@@ -17,7 +17,12 @@ from .roi_dataset import RoiPresenceEmbeddingDataset, collate_roi_batch
 from .roi_loss import roi_presence_embedding_loss
 from .roi_metrics import embedding_metrics, presence_metrics
 from .roi_model import RoiPresenceEmbeddingModel
+from .roi_pairs import normalize_ocr_text, select_embedding_pairs
 from .train import choose_device
+
+_SHORT_SUBTITLE_MAX_CHARS = 2
+_CHECKPOINT_STABILITY_TOLERANCE = 0.01
+_CHECKPOINT_IMPROVEMENT_MARGIN = 0.005
 
 
 def seed_everything(seed: int) -> None:
@@ -77,6 +82,50 @@ def format_epoch_summary(epoch: int, total_epochs: int, metrics: dict[str, float
     )
 
 
+def _metric(metrics: dict[str, float], name: str) -> float:
+    fallback_names = {
+        "global_presence_f1": ("presence_f1",),
+        "normal_presence_f1": ("global_presence_f1", "presence_f1"),
+        "short_presence_f1": ("global_presence_f1", "presence_f1"),
+        "global_embedding_acc": ("embedding_pair_accuracy",),
+        "normal_embedding_acc": ("global_embedding_acc", "embedding_pair_accuracy"),
+        "style_hard_negative_embedding_acc": ("global_embedding_acc", "embedding_pair_accuracy"),
+        "hard_negative_sim": ("embedding_diff_similarity",),
+    }
+    if name in metrics:
+        return float(metrics[name])
+    for fallback in fallback_names.get(name, ()):
+        if fallback in metrics:
+            return float(metrics[fallback])
+    return 0.0
+
+
+def should_save_roi_best_checkpoint(current: dict[str, float], best: dict[str, float] | None) -> bool:
+    if not best:
+        return True
+
+    higher_is_better = (
+        "global_presence_f1",
+        "normal_presence_f1",
+        "short_presence_f1",
+        "global_embedding_acc",
+        "normal_embedding_acc",
+        "style_hard_negative_embedding_acc",
+    )
+    for name in higher_is_better:
+        if _metric(current, name) + _CHECKPOINT_STABILITY_TOLERANCE < _metric(best, name):
+            return False
+    if _metric(current, "hard_negative_sim") > _metric(best, "hard_negative_sim") + _CHECKPOINT_STABILITY_TOLERANCE:
+        return False
+
+    short_presence_improved = _metric(current, "short_presence_f1") >= _metric(best, "short_presence_f1") + _CHECKPOINT_IMPROVEMENT_MARGIN
+    hard_negative_acc_improved = _metric(current, "style_hard_negative_embedding_acc") >= (
+        _metric(best, "style_hard_negative_embedding_acc") + _CHECKPOINT_IMPROVEMENT_MARGIN
+    )
+    hard_negative_sim_improved = _metric(current, "hard_negative_sim") <= _metric(best, "hard_negative_sim") - _CHECKPOINT_IMPROVEMENT_MARGIN
+    return short_presence_improved or hard_negative_acc_improved or hard_negative_sim_improved
+
+
 def epoch_output_dir(settings: RoiTrainSettings, epoch: int) -> Path:
     return settings.output_dir / "epoch_outputs" / f"epoch_{epoch:04}"
 
@@ -87,6 +136,7 @@ def checkpoint_payload(
     step: int,
     best_presence_f1: float,
     best_epoch: int,
+    best_metrics: dict[str, float],
     model: RoiPresenceEmbeddingModel,
     optimizer: torch.optim.Optimizer,
     metrics: dict[str, float],
@@ -101,6 +151,7 @@ def checkpoint_payload(
         "step": step,
         "best_presence_f1": best_presence_f1,
         "best_epoch": best_epoch,
+        "best_metrics": best_metrics,
     }
 
 
@@ -137,7 +188,7 @@ def load_resume_checkpoint(
     device: torch.device,
     *,
     current_embedding_head_type: str,
-) -> tuple[Path, int, int, float, int, dict[str, float]]:
+) -> tuple[Path, int, int, float, int, dict[str, float], dict[str, float]]:
     checkpoint_path = resolve_resume_checkpoint(resume)
     checkpoint = torch.load(checkpoint_path, map_location=device)
     if not isinstance(checkpoint, dict) or checkpoint.get("model_type") != "roi_presence_embedding":
@@ -153,7 +204,8 @@ def load_resume_checkpoint(
     step = int(checkpoint.get("step", metrics.get("step", 0)))
     best_presence_f1 = float(checkpoint.get("best_presence_f1", metrics.get("presence_f1", -1.0)))
     best_epoch = int(checkpoint.get("best_epoch", metrics.get("best_epoch", completed_epoch)))
-    return checkpoint_path, completed_epoch + 1, step, best_presence_f1, best_epoch, metrics
+    best_metrics = dict(checkpoint.get("best_metrics") or metrics)
+    return checkpoint_path, completed_epoch + 1, step, best_presence_f1, best_epoch, metrics, best_metrics
 
 
 def load_model_checkpoint(
@@ -226,6 +278,7 @@ def save_epoch_checkpoint(
     step: int,
     best_presence_f1: float,
     best_epoch: int,
+    best_metrics: dict[str, float],
     model: RoiPresenceEmbeddingModel,
     optimizer: torch.optim.Optimizer,
     metrics: dict[str, float],
@@ -234,10 +287,96 @@ def save_epoch_checkpoint(
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "model.pt"
     torch.save(
-        checkpoint_payload(settings, epoch, step, best_presence_f1, best_epoch, model, optimizer, metrics),
+        checkpoint_payload(settings, epoch, step, best_presence_f1, best_epoch, best_metrics, model, optimizer, metrics),
         path,
     )
     return path
+
+
+def _presence_metrics_for_mask(logits: torch.Tensor, presence: torch.Tensor, mask: torch.Tensor, prefix: str) -> dict[str, float]:
+    if not bool(mask.any()):
+        return {
+            f"{prefix}_presence_f1": 0.0,
+            f"{prefix}_presence_accuracy": 0.0,
+        }
+    scoped = presence_metrics(logits[mask], presence[mask])
+    return {
+        f"{prefix}_presence_f1": scoped["presence_f1"],
+        f"{prefix}_presence_accuracy": scoped["presence_accuracy"],
+    }
+
+
+def _pair_accuracy(scores: list[float], targets: list[bool], threshold: float) -> float:
+    if not scores:
+        return 0.0
+    correct = sum(int((score >= threshold) == target) for score, target in zip(scores, targets, strict=True))
+    return correct / len(scores)
+
+
+def scoped_validation_metrics(
+    logits: torch.Tensor,
+    presence: torch.Tensor,
+    embedding: torch.Tensor,
+    segment_ids: list[str],
+    *,
+    roots: list[str],
+    video_ids: list[str | None],
+    frame_indices: list[int | None],
+    ocr_texts: list[str],
+    frame_window: int,
+    ocr_negative_enabled: bool,
+    ocr_negative_max_similarity: float,
+    threshold: float,
+) -> dict[str, float]:
+    positive_mask = presence > 0.5
+    short_positive = torch.tensor(
+        [
+            bool(is_positive) and 0 < len(normalize_ocr_text(text)) <= _SHORT_SUBTITLE_MAX_CHARS
+            for is_positive, text in zip(positive_mask.tolist(), ocr_texts, strict=True)
+        ],
+        dtype=torch.bool,
+    )
+    normal_positive = positive_mask & ~short_positive
+    negative_mask = ~positive_mask
+    metrics = {
+        "global_presence_f1": _metric(presence_metrics(logits, presence), "presence_f1"),
+    }
+    metrics.update(_presence_metrics_for_mask(logits, presence, negative_mask | normal_positive, "normal"))
+    metrics.update(_presence_metrics_for_mask(logits, presence, negative_mask | short_positive, "short"))
+
+    selection = select_embedding_pairs(
+        presence=presence,
+        segment_ids=segment_ids,
+        roots=roots,
+        video_ids=video_ids,
+        frame_indices=frame_indices,
+        ocr_texts=ocr_texts,
+        frame_window=frame_window,
+        ocr_negative_enabled=ocr_negative_enabled,
+        ocr_negative_max_similarity=ocr_negative_max_similarity,
+    )
+    normal_scores: list[float] = []
+    normal_targets: list[bool] = []
+    hard_negative_scores: list[float] = []
+    hard_negative_targets: list[bool] = []
+    for pair in selection.pairs:
+        score = float((embedding[pair.i] * embedding[pair.j]).sum().detach().cpu())
+        if not bool(short_positive[pair.i]) and not bool(short_positive[pair.j]):
+            normal_scores.append(score)
+            normal_targets.append(pair.same)
+        if pair.source == "local" and not pair.same:
+            hard_negative_scores.append(score)
+            hard_negative_targets.append(False)
+
+    metrics.update(
+        {
+            "normal_embedding_acc": _pair_accuracy(normal_scores, normal_targets, threshold),
+            "style_hard_negative_embedding_acc": _pair_accuracy(hard_negative_scores, hard_negative_targets, threshold),
+            "hard_negative_sim": sum(hard_negative_scores) / len(hard_negative_scores) if hard_negative_scores else 0.0,
+            "style_hard_negative_pairs": float(len(hard_negative_scores)),
+        }
+    )
+    return metrics
 
 
 @torch.no_grad()
@@ -318,6 +457,24 @@ def validate(
             threshold=settings.embedding_similarity_threshold,
         )
     )
+    metrics["global_presence_f1"] = metrics["presence_f1"]
+    metrics["global_embedding_acc"] = metrics["embedding_pair_accuracy"]
+    metrics.update(
+        scoped_validation_metrics(
+            logits,
+            presence,
+            embedding,
+            segment_ids,
+            roots=roots,
+            video_ids=video_ids,
+            frame_indices=frame_indices,
+            ocr_texts=ocr_texts,
+            frame_window=settings.embedding_pair_frame_window,
+            ocr_negative_enabled=settings.embedding_ocr_negative_enabled,
+            ocr_negative_max_similarity=settings.embedding_ocr_negative_max_similarity,
+            threshold=settings.embedding_similarity_threshold,
+        )
+    )
     return metrics
 
 
@@ -348,6 +505,7 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
     optimizer = torch.optim.AdamW(model.parameters(), lr=settings.learning_rate, weight_decay=settings.weight_decay)
     best_presence_f1 = -1.0
     best_epoch = 0
+    best_metrics: dict[str, float] | None = None
     last_metrics: dict[str, float] = {}
     global_step = 0
     start_epoch = 1
@@ -360,6 +518,7 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
             best_presence_f1,
             best_epoch,
             last_metrics,
+            best_metrics,
         ) = load_resume_checkpoint(
             settings.resume,
             model,
@@ -493,10 +652,11 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                     "epoch_seconds": time.perf_counter() - epoch_start,
                 }
             )
-            checkpoint_saved = last_metrics["presence_f1"] >= best_presence_f1
+            checkpoint_saved = should_save_roi_best_checkpoint(last_metrics, best_metrics)
             if checkpoint_saved:
-                best_presence_f1 = last_metrics["presence_f1"]
+                best_presence_f1 = max(best_presence_f1, last_metrics["presence_f1"])
                 best_epoch = epoch
+                best_metrics = dict(last_metrics)
             last_metrics["best_epoch"] = float(best_epoch)
             epoch_checkpoint_path = save_epoch_checkpoint(
                 settings,
@@ -504,6 +664,7 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                 global_step,
                 best_presence_f1,
                 best_epoch,
+                best_metrics or {},
                 model,
                 optimizer,
                 last_metrics,
@@ -512,7 +673,7 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
             metrics_file.flush()
             if checkpoint_saved:
                 torch.save(
-                    checkpoint_payload(settings, epoch, global_step, best_presence_f1, best_epoch, model, optimizer, last_metrics),
+                    checkpoint_payload(settings, epoch, global_step, best_presence_f1, best_epoch, best_metrics or {}, model, optimizer, last_metrics),
                     settings.output_dir / "best.pt",
                 )
             epoch_message = format_epoch_summary(epoch, settings.epochs, last_metrics)

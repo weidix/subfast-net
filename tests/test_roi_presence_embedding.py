@@ -11,7 +11,7 @@ from src.roi_dataset import RoiPresenceEmbeddingDataset, collate_roi_batch
 from src.roi_loss import roi_presence_embedding_loss
 from src.roi_pairs import select_embedding_pairs
 from src.roi_model import RoiPresenceEmbeddingModel
-from src.train_roi import parse_args, run_training
+from src.train_roi import parse_args, run_training, should_save_roi_best_checkpoint
 
 
 def write_roi_dataset(root: Path, *, size: tuple[int, int] = (32, 16)) -> None:
@@ -215,6 +215,48 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
 
         self.assertEqual(settings.val_negative_ratio, 0.4)
 
+    def test_best_checkpoint_gate_ignores_embedding_only_gain_without_weak_area_improvement(self):
+        best = {
+            "global_presence_f1": 0.95,
+            "normal_presence_f1": 0.95,
+            "short_presence_f1": 0.70,
+            "global_embedding_acc": 0.80,
+            "normal_embedding_acc": 0.80,
+            "style_hard_negative_embedding_acc": 0.60,
+            "hard_negative_sim": 0.42,
+        }
+        current = dict(best, global_embedding_acc=0.83, normal_embedding_acc=0.82)
+
+        self.assertFalse(should_save_roi_best_checkpoint(current, best))
+
+    def test_best_checkpoint_gate_saves_when_short_presence_improves_without_core_regression(self):
+        best = {
+            "global_presence_f1": 0.95,
+            "normal_presence_f1": 0.95,
+            "short_presence_f1": 0.70,
+            "global_embedding_acc": 0.80,
+            "normal_embedding_acc": 0.80,
+            "style_hard_negative_embedding_acc": 0.60,
+            "hard_negative_sim": 0.42,
+        }
+        current = dict(best, short_presence_f1=0.73, global_embedding_acc=0.81)
+
+        self.assertTrue(should_save_roi_best_checkpoint(current, best))
+
+    def test_best_checkpoint_gate_blocks_obvious_normal_presence_regression(self):
+        best = {
+            "global_presence_f1": 0.95,
+            "normal_presence_f1": 0.95,
+            "short_presence_f1": 0.70,
+            "global_embedding_acc": 0.80,
+            "normal_embedding_acc": 0.80,
+            "style_hard_negative_embedding_acc": 0.60,
+            "hard_negative_sim": 0.42,
+        }
+        current = dict(best, normal_presence_f1=0.91, short_presence_f1=0.78)
+
+        self.assertFalse(should_save_roi_best_checkpoint(current, best))
+
     def test_one_epoch_roi_training_smoke(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "roi"
@@ -237,6 +279,13 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
 
             self.assertIn("presence_f1", metrics)
             self.assertIn("embedding_pair_accuracy", metrics)
+            self.assertIn("global_presence_f1", metrics)
+            self.assertIn("normal_presence_f1", metrics)
+            self.assertIn("short_presence_f1", metrics)
+            self.assertIn("global_embedding_acc", metrics)
+            self.assertIn("normal_embedding_acc", metrics)
+            self.assertIn("style_hard_negative_embedding_acc", metrics)
+            self.assertIn("hard_negative_sim", metrics)
             self.assertTrue((output / "best.pt").exists())
 
 

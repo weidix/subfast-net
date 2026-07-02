@@ -129,7 +129,7 @@ Each ROI training run writes:
 
 | Path | Meaning |
 |---|---|
-| `best.pt` | Best ROI checkpoint by validation Presence F1 |
+| `best.pt` | Best ROI checkpoint by composite validation gate across global/normal/short presence, embedding accuracy, and style hard negatives |
 | `metrics.jsonl` | ROI train-step and validation metrics |
 | `summary.json` | Last ROI validation summary |
 | `epoch_outputs/epoch_000N/model.pt` | Per-epoch ROI checkpoint |
