@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>filter-region helper</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Arial, "Microsoft YaHei", sans-serif;
+      background: #f4f5f7;
+      color: #1f2328;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      padding: 24px;
+    }
+
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      display: grid;
+      gap: 16px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 700;
+    }
+
+    .toolbar,
+    .output {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 12px;
+      padding: 12px;
+      background: #ffffff;
+      border: 1px solid #d0d7de;
+      border-radius: 6px;
+    }
+
+    label {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+    }
+
+    input[type="file"] {
+      max-width: 360px;
+    }
+
+    input[type="range"] {
+      width: min(520px, 100%);
+    }
+
+    button {
+      height: 34px;
+      padding: 0 12px;
+      border: 1px solid #8c959f;
+      border-radius: 6px;
+      background: #ffffff;
+      color: #1f2328;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    button:hover {
+      background: #f6f8fa;
+    }
+
+    code {
+      padding: 6px 8px;
+      border-radius: 6px;
+      background: #f6f8fa;
+      border: 1px solid #d0d7de;
+      font-size: 14px;
+      word-break: break-all;
+    }
+
+    .stage {
+      position: relative;
+      width: 100%;
+      min-height: 360px;
+      background: #101418;
+      border-radius: 6px;
+      overflow: hidden;
+      display: grid;
+      place-items: center;
+      border: 1px solid #30363d;
+    }
+
+    video {
+      display: none;
+    }
+
+    canvas {
+      display: block;
+      max-width: 100%;
+      max-height: calc(100vh - 240px);
+      cursor: crosshair;
+      background: #000000;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      font-size: 13px;
+      color: #57606a;
+    }
+
+    .hint {
+      color: #57606a;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>filter-region helper</h1>
+
+    <section class="toolbar">
+      <label>
+        视频
+        <input id="fileInput" type="file" accept="video/*">
+      </label>
+      <button id="playPause" type="button" disabled>播放</button>
+      <label>
+        时间
+        <input id="timeline" type="range" min="0" max="0" step="0.001" value="0" disabled>
+      </label>
+      <button id="clearRegion" type="button" disabled>清除区域</button>
+      <span class="hint">在画面上拖拽选择字幕区域，输出为原视频帧坐标。</span>
+    </section>
+
+    <section class="stage">
+      <video id="video" playsinline muted></video>
+      <canvas id="canvas"></canvas>
+    </section>
+
+    <section class="output">
+      <code id="regionText">--filter-region 未选择</code>
+      <button id="copyRegion" type="button" disabled>复制</button>
+      <div class="meta">
+        <span id="sizeText">尺寸: -</span>
+        <span id="timeText">时间: 0.000s</span>
+        <span id="cursorText">坐标: -</span>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const fileInput = document.getElementById("fileInput");
+    const playPause = document.getElementById("playPause");
+    const timeline = document.getElementById("timeline");
+    const clearRegion = document.getElementById("clearRegion");
+    const copyRegion = document.getElementById("copyRegion");
+    const regionText = document.getElementById("regionText");
+    const sizeText = document.getElementById("sizeText");
+    const timeText = document.getElementById("timeText");
+    const cursorText = document.getElementById("cursorText");
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+
+    let objectUrl = null;
+    let region = null;
+    let dragStart = null;
+    let rafId = null;
+
+    function frameSize() {
+      return {
+        width: video.videoWidth || 0,
+        height: video.videoHeight || 0,
+      };
+    }
+
+    function canvasPoint(event) {
+      const rect = canvas.getBoundingClientRect();
+      const { width, height } = frameSize();
+      const x = ((event.clientX - rect.left) / rect.width) * width;
+      const y = ((event.clientY - rect.top) / rect.height) * height;
+      return {
+        x: Math.round(Math.max(0, Math.min(width, x))),
+        y: Math.round(Math.max(0, Math.min(height, y))),
+      };
+    }
+
+    function normalizedRegion(a, b) {
+      const x1 = Math.min(a.x, b.x);
+      const y1 = Math.min(a.y, b.y);
+      const x2 = Math.max(a.x, b.x);
+      const y2 = Math.max(a.y, b.y);
+      if (x2 <= x1 || y2 <= y1) {
+        return null;
+      }
+      return { x1, y1, x2, y2 };
+    }
+
+    function regionValue() {
+      if (!region) {
+        return "";
+      }
+      return `${region.x1},${region.y1},${region.x2},${region.y2}`;
+    }
+
+    function drawRegion(activeRegion) {
+      if (!activeRegion) {
+        return;
+      }
+      const x = activeRegion.x1;
+      const y = activeRegion.y1;
+      const width = activeRegion.x2 - activeRegion.x1;
+      const height = activeRegion.y2 - activeRegion.y1;
+      ctx.save();
+      ctx.fillStyle = "rgba(255, 212, 59, 0.18)";
+      ctx.strokeStyle = "#ffd43b";
+      ctx.lineWidth = Math.max(2, Math.round(canvas.width / 720));
+      ctx.fillRect(x, y, width, height);
+      ctx.strokeRect(x, y, width, height);
+      ctx.restore();
+    }
+
+    function draw() {
+      const { width, height } = frameSize();
+      if (!width || !height) {
+        return;
+      }
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      ctx.drawImage(video, 0, 0, width, height);
+      drawRegion(region);
+      timeline.value = String(video.currentTime || 0);
+      timeText.textContent = `时间: ${(video.currentTime || 0).toFixed(3)}s`;
+      if (!video.paused && !video.ended) {
+        rafId = requestAnimationFrame(draw);
+      }
+    }
+
+    function updateOutput() {
+      const value = regionValue();
+      regionText.textContent = value ? `--filter-region ${value}` : "--filter-region 未选择";
+      copyRegion.disabled = !value;
+      clearRegion.disabled = !value;
+    }
+
+    function stopAnimation() {
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+    }
+
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) {
+        return;
+      }
+      stopAnimation();
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+      }
+      objectUrl = URL.createObjectURL(file);
+      region = null;
+      video.src = objectUrl;
+      video.load();
+      updateOutput();
+    });
+
+    video.addEventListener("loadedmetadata", () => {
+      const { width, height } = frameSize();
+      timeline.max = String(video.duration || 0);
+      timeline.disabled = false;
+      playPause.disabled = false;
+      sizeText.textContent = `尺寸: ${width}x${height}`;
+      draw();
+    });
+
+    video.addEventListener("play", () => {
+      playPause.textContent = "暂停";
+      stopAnimation();
+      rafId = requestAnimationFrame(draw);
+    });
+
+    video.addEventListener("pause", () => {
+      playPause.textContent = "播放";
+      stopAnimation();
+      draw();
+    });
+
+    video.addEventListener("ended", () => {
+      playPause.textContent = "播放";
+      stopAnimation();
+      draw();
+    });
+
+    playPause.addEventListener("click", () => {
+      if (video.paused) {
+        video.play();
+      } else {
+        video.pause();
+      }
+    });
+
+    timeline.addEventListener("input", () => {
+      video.currentTime = Number(timeline.value);
+    });
+
+    video.addEventListener("seeked", draw);
+
+    canvas.addEventListener("pointerdown", (event) => {
+      if (!video.videoWidth || !video.videoHeight) {
+        return;
+      }
+      video.pause();
+      canvas.setPointerCapture(event.pointerId);
+      dragStart = canvasPoint(event);
+      region = null;
+      updateOutput();
+      draw();
+    });
+
+    canvas.addEventListener("pointermove", (event) => {
+      if (!video.videoWidth || !video.videoHeight) {
+        return;
+      }
+      const point = canvasPoint(event);
+      cursorText.textContent = `坐标: ${point.x},${point.y}`;
+      if (!dragStart) {
+        return;
+      }
+      region = normalizedRegion(dragStart, point);
+      draw();
+      updateOutput();
+    });
+
+    canvas.addEventListener("pointerup", (event) => {
+      if (!dragStart) {
+        return;
+      }
+      const point = canvasPoint(event);
+      region = normalizedRegion(dragStart, point);
+      dragStart = null;
+      canvas.releasePointerCapture(event.pointerId);
+      draw();
+      updateOutput();
+    });
+
+    canvas.addEventListener("pointerleave", () => {
+      cursorText.textContent = "坐标: -";
+    });
+
+    clearRegion.addEventListener("click", () => {
+      region = null;
+      updateOutput();
+      draw();
+    });
+
+    copyRegion.addEventListener("click", async () => {
+      const value = regionValue();
+      if (!value) {
+        return;
+      }
+      await navigator.clipboard.writeText(value);
+      copyRegion.textContent = "已复制";
+      setTimeout(() => {
+        copyRegion.textContent = "复制";
+      }, 900);
+    });
+  </script>
+</body>
+</html>
