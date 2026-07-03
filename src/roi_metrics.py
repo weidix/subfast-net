@@ -28,7 +28,7 @@ def presence_metrics(presence_logit: torch.Tensor, presence: torch.Tensor) -> di
     }
 
 
-def _percentile(values: list[float], percentile: float) -> float:
+def similarity_percentile(values: list[float], percentile: float) -> float:
     if not values:
         return 0.0
     if len(values) == 1:
@@ -97,6 +97,7 @@ def embedding_metrics(
             "embedding_ocr_negative_pairs": 0.0,
             "embedding_skipped_pairs": float(selection.skipped_pairs),
             "embedding_roc_auc": 0.0,
+            "embedding_positive_p10": 0.0,
             "embedding_positive_p05": 0.0,
             "embedding_positive_p25": 0.0,
             "embedding_positive_p50": 0.0,
@@ -137,12 +138,13 @@ def embedding_metrics(
         "embedding_ocr_negative_pairs": float(selection.ocr_negative_pairs),
         "embedding_skipped_pairs": float(selection.skipped_pairs),
         "embedding_roc_auc": _roc_auc(scores, targets),
-        "embedding_positive_p05": _percentile(same_values, 0.05),
-        "embedding_positive_p25": _percentile(same_values, 0.25),
-        "embedding_positive_p50": _percentile(same_values, 0.50),
-        "embedding_negative_p90": _percentile(diff_values, 0.90),
-        "embedding_negative_p95": _percentile(diff_values, 0.95),
-        "embedding_negative_p99": _percentile(diff_values, 0.99),
+        "embedding_positive_p05": similarity_percentile(same_values, 0.05),
+        "embedding_positive_p10": similarity_percentile(same_values, 0.10),
+        "embedding_positive_p25": similarity_percentile(same_values, 0.25),
+        "embedding_positive_p50": similarity_percentile(same_values, 0.50),
+        "embedding_negative_p90": similarity_percentile(diff_values, 0.90),
+        "embedding_negative_p95": similarity_percentile(diff_values, 0.95),
+        "embedding_negative_p99": similarity_percentile(diff_values, 0.99),
         "embedding_false_positive_pairs": float(false_positive),
         "embedding_false_negative_pairs": float(false_negative),
     }

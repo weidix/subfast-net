@@ -11,7 +11,7 @@ from src.roi_dataset import RoiPresenceEmbeddingDataset, collate_roi_batch
 from src.roi_loss import roi_presence_embedding_loss
 from src.roi_pairs import select_embedding_pairs
 from src.roi_model import LocalTextnessPresenceHead, RoiPresenceEmbeddingModel
-from src.train_roi import parse_args, run_training, should_save_roi_best_checkpoint
+from src.train_roi import format_epoch_summary, parse_args, run_training, should_save_roi_best_checkpoint
 
 
 def write_roi_dataset(root: Path, *, size: tuple[int, int] = (32, 16)) -> None:
@@ -273,6 +273,61 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
 
         self.assertFalse(should_save_roi_best_checkpoint(current, best))
 
+    def test_best_checkpoint_gate_saves_when_hard_margin_improves_without_core_regression(self):
+        best = {
+            "global_presence_f1": 0.95,
+            "normal_presence_f1": 0.95,
+            "short_presence_f1": 0.70,
+            "global_embedding_acc": 0.80,
+            "normal_embedding_acc": 0.80,
+            "style_hard_negative_embedding_acc": 0.60,
+            "hard_negative_sim_p90": 0.42,
+            "hard_margin": 0.10,
+        }
+        current = dict(best, hard_margin=0.12, hard_negative_sim_p90=0.41)
+
+        self.assertTrue(should_save_roi_best_checkpoint(current, best))
+
+    def test_format_epoch_summary_groups_roi_metrics(self):
+        text = format_epoch_summary(
+            epoch=2,
+            total_epochs=5,
+            metrics={
+                "train_loss": 0.123456,
+                "train_presence_loss": 0.02,
+                "train_embedding_loss": 0.03,
+                "val_loss": 0.234567,
+                "presence_f1": 0.91,
+                "presence_accuracy": 0.92,
+                "presence_tp": 46.0,
+                "presence_fp": 3.0,
+                "presence_fn": 2.0,
+                "presence_tn": 29.0,
+                "embedding_pair_accuracy": 0.83,
+                "embedding_same_similarity": 0.71,
+                "embedding_diff_similarity": 0.22,
+                "hard_negative_sim_p50": 0.31,
+                "hard_negative_sim_p90": 0.41,
+                "hard_negative_sim_p95": 0.45,
+                "same_sim_p50": 0.72,
+                "same_sim_p10": 0.52,
+                "hard_margin": 0.11,
+            },
+        )
+
+        self.assertEqual(
+            text,
+            "\n".join(
+                [
+                    "roi epoch 2/5",
+                    "  loss: train=0.1235 presence=0.0200 embedding=0.0300 val=0.2346",
+                    "  presence: f1=0.9100 accuracy=0.9200 tp=46 fp=3 fn=2 tn=29",
+                    "  embedding: acc=0.8300 same=0.7100 diff=0.2200 hard_margin=0.1100",
+                    "  similarity: same_p10=0.5200 same_p50=0.7200 hard_neg_p50=0.3100 hard_neg_p90=0.4100 hard_neg_p95=0.4500",
+                ]
+            ),
+        )
+
     def test_one_epoch_roi_training_smoke(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "roi"
@@ -302,6 +357,12 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
             self.assertIn("normal_embedding_acc", metrics)
             self.assertIn("style_hard_negative_embedding_acc", metrics)
             self.assertIn("hard_negative_sim", metrics)
+            self.assertIn("hard_negative_sim_p50", metrics)
+            self.assertIn("hard_negative_sim_p90", metrics)
+            self.assertIn("hard_negative_sim_p95", metrics)
+            self.assertIn("same_sim_p50", metrics)
+            self.assertIn("same_sim_p10", metrics)
+            self.assertIn("hard_margin", metrics)
             self.assertTrue((output / "best.pt").exists())
 
 

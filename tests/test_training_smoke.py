@@ -202,7 +202,14 @@ class TrainingSmokeTests(unittest.TestCase):
         )
         self.assertEqual(
             text,
-            "epoch 1/3 train_loss=0.1235 region_bce=0.0100 kernel_bce=0.0200 region_dice=0.0300 kernel_dice=0.0400 val_loss=0.2346 precision=0.9000 recall=0.8000 f1=0.8471 tp=17 fp=2 fn=3",
+            "\n".join(
+                [
+                    "epoch 1/3",
+                    "  loss: train=0.1235 val=0.2346",
+                    "  train_parts: region_bce=0.0100 kernel_bce=0.0200 region_dice=0.0300 kernel_dice=0.0400",
+                    "  validation: precision=0.9000 recall=0.8000 f1=0.8471 tp=17 fp=2 fn=3",
+                ]
+            ),
         )
 
 

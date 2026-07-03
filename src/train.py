@@ -61,20 +61,25 @@ def format_dataset_summary(name: str, dataset: SubtitleDataset) -> str:
 
 
 def format_epoch_summary(epoch: int, total_epochs: int, metrics: dict[str, float]) -> str:
-    return (
-        f"epoch {epoch}/{total_epochs} "
-        f"train_loss={metrics['train_loss']:.4f} "
-        f"region_bce={metrics['train_region_bce']:.4f} "
-        f"kernel_bce={metrics['train_kernel_bce']:.4f} "
-        f"region_dice={metrics['train_region_dice']:.4f} "
-        f"kernel_dice={metrics['train_kernel_dice']:.4f} "
-        f"val_loss={metrics['val_loss']:.4f} "
-        f"precision={metrics['precision']:.4f} "
-        f"recall={metrics['recall']:.4f} "
-        f"f1={metrics['f1']:.4f} "
-        f"tp={metrics['true_positive']:.0f} "
-        f"fp={metrics['false_positive']:.0f} "
-        f"fn={metrics['false_negative']:.0f}"
+    return "\n".join(
+        [
+            f"epoch {epoch}/{total_epochs}",
+            f"  loss: train={metrics['train_loss']:.4f} val={metrics['val_loss']:.4f}",
+            (
+                f"  train_parts: region_bce={metrics['train_region_bce']:.4f} "
+                f"kernel_bce={metrics['train_kernel_bce']:.4f} "
+                f"region_dice={metrics['train_region_dice']:.4f} "
+                f"kernel_dice={metrics['train_kernel_dice']:.4f}"
+            ),
+            (
+                f"  validation: precision={metrics['precision']:.4f} "
+                f"recall={metrics['recall']:.4f} "
+                f"f1={metrics['f1']:.4f} "
+                f"tp={metrics['true_positive']:.0f} "
+                f"fp={metrics['false_positive']:.0f} "
+                f"fn={metrics['false_negative']:.0f}"
+            ),
+        ]
     )
 
 
@@ -408,10 +413,10 @@ def run_training(settings: TrainSettings) -> dict[str, float]:
                 )
             epoch_message = format_epoch_summary(epoch, settings.epochs, last_metrics)
             if epoch_output_path is not None:
-                epoch_message += f" epoch_output={epoch_output_path} samples={len(epoch_outputs)}"
-            epoch_message += f" epoch_checkpoint={epoch_checkpoint_path}"
+                epoch_message += f"\n  output: epoch_output={epoch_output_path} samples={len(epoch_outputs)}"
+            epoch_message += f"\n  checkpoint: epoch={epoch_checkpoint_path}"
             if checkpoint_saved:
-                epoch_message += f" checkpoint=best step={global_step}"
+                epoch_message += f" best=true step={global_step}"
             print(epoch_message, flush=True)
     (settings.output_dir / "summary.json").write_text(json.dumps(last_metrics, indent=2, sort_keys=True))
     return last_metrics

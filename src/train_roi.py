@@ -15,7 +15,7 @@ from tqdm import tqdm
 from .roi_config import RoiTrainSettings
 from .roi_dataset import RoiPresenceEmbeddingDataset, collate_roi_batch
 from .roi_loss import roi_presence_embedding_loss
-from .roi_metrics import embedding_metrics, presence_metrics
+from .roi_metrics import embedding_metrics, presence_metrics, similarity_percentile
 from .roi_model import RoiPresenceEmbeddingModel
 from .roi_pairs import normalize_ocr_text, select_embedding_pairs
 from .train import choose_device
@@ -68,17 +68,37 @@ def format_dataset_summary(name: str, dataset: RoiPresenceEmbeddingDataset) -> s
 
 
 def format_epoch_summary(epoch: int, total_epochs: int, metrics: dict[str, float]) -> str:
-    return (
-        f"epoch {epoch}/{total_epochs} "
-        f"train_loss={metrics['train_loss']:.4f} "
-        f"presence_loss={metrics['train_presence_loss']:.4f} "
-        f"embedding_loss={metrics['train_embedding_loss']:.4f} "
-        f"val_loss={metrics['val_loss']:.4f} "
-        f"presence_f1={metrics['presence_f1']:.4f} "
-        f"presence_accuracy={metrics['presence_accuracy']:.4f} "
-        f"embedding_acc={metrics['embedding_pair_accuracy']:.4f} "
-        f"same_sim={metrics['embedding_same_similarity']:.4f} "
-        f"diff_sim={metrics['embedding_diff_similarity']:.4f}"
+    return "\n".join(
+        [
+            f"roi epoch {epoch}/{total_epochs}",
+            (
+                f"  loss: train={metrics['train_loss']:.4f} "
+                f"presence={metrics['train_presence_loss']:.4f} "
+                f"embedding={metrics['train_embedding_loss']:.4f} "
+                f"val={metrics['val_loss']:.4f}"
+            ),
+            (
+                f"  presence: f1={metrics['presence_f1']:.4f} "
+                f"accuracy={metrics['presence_accuracy']:.4f} "
+                f"tp={metrics['presence_tp']:.0f} "
+                f"fp={metrics['presence_fp']:.0f} "
+                f"fn={metrics['presence_fn']:.0f} "
+                f"tn={metrics['presence_tn']:.0f}"
+            ),
+            (
+                f"  embedding: acc={metrics['embedding_pair_accuracy']:.4f} "
+                f"same={metrics['embedding_same_similarity']:.4f} "
+                f"diff={metrics['embedding_diff_similarity']:.4f} "
+                f"hard_margin={metrics['hard_margin']:.4f}"
+            ),
+            (
+                f"  similarity: same_p10={metrics['same_sim_p10']:.4f} "
+                f"same_p50={metrics['same_sim_p50']:.4f} "
+                f"hard_neg_p50={metrics['hard_negative_sim_p50']:.4f} "
+                f"hard_neg_p90={metrics['hard_negative_sim_p90']:.4f} "
+                f"hard_neg_p95={metrics['hard_negative_sim_p95']:.4f}"
+            ),
+        ]
     )
 
 
@@ -91,7 +111,12 @@ def _metric(metrics: dict[str, float], name: str) -> float:
         "normal_embedding_acc": ("global_embedding_acc", "embedding_pair_accuracy"),
         "style_hard_negative_embedding_acc": ("global_embedding_acc", "embedding_pair_accuracy"),
         "hard_negative_sim": ("embedding_diff_similarity",),
+        "hard_negative_sim_p90": ("hard_negative_sim", "embedding_negative_p90", "embedding_diff_similarity"),
+        "same_sim_p10": ("embedding_positive_p10", "embedding_same_similarity"),
+        "same_sim_p50": ("embedding_positive_p50", "embedding_same_similarity"),
     }
+    if name == "hard_margin":
+        return _metric(metrics, "same_sim_p10") - _metric(metrics, "hard_negative_sim_p90")
     if name in metrics:
         return float(metrics[name])
     for fallback in fallback_names.get(name, ()):
@@ -111,19 +136,21 @@ def should_save_roi_best_checkpoint(current: dict[str, float], best: dict[str, f
         "global_embedding_acc",
         "normal_embedding_acc",
         "style_hard_negative_embedding_acc",
+        "hard_margin",
     )
     for name in higher_is_better:
         if _metric(current, name) + _CHECKPOINT_STABILITY_TOLERANCE < _metric(best, name):
             return False
-    if _metric(current, "hard_negative_sim") > _metric(best, "hard_negative_sim") + _CHECKPOINT_STABILITY_TOLERANCE:
+    if _metric(current, "hard_negative_sim_p90") > _metric(best, "hard_negative_sim_p90") + _CHECKPOINT_STABILITY_TOLERANCE:
         return False
 
     short_presence_improved = _metric(current, "short_presence_f1") >= _metric(best, "short_presence_f1") + _CHECKPOINT_IMPROVEMENT_MARGIN
     hard_negative_acc_improved = _metric(current, "style_hard_negative_embedding_acc") >= (
         _metric(best, "style_hard_negative_embedding_acc") + _CHECKPOINT_IMPROVEMENT_MARGIN
     )
-    hard_negative_sim_improved = _metric(current, "hard_negative_sim") <= _metric(best, "hard_negative_sim") - _CHECKPOINT_IMPROVEMENT_MARGIN
-    return short_presence_improved or hard_negative_acc_improved or hard_negative_sim_improved
+    hard_negative_sim_improved = _metric(current, "hard_negative_sim_p90") <= _metric(best, "hard_negative_sim_p90") - _CHECKPOINT_IMPROVEMENT_MARGIN
+    hard_margin_improved = _metric(current, "hard_margin") >= _metric(best, "hard_margin") + _CHECKPOINT_IMPROVEMENT_MARGIN
+    return short_presence_improved or hard_negative_acc_improved or hard_negative_sim_improved or hard_margin_improved
 
 
 def epoch_output_dir(settings: RoiTrainSettings, epoch: int) -> Path:
@@ -357,22 +384,33 @@ def scoped_validation_metrics(
     )
     normal_scores: list[float] = []
     normal_targets: list[bool] = []
+    same_scores: list[float] = []
     hard_negative_scores: list[float] = []
     hard_negative_targets: list[bool] = []
     for pair in selection.pairs:
         score = float((embedding[pair.i] * embedding[pair.j]).sum().detach().cpu())
+        if pair.same:
+            same_scores.append(score)
         if not bool(short_positive[pair.i]) and not bool(short_positive[pair.j]):
             normal_scores.append(score)
             normal_targets.append(pair.same)
         if pair.source == "local" and not pair.same:
             hard_negative_scores.append(score)
             hard_negative_targets.append(False)
+    hard_negative_sim_p90 = similarity_percentile(hard_negative_scores, 0.90)
+    same_sim_p10 = similarity_percentile(same_scores, 0.10)
 
     metrics.update(
         {
             "normal_embedding_acc": _pair_accuracy(normal_scores, normal_targets, threshold),
             "style_hard_negative_embedding_acc": _pair_accuracy(hard_negative_scores, hard_negative_targets, threshold),
             "hard_negative_sim": sum(hard_negative_scores) / len(hard_negative_scores) if hard_negative_scores else 0.0,
+            "hard_negative_sim_p50": similarity_percentile(hard_negative_scores, 0.50),
+            "hard_negative_sim_p90": hard_negative_sim_p90,
+            "hard_negative_sim_p95": similarity_percentile(hard_negative_scores, 0.95),
+            "same_sim_p50": similarity_percentile(same_scores, 0.50),
+            "same_sim_p10": same_sim_p10,
+            "hard_margin": same_sim_p10 - hard_negative_sim_p90 if same_scores and hard_negative_scores else 0.0,
             "style_hard_negative_pairs": float(len(hard_negative_scores)),
         }
     )
@@ -677,9 +715,9 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                     settings.output_dir / "best.pt",
                 )
             epoch_message = format_epoch_summary(epoch, settings.epochs, last_metrics)
-            epoch_message += f" epoch_checkpoint={epoch_checkpoint_path}"
+            epoch_message += f"\n  checkpoint: epoch={epoch_checkpoint_path}"
             if checkpoint_saved:
-                epoch_message += f" checkpoint=best step={global_step}"
+                epoch_message += f" best=true step={global_step}"
             print(epoch_message, flush=True)
     (settings.output_dir / "summary.json").write_text(json.dumps(last_metrics, indent=2, sort_keys=True), encoding="utf-8")
     return last_metrics
