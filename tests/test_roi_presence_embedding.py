@@ -10,7 +10,7 @@ from src.roi_config import RoiTrainSettings
 from src.roi_dataset import RoiPresenceEmbeddingDataset, collate_roi_batch
 from src.roi_loss import roi_presence_embedding_loss
 from src.roi_pairs import select_embedding_pairs
-from src.roi_model import RoiPresenceEmbeddingModel
+from src.roi_model import LocalTextnessPresenceHead, RoiPresenceEmbeddingModel
 from src.train_roi import parse_args, run_training, should_save_roi_best_checkpoint
 
 
@@ -138,6 +138,22 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertEqual(presence_logit.shape, (2,))
         self.assertEqual(embedding.shape, (2, 128))
         self.assertTrue(torch.allclose(embedding.norm(dim=1), torch.ones(2), atol=1e-5))
+
+    def test_presence_head_uses_top_local_textness_responses(self):
+        head = LocalTextnessPresenceHead(feature_dim=1, hidden_dim=1, topk_ratio=0.25)
+        head.local[1] = torch.nn.ReLU()
+        with torch.no_grad():
+            head.local[0].weight.zero_()
+            head.local[0].bias.zero_()
+            head.local[0].weight[:, :, 1, 1] = 1.0
+            head.textness.weight.fill_(1.0)
+            head.textness.bias.zero_()
+        feature_map = torch.tensor([[[[8.0, 0.0, 0.0, 0.0], [4.0, 0.0, 0.0, 0.0]]]])
+
+        logit = head(feature_map)
+
+        self.assertEqual(logit.shape, (1,))
+        self.assertAlmostEqual(float(logit.item()), 6.0)
 
     def test_hybrid_lite_model_returns_normalized_embedding(self):
         model = RoiPresenceEmbeddingModel(
