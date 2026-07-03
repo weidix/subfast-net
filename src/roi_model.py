@@ -67,6 +67,27 @@ class LocalTextnessPresenceHead(nn.Module):
         return textness.topk(k, dim=1).values.mean(dim=1)
 
 
+class LocalContrastEnhancement(nn.Module):
+    def __init__(self, kernel_size: int = 7, eps: float = 1e-4) -> None:
+        super().__init__()
+        if kernel_size <= 1 or kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be an odd integer greater than 1")
+        self.background = nn.AvgPool2d(
+            kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            count_include_pad=False,
+        )
+        self.eps = eps
+
+    def forward(self, feature_map: torch.Tensor) -> torch.Tensor:
+        local_background = self.background(feature_map)
+        local_difference = (feature_map - local_background).abs()
+        local_scale = self.background(local_difference).clamp_min(self.eps)
+        local_contrast = local_difference / local_scale
+        return torch.cat([feature_map, local_contrast], dim=1)
+
+
 class RoiPresenceEmbeddingModel(nn.Module):
     def __init__(
         self,
@@ -94,7 +115,8 @@ class RoiPresenceEmbeddingModel(nn.Module):
         feature_dim = width * 2
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.flatten = nn.Flatten()
-        self.presence_head = LocalTextnessPresenceHead(feature_dim)
+        self.presence_contrast = LocalContrastEnhancement()
+        self.presence_head = LocalTextnessPresenceHead(feature_dim * 2, hidden_dim=feature_dim)
         self.embedding_head = nn.Sequential(
             nn.Linear(feature_dim, feature_dim),
             nn.SiLU(inplace=True),
@@ -119,7 +141,7 @@ class RoiPresenceEmbeddingModel(nn.Module):
         if features_or_images.ndim != 4:
             raise ValueError("presence head requires ROI images or a feature map")
         feature_map = self.encode_map(features_or_images) if features_or_images.shape[1] == 3 else features_or_images
-        return self.presence_head(feature_map)
+        return self.presence_head(self.presence_contrast(feature_map))
 
     def forward_embedding(self, features_or_images: torch.Tensor) -> torch.Tensor:
         feature_map = self.encode_map(features_or_images) if features_or_images.ndim == 4 else None
@@ -132,7 +154,7 @@ class RoiPresenceEmbeddingModel(nn.Module):
     def forward(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         feature_map = self.encode_map(images)
         features = self._pool_features(feature_map)
-        presence_logit = self.presence_head(feature_map)
+        presence_logit = self.presence_head(self.presence_contrast(feature_map))
         gap_feature = self.embedding_head(features)
         if self.hybrid_embedding_head is not None:
             gap_feature = self.hybrid_embedding_head(gap_feature, feature_map)
