@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from io import BytesIO
 from difflib import SequenceMatcher
 import json
 import mimetypes
@@ -10,7 +11,7 @@ import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 
 REVIEW_FILENAME = "segment_review.json"
@@ -25,6 +26,7 @@ class SegmentReviewApp:
         self.images_dir = self.samples_dir / "images"
         self.annotations_path = self.samples_dir / "annotations.jsonl"
         self.review_path = self.samples_dir / REVIEW_FILENAME
+        self.craft_outputs_dir = self.samples_dir / "craft_outputs"
         self.verbose_requests = verbose_requests
         if not self.images_dir.is_dir():
             raise ValueError(f"missing images dir: {self.images_dir}")
@@ -32,6 +34,7 @@ class SegmentReviewApp:
             raise ValueError(f"missing annotations file: {self.annotations_path}")
         self.items = self.load_items()
         self.review = self.load_review()
+        self.craft_manifest = self.load_craft_manifest()
 
     def load_items(self) -> list[dict[str, object]]:
         items = []
@@ -71,6 +74,97 @@ class SegmentReviewApp:
                 "updated_at": int(time.time()),
             }
         return review
+
+    def load_craft_manifest(self) -> dict[str, dict[str, object]]:
+        manifest_path = self.craft_outputs_dir / "manifest.jsonl"
+        if not manifest_path.exists():
+            return {}
+        rows: dict[str, dict[str, object]] = {}
+        with manifest_path.open("r", encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                stem = Path(str(row.get("image", ""))).stem
+                if stem:
+                    rows[stem] = row
+        return rows
+
+    def craft_summary(self) -> dict[str, object]:
+        summary_path = self.craft_outputs_dir / "summary.json"
+        if not summary_path.exists():
+            return {}
+        return json.loads(summary_path.read_text(encoding="utf-8"))
+
+    def craft_state(self) -> dict[str, object]:
+        summary = self.craft_summary()
+        craft_items = []
+        for item in self.items:
+            stem = str(item.get("stem") or Path(str(item.get("image", ""))).stem)
+            row = self.craft_manifest.get(stem)
+            if not row:
+                continue
+            reviewed = self.reviewed_item(item)
+            has_text_png = bool(row.get("score_text_png"))
+            has_link_png = bool(row.get("score_link_png"))
+            craft_items.append(
+                {
+                    "id": reviewed["id"],
+                    "image": reviewed["image"],
+                    "stem": stem,
+                    "review_has_subtitle": reviewed["review_has_subtitle"],
+                    "review_segment_id": reviewed["review_segment_id"],
+                    "ocr_text": str(reviewed.get("ocr_text") or ""),
+                    "score_text_max": float(row.get("score_text_max", 0.0) or 0.0),
+                    "score_text_mean": float(row.get("score_text_mean", 0.0) or 0.0),
+                    "score_text_url": self.craft_score_url(stem, "text", row, has_text_png),
+                    "score_link_url": self.craft_score_url(stem, "link", row, has_link_png),
+                    "has_score_link": bool(has_link_png or row.get("score_npz")),
+                }
+            )
+        return {
+            "samples_dir": str(self.samples_dir),
+            "craft_outputs_dir": str(self.craft_outputs_dir),
+            "available": bool(self.craft_manifest),
+            "summary": summary,
+            "items": craft_items,
+            "stats": {
+                "manifest_samples": len(self.craft_manifest),
+                "matched_samples": len(craft_items),
+                "subtitle_samples": sum(1 for item in craft_items if bool(item["review_has_subtitle"])),
+            },
+        }
+
+    def craft_score_url(self, stem: str, score_type: str, row: dict[str, object], has_png: bool) -> str:
+        if has_png:
+            key = "score_text_png" if score_type == "text" else "score_link_png"
+            return f"/craft-file/{quote_path(str(row[key]))}"
+        return f"/craft-score/{score_type}/{quote_path(stem)}.png"
+
+    def render_craft_score_png(self, stem: str, score_type: str) -> bytes:
+        row = self.craft_manifest.get(stem)
+        if not row:
+            raise FileNotFoundError(f"missing CRAFT manifest row for {stem}")
+        score_npz = str(row.get("score_npz") or "")
+        if not score_npz:
+            raise FileNotFoundError(f"missing score_npz for {stem}")
+        npz_path = (self.samples_dir / score_npz).resolve()
+        if self.samples_dir not in npz_path.parents or not npz_path.exists():
+            raise FileNotFoundError(f"missing CRAFT score map: {npz_path}")
+
+        import numpy as np
+        from PIL import Image
+
+        key = "score_text" if score_type == "text" else "score_link"
+        with np.load(npz_path) as npz:
+            if key not in npz:
+                raise FileNotFoundError(f"missing {key} in {npz_path}")
+            score = np.asarray(npz[key], dtype=np.float32)
+        image = Image.fromarray((np.clip(score, 0.0, 1.0) * 255.0).round().astype("uint8"), mode="L")
+        output = BytesIO()
+        image.save(output, format="PNG")
+        return output.getvalue()
 
     def save_review(self) -> None:
         payload = {
@@ -393,6 +487,10 @@ def item_id(item: dict[str, object], index: int) -> str:
     return stem or f"sample_{index}"
 
 
+def quote_path(value: str) -> str:
+    return quote(value, safe="")
+
+
 def first_note(items: list[dict[str, object]]) -> str:
     for item in items:
         note = str(item.get("review_note", ""))
@@ -490,6 +588,9 @@ def make_handler(app: SegmentReviewApp) -> type[BaseHTTPRequestHandler]:
             if parsed.path == "/ocr-review":
                 self.write_bytes(OCR_REVIEW_HTML.encode("utf-8"), "text/html; charset=utf-8")
                 return
+            if parsed.path == "/craft-review":
+                self.write_bytes(CRAFT_REVIEW_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                return
             if parsed.path == "/api/state":
                 query = parse_qs(parsed.query)
                 self.write_json(
@@ -501,6 +602,9 @@ def make_handler(app: SegmentReviewApp) -> type[BaseHTTPRequestHandler]:
                     )
                 )
                 return
+            if parsed.path == "/api/craft-state":
+                self.write_json(app.craft_state())
+                return
             if parsed.path.startswith("/images/"):
                 filename = unquote(parsed.path.removeprefix("/images/"))
                 image_path = (app.images_dir / filename).resolve()
@@ -509,6 +613,26 @@ def make_handler(app: SegmentReviewApp) -> type[BaseHTTPRequestHandler]:
                     return
                 content_type = mimetypes.guess_type(str(image_path))[0] or "application/octet-stream"
                 self.write_bytes(image_path.read_bytes(), content_type)
+                return
+            if parsed.path.startswith("/craft-file/"):
+                filename = unquote(parsed.path.removeprefix("/craft-file/"))
+                craft_path = (app.samples_dir / filename).resolve()
+                if app.samples_dir not in craft_path.parents or not craft_path.exists():
+                    self.send_error(404)
+                    return
+                content_type = mimetypes.guess_type(str(craft_path))[0] or "application/octet-stream"
+                self.write_bytes(craft_path.read_bytes(), content_type)
+                return
+            if parsed.path.startswith("/craft-score/"):
+                parts = parsed.path.removeprefix("/craft-score/").split("/", 1)
+                if len(parts) != 2 or parts[0] not in {"text", "link"} or not parts[1].endswith(".png"):
+                    self.send_error(404)
+                    return
+                stem = unquote(parts[1][:-4])
+                try:
+                    self.write_bytes(app.render_craft_score_png(stem, parts[0]), "image/png")
+                except Exception as exc:
+                    self.send_error(404, str(exc))
                 return
             self.send_error(404)
 
@@ -938,6 +1062,7 @@ HTML = r"""<!doctype html>
       </div>
       <div class="actions">
         <button id="openCandidateReview" class="primary">OCR 合并</button>
+        <button id="openCraftReview">CRAFT 可视化</button>
         <button id="subtitleOnly" class="mode">仅显示有字幕</button>
         <input id="groupSegment" placeholder="当前组 segment_id">
         <button id="renameGroup">保存组</button>
@@ -1468,6 +1593,7 @@ function createNavigationHoldController(shortcuts) {
 
 document.getElementById("subtitleOnly").onclick = () => { showOnlySubtitle = !showOnlySubtitle; selectedItemIndex = 0; render(); };
 document.getElementById("openCandidateReview").onclick = () => { window.location.href = "/ocr-review"; };
+document.getElementById("openCraftReview").onclick = () => { window.location.href = "/craft-review"; };
 document.getElementById("renameGroup").onclick = renameGroup;
 document.getElementById("prevGroup").onclick = () => moveGroup(-1);
 document.getElementById("nextGroup").onclick = () => moveGroup(1);
@@ -2099,6 +2225,484 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) navigationHold.releaseAll();
 });
 init();
+</script>
+</body>
+</html>
+"""
+
+
+CRAFT_REVIEW_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CRAFT 可视化</title>
+  <style>
+    :root {
+      font-family: Arial, "Microsoft YaHei", sans-serif;
+      color: #202124;
+      background: #f6f7f9;
+      --border: #d7dce2;
+      --muted: #5f6368;
+      --accent: #0b57d0;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main {
+      height: 100vh;
+      display: grid;
+      grid-template-columns: 330px minmax(0, 1fr);
+      background: #f6f7f9;
+    }
+    aside {
+      min-width: 0;
+      min-height: 0;
+      background: #fff;
+      border-right: 1px solid var(--border);
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      overflow: hidden;
+    }
+    section {
+      min-width: 0;
+      min-height: 0;
+      display: grid;
+      grid-template-rows: auto auto minmax(0, 1fr);
+      overflow: hidden;
+    }
+    h1 { margin: 0 0 6px; font-size: 18px; }
+    .meta {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      word-break: break-all;
+    }
+    .sidebar-head,
+    .topbar {
+      padding: 12px 14px;
+      background: #fff;
+      border-bottom: 1px solid var(--border);
+    }
+    .topbar {
+      display: grid;
+      gap: 8px;
+    }
+    .actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    button {
+      min-height: 34px;
+      border: 1px solid #b7bec7;
+      background: #fff;
+      cursor: pointer;
+      padding: 0 12px;
+      font-size: 13px;
+    }
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    button.mode.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    button:disabled {
+      background: #f1f3f4;
+      border-color: #d7dce2;
+      color: #9aa0a6;
+      cursor: default;
+    }
+    .list {
+      min-height: 0;
+      overflow: auto;
+      display: grid;
+      align-content: start;
+      gap: 5px;
+      padding: 8px;
+    }
+    .sample {
+      width: 100%;
+      min-height: 58px;
+      text-align: left;
+      border: 1px solid transparent;
+      border-left: 4px solid transparent;
+      background: #fff;
+      display: grid;
+      grid-template-columns: 92px minmax(0, 1fr);
+      gap: 8px;
+      padding: 6px;
+    }
+    .sample.active {
+      border-color: var(--accent);
+      border-left-color: var(--accent);
+      background: #eef4ff;
+    }
+    .sample.empty {
+      opacity: 0.72;
+    }
+    .thumb {
+      width: 100%;
+      height: 48px;
+      object-fit: contain;
+      background: #101214;
+      display: block;
+    }
+    .sample-main {
+      min-width: 0;
+      display: grid;
+      gap: 3px;
+      align-content: center;
+    }
+    .sample-id {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .status {
+      padding: 8px 14px;
+      min-height: 34px;
+      color: var(--muted);
+      background: #fff;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .workspace {
+      min-height: 0;
+      overflow: auto;
+      padding: 12px;
+      display: grid;
+      grid-template-rows: minmax(260px, 1fr) auto;
+      gap: 12px;
+    }
+    .visual-grid {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .panel {
+      min-width: 0;
+      min-height: 0;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      border: 1px solid var(--border);
+      background: #fff;
+    }
+    .panel-head {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .panel-body {
+      min-height: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #101214;
+      padding: 10px;
+    }
+    .panel-body img {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+      cursor: zoom-in;
+      background: #000;
+    }
+    .detail {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 12px;
+    }
+    .detail-box {
+      border: 1px solid var(--border);
+      background: #fff;
+      padding: 10px;
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+    .ocr-text {
+      min-height: 68px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: #303134;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .viewer {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0, 0, 0, 0.86);
+      z-index: 20;
+      padding: 24px;
+    }
+    .viewer.open { display: flex; }
+    .viewer img {
+      max-width: 96vw;
+      max-height: 88vh;
+      object-fit: contain;
+      background: #000;
+    }
+    @media (max-width: 1100px) {
+      main { grid-template-columns: 250px minmax(0, 1fr); }
+      .visual-grid { grid-template-columns: minmax(0, 1fr); }
+      .detail { grid-template-columns: minmax(0, 1fr); }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <aside>
+    <div class="sidebar-head">
+      <h1>CRAFT 输出</h1>
+      <div class="meta" id="meta">加载中...</div>
+    </div>
+    <div class="list" id="list"></div>
+  </aside>
+  <section>
+    <div class="topbar">
+      <div>
+        <h1 id="title">未选择</h1>
+        <div class="meta" id="detail"></div>
+      </div>
+      <div class="actions">
+        <button id="prev">← 上一个</button>
+        <button id="next">→ 下一个</button>
+        <button id="subtitleOnly" class="mode">仅显示有字幕</button>
+        <button id="back" class="primary">返回分组检查</button>
+      </div>
+    </div>
+    <div class="status" id="status">读取 craft_outputs/manifest.jsonl。</div>
+    <div class="workspace">
+      <div class="visual-grid">
+        <div class="panel">
+          <div class="panel-head">ROI 图像</div>
+          <div class="panel-body"><img id="roiImage" alt=""></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">score_text</div>
+          <div class="panel-body"><img id="textScoreImage" alt=""></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">score_link</div>
+          <div class="panel-body"><img id="linkScoreImage" alt=""></div>
+        </div>
+      </div>
+      <div class="detail">
+        <div class="detail-box">
+          <div class="meta" id="sampleMeta"></div>
+          <div class="ocr-text" id="ocrText"></div>
+        </div>
+        <div class="detail-box">
+          <div class="meta" id="scoreMeta"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+<div class="viewer" id="viewer"><img id="viewerImg" alt=""></div>
+<script>
+let state = null;
+let activeIndex = 0;
+let showOnlySubtitle = false;
+const listEl = document.getElementById("list");
+const metaEl = document.getElementById("meta");
+const titleEl = document.getElementById("title");
+const detailEl = document.getElementById("detail");
+const statusEl = document.getElementById("status");
+const roiImageEl = document.getElementById("roiImage");
+const textScoreImageEl = document.getElementById("textScoreImage");
+const linkScoreImageEl = document.getElementById("linkScoreImage");
+const sampleMetaEl = document.getElementById("sampleMeta");
+const scoreMetaEl = document.getElementById("scoreMeta");
+const ocrTextEl = document.getElementById("ocrText");
+const viewerEl = document.getElementById("viewer");
+const viewerImg = document.getElementById("viewerImg");
+
+async function loadState() {
+  state = await fetch("/api/craft-state").then(response => response.json());
+  render();
+}
+
+function visibleItems() {
+  const items = state?.items || [];
+  return showOnlySubtitle ? items.filter(item => item.review_has_subtitle) : items;
+}
+
+function render() {
+  if (!state?.available) {
+    metaEl.textContent = "未找到 craft_outputs/manifest.jsonl";
+    titleEl.textContent = "没有 CRAFT 输出";
+    detailEl.textContent = state?.craft_outputs_dir || "";
+    listEl.innerHTML = "";
+    clearImages();
+    statusEl.textContent = "先为当前 samples-dir 生成 craft_outputs 后再打开此页。";
+    return;
+  }
+  const items = visibleItems();
+  const stats = state.stats;
+  metaEl.textContent = `${stats.matched_samples}/${stats.manifest_samples} 张已匹配 | 有字幕 ${stats.subtitle_samples} | ${state.craft_outputs_dir}`;
+  document.getElementById("subtitleOnly").classList.toggle("active", showOnlySubtitle);
+  activeIndex = Math.max(0, Math.min(items.length - 1, activeIndex));
+  listEl.innerHTML = items.map((item, index) => renderListItem(item, index)).join("");
+  listEl.querySelectorAll(".sample").forEach(button => {
+    button.onclick = () => {
+      activeIndex = Number(button.dataset.index);
+      renderActive(true);
+    };
+  });
+  if (!items.length) {
+    titleEl.textContent = "没有符合条件的 CRAFT 样本";
+    detailEl.textContent = "";
+    clearImages();
+    statusEl.textContent = "当前筛选没有样本。";
+    return;
+  }
+  renderActive(true);
+}
+
+function renderListItem(item, index) {
+  const image = `/images/${encodeURIComponent(imageName(item.image))}`;
+  return `
+    <button class="sample ${index === activeIndex ? "active" : ""} ${item.review_has_subtitle ? "" : "empty"}" data-index="${index}">
+      <img class="thumb" src="${image}" alt="">
+      <span class="sample-main">
+        <span class="sample-id">${escapeHtml(item.id)}</span>
+        <span class="meta">${item.review_has_subtitle ? "有字幕" : "无字幕"} | max=${formatScore(item.score_text_max)}</span>
+      </span>
+    </button>
+  `;
+}
+
+function renderActive(scroll) {
+  const items = visibleItems();
+  const item = items[activeIndex];
+  if (!item) return;
+  listEl.querySelectorAll(".sample").forEach((button, index) => {
+    button.classList.toggle("active", index === activeIndex);
+  });
+  const active = listEl.querySelector(`.sample[data-index="${activeIndex}"]`);
+  if (active && scroll) active.scrollIntoView({block: "nearest", inline: "nearest"});
+  const image = `/images/${encodeURIComponent(imageName(item.image))}`;
+  roiImageEl.src = image;
+  roiImageEl.dataset.full = image;
+  textScoreImageEl.src = item.score_text_url;
+  textScoreImageEl.dataset.full = item.score_text_url;
+  linkScoreImageEl.src = item.score_link_url;
+  linkScoreImageEl.dataset.full = item.score_link_url;
+  titleEl.textContent = item.id;
+  detailEl.textContent = `${activeIndex + 1}/${items.length} | ${item.review_has_subtitle ? "有字幕" : "无字幕"} | ${item.review_segment_id}`;
+  sampleMetaEl.textContent = `${item.image} | stem=${item.stem}`;
+  ocrTextEl.textContent = item.ocr_text ? `OCR: ${item.ocr_text}` : "OCR: ";
+  scoreMetaEl.textContent = `score_text_max=${formatScore(item.score_text_max)} | score_text_mean=${formatScore(item.score_text_mean)} | source=${state.summary?.teacher_method || "craft_outputs"}`;
+  statusEl.textContent = "只读显示 CRAFT score map；不会写入 review 文件。";
+}
+
+function clearImages() {
+  [roiImageEl, textScoreImageEl, linkScoreImageEl].forEach(img => {
+    img.removeAttribute("src");
+    img.removeAttribute("data-full");
+  });
+  sampleMetaEl.textContent = "";
+  scoreMetaEl.textContent = "";
+  ocrTextEl.textContent = "";
+}
+
+function move(delta) {
+  const items = visibleItems();
+  if (!items.length) return;
+  activeIndex = Math.max(0, Math.min(items.length - 1, activeIndex + delta));
+  renderActive(true);
+}
+
+function imageName(path) {
+  return String(path).split("/").pop();
+}
+
+function formatScore(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "0.0000";
+  return number.toFixed(4);
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
+function isTextEntryFocus() {
+  const element = document.activeElement;
+  if (!element) return false;
+  if (element.isContentEditable) return true;
+  return ["INPUT", "TEXTAREA", "SELECT"].includes(element.tagName);
+}
+
+function suppressFocusedButtonActivation(event) {
+  const element = document.activeElement;
+  if (!element || element.tagName !== "BUTTON") return false;
+  if (event.key !== "Enter" && event.key !== " ") return false;
+  event.preventDefault();
+  event.stopPropagation();
+  element.blur();
+  return true;
+}
+
+document.getElementById("prev").onclick = () => move(-1);
+document.getElementById("next").onclick = () => move(1);
+document.getElementById("subtitleOnly").onclick = () => {
+  showOnlySubtitle = !showOnlySubtitle;
+  activeIndex = 0;
+  render();
+};
+document.getElementById("back").onclick = () => { window.location.href = "/"; };
+[roiImageEl, textScoreImageEl, linkScoreImageEl].forEach(img => {
+  img.onclick = () => {
+    if (!img.dataset.full) return;
+    viewerImg.src = img.dataset.full;
+    viewerEl.classList.add("open");
+  };
+});
+viewerEl.onclick = () => viewerEl.classList.remove("open");
+document.addEventListener("keydown", event => {
+  if (viewerEl.classList.contains("open")) {
+    if (event.key === "Escape" || event.key.toLowerCase() === "v") viewerEl.classList.remove("open");
+    return;
+  }
+  if (isTextEntryFocus()) return;
+  if (suppressFocusedButtonActivation(event)) return;
+  if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+    event.preventDefault();
+    move(1);
+  }
+  if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+    event.preventDefault();
+    move(-1);
+  }
+  if (event.key.toLowerCase() === "v") {
+    const target = document.activeElement?.classList?.contains("sample") ? roiImageEl : textScoreImageEl;
+    if (target?.dataset.full) {
+      viewerImg.src = target.dataset.full;
+      viewerEl.classList.add("open");
+    }
+  }
+  if (event.key === "Escape") window.location.href = "/";
+});
+loadState();
 </script>
 </body>
 </html>
