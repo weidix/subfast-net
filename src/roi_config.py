@@ -20,6 +20,8 @@ class RoiTrainSettings(BaseModel):
     max_val_samples: int | None = None
     negative_ratio: float | None = 0.35
     val_negative_ratio: float | None = None
+    short_positive_loss_weight: float = 1.0
+    short_positive_mask_loss_weight: float = 0.0
     embedding_loss_weight: float = 1.0
     embedding_loss_alpha: float = 1.0
     embedding_pair_frame_window: int = 90
@@ -29,6 +31,7 @@ class RoiTrainSettings(BaseModel):
     embedding_positive_consistency_margin: float = 0.75
     embedding_temperature: float = 0.1
     embedding_similarity_threshold: float = 0.5
+    presence_topk_ratio: float = 0.05
     embedding_head_type: str = "gap"
     embedding_sequence_channels: int = 16
     width: int = 32

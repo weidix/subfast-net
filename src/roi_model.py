@@ -61,10 +61,13 @@ class LocalTextnessPresenceHead(nn.Module):
         self.flatten = nn.Flatten(start_dim=1)
 
     def forward(self, feature_map: torch.Tensor) -> torch.Tensor:
-        textness_map = self.textness(self.local(feature_map))
+        textness_map = self.textness_map(feature_map)
         textness = self.flatten(textness_map)
         k = max(1, int(textness.shape[1] * self.topk_ratio + 0.999999))
         return textness.topk(k, dim=1).values.mean(dim=1)
+
+    def textness_map(self, feature_map: torch.Tensor) -> torch.Tensor:
+        return self.textness(self.local(feature_map))
 
 
 class LocalContrastEnhancement(nn.Module):
@@ -96,6 +99,7 @@ class RoiPresenceEmbeddingModel(nn.Module):
         *,
         embedding_head_type: str = "gap",
         embedding_sequence_channels: int = 16,
+        presence_topk_ratio: float = 0.05,
     ) -> None:
         super().__init__()
         if embedding_head_type not in {"gap", "hybrid_lite"}:
@@ -116,7 +120,7 @@ class RoiPresenceEmbeddingModel(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.flatten = nn.Flatten()
         self.presence_contrast = LocalContrastEnhancement()
-        self.presence_head = LocalTextnessPresenceHead(feature_dim * 2, hidden_dim=feature_dim)
+        self.presence_head = LocalTextnessPresenceHead(feature_dim * 2, hidden_dim=feature_dim, topk_ratio=presence_topk_ratio)
         self.embedding_head = nn.Sequential(
             nn.Linear(feature_dim, feature_dim),
             nn.SiLU(inplace=True),
@@ -159,3 +163,16 @@ class RoiPresenceEmbeddingModel(nn.Module):
         if self.hybrid_embedding_head is not None:
             gap_feature = self.hybrid_embedding_head(gap_feature, feature_map)
         return presence_logit, F.normalize(gap_feature, p=2, dim=1)
+
+    def forward_with_presence_map(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        feature_map = self.encode_map(images)
+        features = self._pool_features(feature_map)
+        presence_feature = self.presence_contrast(feature_map)
+        textness_map = self.presence_head.textness_map(presence_feature)
+        presence_logit = self.presence_head.flatten(textness_map)
+        k = max(1, int(presence_logit.shape[1] * self.presence_head.topk_ratio + 0.999999))
+        presence_logit = presence_logit.topk(k, dim=1).values.mean(dim=1)
+        gap_feature = self.embedding_head(features)
+        if self.hybrid_embedding_head is not None:
+            gap_feature = self.hybrid_embedding_head(gap_feature, feature_map)
+        return presence_logit, F.normalize(gap_feature, p=2, dim=1), textness_map

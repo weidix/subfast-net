@@ -83,6 +83,7 @@ def roi_presence_embedding_loss(
     presence: torch.Tensor,
     segment_ids: list[str],
     *,
+    presence_loss_weights: torch.Tensor | None = None,
     roots: list[str],
     video_ids: list[str | None],
     frame_indices: list[int | None],
@@ -96,7 +97,7 @@ def roi_presence_embedding_loss(
     embedding_positive_consistency_margin: float = 0.75,
     embedding_temperature: float = 0.1,
 ) -> RoiLossBreakdown:
-    presence_loss = F.binary_cross_entropy_with_logits(presence_logit, presence)
+    presence_loss = F.binary_cross_entropy_with_logits(presence_logit, presence, weight=presence_loss_weights)
     (
         embedding_loss,
         embedding_pairs,

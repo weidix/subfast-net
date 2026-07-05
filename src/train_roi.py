@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -188,6 +189,7 @@ def make_model(settings: RoiTrainSettings) -> RoiPresenceEmbeddingModel:
         embedding_dim=settings.embedding_dim,
         embedding_head_type=settings.embedding_head_type,
         embedding_sequence_channels=settings.embedding_sequence_channels,
+        presence_topk_ratio=settings.presence_topk_ratio,
     )
 
 
@@ -249,6 +251,7 @@ def load_model_checkpoint(
         embedding_dim=int(raw_settings.get("embedding_dim", RoiTrainSettings().embedding_dim)),
         embedding_head_type=str(raw_settings.get("embedding_head_type", RoiTrainSettings().embedding_head_type)),
         embedding_sequence_channels=int(raw_settings.get("embedding_sequence_channels", RoiTrainSettings().embedding_sequence_channels)),
+        presence_topk_ratio=float(raw_settings.get("presence_topk_ratio", RoiTrainSettings().presence_topk_ratio)),
     ).to(device)
     model.load_state_dict(checkpoint["model"])
     return model, checkpoint
@@ -516,6 +519,46 @@ def validate(
     return metrics
 
 
+def short_positive_presence_weights(presence: torch.Tensor, ocr_texts: list[str], weight: float) -> torch.Tensor | None:
+    if weight == 1.0:
+        return None
+    weights = torch.ones_like(presence)
+    short_positive = [
+        bool(is_positive) and 0 < len(normalize_ocr_text(text)) <= _SHORT_SUBTITLE_MAX_CHARS
+        for is_positive, text in zip((presence > 0.5).detach().cpu().tolist(), ocr_texts, strict=True)
+    ]
+    if any(short_positive):
+        weights[torch.tensor(short_positive, dtype=torch.bool, device=presence.device)] = weight
+    return weights
+
+
+def short_positive_mask_loss(
+    textness_map: torch.Tensor,
+    subtitle_masks: torch.Tensor,
+    presence: torch.Tensor,
+    ocr_texts: list[str],
+    weight: float,
+) -> torch.Tensor:
+    if weight <= 0.0:
+        return textness_map.sum() * 0.0
+    short_positive = torch.tensor(
+        [
+            bool(is_positive) and 0 < len(normalize_ocr_text(text)) <= _SHORT_SUBTITLE_MAX_CHARS
+            for is_positive, text in zip((presence > 0.5).detach().cpu().tolist(), ocr_texts, strict=True)
+        ],
+        dtype=torch.bool,
+        device=presence.device,
+    )
+    if not bool(short_positive.any()):
+        return textness_map.sum() * 0.0
+    target = F.interpolate(
+        subtitle_masks.to(device=textness_map.device, dtype=textness_map.dtype),
+        size=textness_map.shape[-2:],
+        mode="area",
+    ).clamp(0.0, 1.0)
+    return F.binary_cross_entropy_with_logits(textness_map[short_positive], target[short_positive]) * weight
+
+
 def run_training(settings: RoiTrainSettings) -> dict[str, float]:
     seed_everything(settings.seed)
     device = choose_device(settings.device)
@@ -576,6 +619,9 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
         f"config: batch_size={settings.batch_size} epochs={settings.epochs} lr={settings.learning_rate:g} "
         f"weight_decay={settings.weight_decay:g} embedding_dim={settings.embedding_dim} "
         f"embedding_head={settings.embedding_head_type} sequence_channels={settings.embedding_sequence_channels} "
+        f"presence_topk_ratio={settings.presence_topk_ratio:g} "
+        f"short_positive_loss_weight={settings.short_positive_loss_weight:g} "
+        f"short_positive_mask_loss_weight={settings.short_positive_mask_loss_weight:g} "
         f"embedding_loss_weight={settings.embedding_loss_weight:g} resize_roi={settings.resize_roi} "
         f"embedding_loss_alpha={settings.embedding_loss_alpha:g} "
         f"embedding_pair_frame_window={settings.embedding_pair_frame_window} "
@@ -595,6 +641,7 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
             model.train()
             train_loss = 0.0
             train_presence_loss = 0.0
+            train_short_mask_loss = 0.0
             train_embedding_loss = 0.0
             train_embedding_pairs = 0
             train_embedding_local_positive_pairs = 0
@@ -610,12 +657,28 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                 images = batch.images.to(device)
                 presence = batch.presence.to(device)
                 optimizer.zero_grad(set_to_none=True)
-                presence_logit, embedding = model(images)
+                if settings.short_positive_mask_loss_weight > 0.0:
+                    presence_logit, embedding, textness_map = model.forward_with_presence_map(images)
+                    mask_loss = short_positive_mask_loss(
+                        textness_map,
+                        batch.subtitle_masks,
+                        presence,
+                        batch.ocr_texts,
+                        settings.short_positive_mask_loss_weight,
+                    )
+                else:
+                    presence_logit, embedding = model(images)
+                    mask_loss = presence_logit.sum() * 0.0
                 loss = roi_presence_embedding_loss(
                     presence_logit,
                     embedding,
                     presence,
                     batch.segment_ids,
+                    presence_loss_weights=short_positive_presence_weights(
+                        presence,
+                        batch.ocr_texts,
+                        settings.short_positive_loss_weight,
+                    ),
                     roots=batch.roots,
                     video_ids=batch.video_ids,
                     frame_indices=batch.frame_indices,
@@ -629,11 +692,13 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                     embedding_positive_consistency_margin=settings.embedding_positive_consistency_margin,
                     embedding_temperature=settings.embedding_temperature,
                 )
-                loss.total.backward()
+                total_loss = loss.total + mask_loss
+                total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-                train_loss += float(loss.total.detach().cpu())
+                train_loss += float(total_loss.detach().cpu())
                 train_presence_loss += float(loss.presence_loss.detach().cpu())
+                train_short_mask_loss += float(mask_loss.detach().cpu())
                 train_embedding_loss += float(loss.embedding_loss.detach().cpu())
                 train_embedding_pairs += loss.embedding_pairs
                 train_embedding_local_positive_pairs += loss.embedding_local_positive_pairs
@@ -649,8 +714,9 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                     "step": float(global_step),
                     "epoch_batch": float(batch_index),
                     "epoch_batches": float(total_batches),
-                    "total_loss": float(loss.total.detach().cpu()),
+                    "total_loss": float(total_loss.detach().cpu()),
                     "presence_loss": float(loss.presence_loss.detach().cpu()),
+                    "short_mask_loss": float(mask_loss.detach().cpu()),
                     "embedding_loss": float(loss.embedding_loss.detach().cpu()),
                     "embedding_bce_loss": float(loss.embedding_bce_loss.detach().cpu()),
                     "positive_consistency_loss": float(loss.positive_consistency_loss.detach().cpu()),
@@ -676,6 +742,7 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                     "step": float(global_step),
                     "train_loss": train_loss / max(1, batches),
                     "train_presence_loss": train_presence_loss / max(1, batches),
+                    "train_short_mask_loss": train_short_mask_loss / max(1, batches),
                     "train_embedding_loss": train_embedding_loss / max(1, batches),
                     "train_embedding_pairs": float(train_embedding_pairs),
                     "train_embedding_local_positive_pairs": float(train_embedding_local_positive_pairs),
@@ -740,6 +807,8 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
     parser.add_argument("--negative-ratio", type=float, help="Target no-subtitle ROI training sample ratio in [0, 1].")
     parser.add_argument("--val-positive-ratio", type=float, help="Target subtitle-present ROI validation sample ratio in [0, 1].")
     parser.add_argument("--val-negative-ratio", type=float, help="Target no-subtitle ROI validation sample ratio in [0, 1].")
+    parser.add_argument("--short-positive-loss-weight", type=float, default=RoiTrainSettings().short_positive_loss_weight)
+    parser.add_argument("--short-positive-mask-loss-weight", type=float, default=RoiTrainSettings().short_positive_mask_loss_weight)
     parser.add_argument("--embedding-loss-weight", type=float, default=RoiTrainSettings().embedding_loss_weight)
     parser.add_argument("--embedding-loss-alpha", type=float, default=RoiTrainSettings().embedding_loss_alpha)
     parser.add_argument("--embedding-pair-frame-window", type=int, default=RoiTrainSettings().embedding_pair_frame_window)
@@ -753,6 +822,7 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
     parser.add_argument("--embedding-positive-consistency-margin", type=float, default=RoiTrainSettings().embedding_positive_consistency_margin)
     parser.add_argument("--embedding-temperature", type=float, default=RoiTrainSettings().embedding_temperature)
     parser.add_argument("--embedding-similarity-threshold", type=float, default=RoiTrainSettings().embedding_similarity_threshold)
+    parser.add_argument("--presence-topk-ratio", type=float, default=RoiTrainSettings().presence_topk_ratio)
     parser.add_argument("--embedding-head", choices=("gap", "hybrid_lite"), default=RoiTrainSettings().embedding_head_type)
     parser.add_argument("--embedding-sequence-channels", type=int, default=RoiTrainSettings().embedding_sequence_channels)
     parser.add_argument("--width", type=int, default=RoiTrainSettings().width)
@@ -797,6 +867,12 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
     )
     if args.embedding_pair_frame_window < 0:
         parser.error("--embedding-pair-frame-window must be non-negative")
+    if args.short_positive_loss_weight <= 0.0:
+        parser.error("--short-positive-loss-weight must be positive")
+    if args.short_positive_mask_loss_weight < 0.0:
+        parser.error("--short-positive-mask-loss-weight must be non-negative")
+    if args.presence_topk_ratio <= 0.0 or args.presence_topk_ratio > 1.0:
+        parser.error("--presence-topk-ratio must be in (0, 1]")
     if not 0.0 <= args.embedding_ocr_negative_max_similarity <= 1.0:
         parser.error("--embedding-ocr-negative-max-similarity must be in [0, 1]")
     max_train_samples = args.max_train_samples if args.max_train_samples is not None else args.max_samples
@@ -813,6 +889,8 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
         max_val_samples=args.max_val_samples,
         negative_ratio=empty_ratio,
         val_negative_ratio=val_empty_ratio,
+        short_positive_loss_weight=args.short_positive_loss_weight,
+        short_positive_mask_loss_weight=args.short_positive_mask_loss_weight,
         embedding_loss_weight=args.embedding_loss_weight,
         embedding_loss_alpha=args.embedding_loss_alpha,
         embedding_pair_frame_window=args.embedding_pair_frame_window,
@@ -822,6 +900,7 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
         embedding_positive_consistency_margin=args.embedding_positive_consistency_margin,
         embedding_temperature=args.embedding_temperature,
         embedding_similarity_threshold=args.embedding_similarity_threshold,
+        presence_topk_ratio=args.presence_topk_ratio,
         embedding_head_type=args.embedding_head,
         embedding_sequence_channels=args.embedding_sequence_channels,
         width=args.width,

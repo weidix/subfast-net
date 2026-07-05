@@ -13,6 +13,7 @@ from torch.nn import functional as F
 from torch.utils.data import Dataset
 
 from .dataset import IMAGENET_MEAN, IMAGENET_STD
+from .geometry import Box, yolo_to_box
 from .roi_pairs import parse_frame_index, parse_video_frame_from_sample_id, parse_video_id
 
 REVIEW_FILENAME = "segment_review.json"
@@ -21,6 +22,7 @@ REVIEW_FILENAME = "segment_review.json"
 @dataclass(frozen=True)
 class RoiSample:
     image_path: Path
+    label_path: Path
     sample_id: str
     root: Path
     has_subtitle: bool
@@ -34,6 +36,7 @@ class RoiSample:
 @dataclass(frozen=True)
 class RoiBatch:
     images: torch.Tensor
+    subtitle_masks: torch.Tensor
     presence: torch.Tensor
     segment_ids: list[str]
     sample_ids: list[str]
@@ -134,9 +137,61 @@ def annotation_ocr_text(item: dict) -> str:
     return str(text)
 
 
+def read_roi_label_boxes(label_path: Path, width: int, height: int) -> list[Box]:
+    if not label_path.exists():
+        return []
+    boxes: list[Box] = []
+    for line in label_path.read_text(encoding="utf-8").splitlines():
+        parts = line.split()
+        if len(parts) != 5:
+            continue
+        try:
+            values = tuple(float(part) for part in parts)
+        except ValueError:
+            continue
+        box = yolo_to_box(values, width, height)
+        if box.width > 0.5 and box.height > 0.5:
+            boxes.append(box)
+    return boxes
+
+
+def subtitle_mask_from_labels(
+    label_path: Path,
+    *,
+    output_size: tuple[int, int],
+    label_size: tuple[int, int],
+) -> torch.Tensor:
+    output_w, output_h = output_size
+    mask = torch.zeros((1, output_h, output_w), dtype=torch.float32)
+    roi_w, roi_h = label_size
+    if roi_w <= 0 or roi_h <= 0:
+        return mask
+    boxes = read_roi_label_boxes(label_path, roi_w, roi_h)
+    if not boxes:
+        return mask
+    scale_x = output_w / roi_w
+    scale_y = output_h / roi_h
+    for box in boxes:
+        x1 = max(0.0, min(box.x1, float(roi_w)))
+        y1 = max(0.0, min(box.y1, float(roi_h)))
+        x2 = max(0.0, min(box.x2, float(roi_w)))
+        y2 = max(0.0, min(box.y2, float(roi_h)))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        left = max(0, min(output_w, int(np.floor(x1 * scale_x))))
+        top = max(0, min(output_h, int(np.floor(y1 * scale_y))))
+        right = max(left + 1, min(output_w, int(np.ceil(x2 * scale_x))))
+        bottom = max(top + 1, min(output_h, int(np.ceil(y2 * scale_y))))
+        mask[:, top:bottom, left:right] = 1.0
+    return mask
+
+
 def discover_roi_samples(root: Path) -> tuple[list[RoiSample], tuple[int, int]]:
     summary = load_summary(root)
     roi_size = (int(summary["roi_size"][0]), int(summary["roi_size"][1]))
+    labels_dir = root / "labels"
+    if not labels_dir.is_dir():
+        raise ValueError(f"missing ROI labels dir: {labels_dir}")
     review = load_review(root)
     samples: list[RoiSample] = []
     for index, item in enumerate(read_annotations(root)):
@@ -146,9 +201,13 @@ def discover_roi_samples(root: Path) -> tuple[list[RoiSample], tuple[int, int]]:
         default_segment = str(item.get("segment_marker") or sample_id)
         segment_id = str(reviewed.get("segment_id") or default_segment)
         image_path = root / str(item.get("image"))
+        label_path = labels_dir / f"{sample_id}.txt"
+        if not label_path.exists():
+            raise ValueError(f"missing ROI label file: {label_path}")
         samples.append(
             RoiSample(
                 image_path=image_path,
+                label_path=label_path,
                 sample_id=sample_id,
                 root=root,
                 has_subtitle=has_subtitle,
@@ -291,6 +350,11 @@ class RoiPresenceEmbeddingDataset(Dataset):
         image = (image - IMAGENET_MEAN) / IMAGENET_STD
         return {
             "image": image,
+            "subtitle_mask": subtitle_mask_from_labels(
+                sample.label_path,
+                output_size=self.output_roi_size,
+                label_size=tuple(expected),
+            ),
             "presence": torch.tensor(1.0 if sample.has_subtitle else 0.0, dtype=torch.float32),
             "segment_id": sample.segment_id,
             "sample_id": sample.sample_id,
@@ -326,8 +390,12 @@ def collate_roi_batch(items: list[dict]) -> RoiBatch:
     def pad_image(tensor: torch.Tensor) -> torch.Tensor:
         return F.pad(tensor, (0, max_w - tensor.shape[2], 0, max_h - tensor.shape[1]), value=0.0)
 
+    def pad_mask(tensor: torch.Tensor) -> torch.Tensor:
+        return F.pad(tensor, (0, max_w - tensor.shape[2], 0, max_h - tensor.shape[1]), value=0.0)
+
     return RoiBatch(
         images=torch.stack([pad_image(item["image"]) for item in items]),
+        subtitle_masks=torch.stack([pad_mask(item["subtitle_mask"]) for item in items]),
         presence=torch.stack([item["presence"] for item in items]),
         segment_ids=[item["segment_id"] for item in items],
         sample_ids=[item["sample_id"] for item in items],

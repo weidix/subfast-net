@@ -63,11 +63,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Keep empty-subtitle images by cropping the common ROI anchor.",
     )
     parser.add_argument(
-        "--copy-labels",
-        action="store_true",
-        help="Also write a labels/ directory with one full-image ROI label for positive samples.",
-    )
-    parser.add_argument(
         "--include-dropped-images",
         action="store_true",
         help="Include images marked with __image__.drop_image in label_masks.json. By default they are skipped.",
@@ -308,8 +303,35 @@ def recognize_sample_text(recognizer: Any, sample: SourceSample, boxes: list[Pix
     return "".join(parts)
 
 
-def write_full_roi_label(path: Path) -> None:
-    path.write_text("0 0.500000 0.500000 1.000000 1.000000\n", encoding="utf-8")
+def roi_label_line(box: PixelBox, crop_box: PixelBox, roi_width: int, roi_height: int) -> str | None:
+    clipped = PixelBox(
+        max(0, min(roi_width, box.x1 - crop_box.x1)),
+        max(0, min(roi_height, box.y1 - crop_box.y1)),
+        max(0, min(roi_width, box.x2 - crop_box.x1)),
+        max(0, min(roi_height, box.y2 - crop_box.y1)),
+    )
+    if clipped.width <= 0 or clipped.height <= 0:
+        return None
+    cx = (clipped.x1 + clipped.x2) / 2 / roi_width
+    cy = (clipped.y1 + clipped.y2) / 2 / roi_height
+    width = clipped.width / roi_width
+    height = clipped.height / roi_height
+    return f"0 {cx:.6f} {cy:.6f} {width:.6f} {height:.6f}"
+
+
+def write_roi_labels(
+    path: Path,
+    boxes: list[PixelBox],
+    crop_box: PixelBox,
+    roi_width: int,
+    roi_height: int,
+) -> None:
+    lines = [
+        line
+        for box in boxes
+        if (line := roi_label_line(box, crop_box, roi_width, roi_height)) is not None
+    ]
+    path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
 
 
 def save_fixed_roi_image(
@@ -337,8 +359,7 @@ def prepare_roi_samples(args: argparse.Namespace) -> int:
     images_dir = output / "images"
     labels_dir = output / "labels"
     images_dir.mkdir(parents=True, exist_ok=True)
-    if args.copy_labels:
-        labels_dir.mkdir(parents=True, exist_ok=True)
+    labels_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         recognizer = create_text_recognizer(PADDLEOCR_RECOGNITION_MODEL)
@@ -388,12 +409,13 @@ def prepare_roi_samples(args: argparse.Namespace) -> int:
             has_subtitle = has_label_box
             presence_method = "source_label_box_ocr_unavailable"
 
-        if args.copy_labels:
-            label_path = labels_dir / f"{sample.stem}.txt"
-            if has_subtitle:
-                write_full_roi_label(label_path)
-            else:
-                label_path.write_text("", encoding="utf-8")
+        write_roi_labels(
+            labels_dir / f"{sample.stem}.txt",
+            subtitle_boxes,
+            crop_box,
+            roi_width,
+            roi_height,
+        )
 
         annotation_rows.append(
             {

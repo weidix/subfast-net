@@ -137,7 +137,6 @@ class PrepareRoiSamplesTests(unittest.TestCase):
                         samples_dir=source,
                         output=output,
                         keep_empty=False,
-                        copy_labels=False,
                         include_dropped_images=False,
                     )
                 )
@@ -146,6 +145,7 @@ class PrepareRoiSamplesTests(unittest.TestCase):
 
             row = json.loads((output / "annotations.jsonl").read_text(encoding="utf-8").strip())
             summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+            label_text = (output / "labels" / "sample.txt").read_text(encoding="utf-8")
 
         self.assertEqual(status, 0)
         self.assertNotIn("segment_marker", row)
@@ -154,6 +154,53 @@ class PrepareRoiSamplesTests(unittest.TestCase):
         self.assertEqual(row["subtitle_presence_method"], "source_label_box_ocr")
         self.assertEqual(summary["subtitle_presence_method"], "source_label_box_ocr")
         self.assertNotIn("segment_marker_method", summary)
+        self.assertEqual(label_text, "0 0.500000 0.500000 1.000000 1.000000\n")
+
+    def test_prepare_writes_roi_coordinate_labels_without_flag(self):
+        class RecognizerStub:
+            def predict(self, path):
+                return {"rec_text": "字幕"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "source"
+            output = root / "roi"
+            (source / "images").mkdir(parents=True)
+            (source / "labels").mkdir()
+            Image.new("RGB", (100, 80), (20, 40, 90)).save(source / "images" / "sample.jpg")
+            (source / "labels" / "sample.txt").write_text(
+                "\n".join(
+                    [
+                        "0 0.300000 0.500000 0.200000 0.250000",
+                        "0 0.700000 0.500000 0.200000 0.250000",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (source / "label_masks.json").write_text(
+                json.dumps({"items": {"sample": {"1": {"deleted": True}}}}),
+                encoding="utf-8",
+            )
+
+            original_create = roi_prep.create_text_recognizer
+            roi_prep.create_text_recognizer = lambda _model_name: RecognizerStub()
+            try:
+                status = roi_prep.prepare_roi_samples(
+                    Namespace(
+                        samples_dir=source,
+                        output=output,
+                        keep_empty=False,
+                        include_dropped_images=False,
+                    )
+                )
+            finally:
+                roi_prep.create_text_recognizer = original_create
+
+            labels = (output / "labels" / "sample.txt").read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(status, 0)
+        self.assertEqual(labels, ["0 0.500000 0.500000 1.000000 1.000000"])
 
 
 if __name__ == "__main__":

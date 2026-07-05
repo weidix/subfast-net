@@ -11,11 +11,18 @@ from src.roi_dataset import RoiPresenceEmbeddingDataset, collate_roi_batch
 from src.roi_loss import roi_presence_embedding_loss
 from src.roi_pairs import select_embedding_pairs
 from src.roi_model import LocalTextnessPresenceHead, RoiPresenceEmbeddingModel
-from src.train_roi import format_epoch_summary, parse_args, run_training, should_save_roi_best_checkpoint
+from src.train_roi import (
+    format_epoch_summary,
+    parse_args,
+    run_training,
+    should_save_roi_best_checkpoint,
+    short_positive_mask_loss,
+)
 
 
 def write_roi_dataset(root: Path, *, size: tuple[int, int] = (32, 16)) -> None:
     (root / "images").mkdir(parents=True)
+    (root / "labels").mkdir()
     annotations = []
     rows = [
         ("a0", True, "seg-a", 0, "same subtitle"),
@@ -32,12 +39,16 @@ def write_roi_dataset(root: Path, *, size: tuple[int, int] = (32, 16)) -> None:
                 "image_width": size[0],
                 "image_height": size[1],
                 "roi_size": [size[0], size[1]],
+                "source_roi": [10, 20, 10 + size[0], 20 + size[1]],
+                "source_subtitle_boxes": [[10, 20, 10 + size[0], 20 + size[1]]] if has_subtitle else [],
                 "has_subtitle": has_subtitle,
                 "segment_marker": segment,
                 "ocr_text": ocr_text,
                 "ocr_text_normalized": ocr_text,
             }
         )
+        label_text = "0 0.250000 0.437500 0.250000 0.375000\n" if has_subtitle else ""
+        (root / "labels" / f"{name}.txt").write_text(label_text, encoding="utf-8")
     (root / "annotations.jsonl").write_text(
         "".join(json.dumps(item) + "\n" for item in annotations),
         encoding="utf-8",
@@ -97,8 +108,24 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
             self.assertEqual(dataset.summary.roi_size, (32, 16))
             self.assertEqual(dataset.summary.positive, 3)
             self.assertEqual(batch.images.shape, (2, 3, 16, 32))
+            self.assertEqual(batch.subtitle_masks.shape, (2, 1, 16, 32))
             self.assertEqual(batch.presence.tolist(), [1.0, 0.0])
             self.assertEqual(batch.segment_ids, ["seg-a", "empty"])
+            self.assertEqual(float(batch.subtitle_masks[0].sum()), 48.0)
+            self.assertEqual(float(batch.subtitle_masks[1].sum()), 0.0)
+
+    def test_dataset_maps_current_roi_labels_after_resize(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_roi_dataset(root, size=(32, 16))
+
+            dataset = RoiPresenceEmbeddingDataset([root], resize_roi=(16, 8))
+            item = dataset[0]
+
+            mask = item["subtitle_mask"]
+            self.assertEqual(mask.shape, (1, 8, 16))
+            self.assertEqual(float(mask.sum()), 12.0)
+            self.assertTrue(bool(mask[0, 2:5, 2:6].all()))
 
     def test_dataset_requires_explicit_resize_for_mismatched_roots(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -192,6 +219,45 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         loss.total.backward()
         self.assertIsNotNone(presence_logit.grad)
 
+    def test_presence_loss_accepts_sample_weights(self):
+        presence_logit = torch.zeros(3, requires_grad=True)
+        embedding = torch.nn.functional.normalize(torch.randn(3, 128, requires_grad=True), dim=1)
+        loss = roi_presence_embedding_loss(
+            presence_logit,
+            embedding,
+            torch.tensor([1.0, 1.0, 0.0]),
+            ["seg-a", "seg-b", "empty"],
+            presence_loss_weights=torch.tensor([3.0, 1.0, 1.0]),
+            roots=["root-a", "root-a", "root-a"],
+            video_ids=["video-1", "video-1", "video-1"],
+            frame_indices=[0, 30, 60],
+            ocr_texts=["好", "subtitle", ""],
+            embedding_loss_weight=0.0,
+            embedding_pair_frame_window=30,
+            embedding_ocr_negative_enabled=True,
+            embedding_ocr_negative_max_similarity=0.2,
+            embedding_temperature=0.1,
+        )
+
+        self.assertAlmostEqual(float(loss.presence_loss.detach()), float(torch.log(torch.tensor(2.0)) * 5.0 / 3.0))
+
+    def test_short_positive_mask_loss_targets_only_short_positive_masks(self):
+        textness = torch.zeros(3, 1, 2, 4, requires_grad=True)
+        masks = torch.zeros(3, 1, 8, 16)
+        masks[0, :, 2:6, 4:12] = 1.0
+        masks[2, :, 2:6, 4:12] = 1.0
+        presence = torch.tensor([1.0, 1.0, 1.0])
+
+        loss = short_positive_mask_loss(
+            textness,
+            masks,
+            presence,
+            ["好", "long subtitle", "无"],
+            weight=2.0,
+        )
+
+        self.assertAlmostEqual(float(loss.detach()), float(torch.log(torch.tensor(2.0)) * 2.0))
+
     def test_parse_args_uses_roi_training_names(self):
         settings = parse_args(
             [
@@ -203,6 +269,12 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
                 "128x32",
                 "--embedding-loss-weight",
                 "0.5",
+                "--short-positive-loss-weight",
+                "2.5",
+                "--short-positive-mask-loss-weight",
+                "1.25",
+                "--presence-topk-ratio",
+                "0.02",
                 "--embedding-head",
                 "hybrid_lite",
                 "--embedding-sequence-channels",
@@ -214,6 +286,9 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertEqual(settings.val_root, Path("data/roi_samples6"))
         self.assertEqual(settings.resize_roi, (128, 32))
         self.assertEqual(settings.embedding_loss_weight, 0.5)
+        self.assertEqual(settings.short_positive_loss_weight, 2.5)
+        self.assertEqual(settings.short_positive_mask_loss_weight, 1.25)
+        self.assertEqual(settings.presence_topk_ratio, 0.02)
         self.assertEqual(settings.embedding_head_type, "hybrid_lite")
         self.assertEqual(settings.embedding_sequence_channels, 16)
 
