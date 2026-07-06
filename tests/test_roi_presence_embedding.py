@@ -7,17 +7,22 @@ import torch
 from PIL import Image
 
 from src.roi_config import RoiTrainSettings
-from src.roi_dataset import RoiPresenceEmbeddingDataset, collate_roi_batch
-from src.roi_loss import roi_presence_embedding_loss
+from src.roi_dataset import RoiPresenceEmbeddingDataset, RoiSample, collate_roi_batch
+from src.roi_loss import EmbeddingPairMemory, balance_embedding_pairs, embedding_margin_loss, roi_presence_embedding_loss
 from src.roi_pairs import select_embedding_pairs
-from src.roi_model import LocalTextnessPresenceHead, RoiPresenceEmbeddingModel
+from src.roi_model import LocalContrastEmbeddingHead, LocalContrastResidual, LocalTextnessPresenceHead, RoiPresenceEmbeddingModel
 from src.train_roi import (
+    configure_training_phase,
     format_epoch_summary,
     parse_args,
     run_training,
     should_save_roi_best_checkpoint,
     short_positive_mask_loss,
+    training_summary,
+    training_phases,
+    validation_overlaps_training,
 )
+from src.roi_sampler import RoiBalancedBatchSampler
 
 
 def write_roi_dataset(root: Path, *, size: tuple[int, int] = (32, 16)) -> None:
@@ -59,7 +64,176 @@ def write_roi_dataset(root: Path, *, size: tuple[int, int] = (32, 16)) -> None:
     )
 
 
+def make_sampler_samples(
+    *, positives: int, negatives: int, repeated_segments: bool = True
+) -> list[RoiSample]:
+    samples: list[RoiSample] = []
+    for index in range(positives):
+        segment_number = index // 2 if repeated_segments else index
+        samples.append(
+            RoiSample(
+                image_path=Path(f"positive-{index}.jpg"),
+                label_path=Path(f"positive-{index}.txt"),
+                sample_id=f"positive-{index}",
+                root=Path("root"),
+                has_subtitle=True,
+                segment_id=f"segment-{segment_number}",
+                video_id="video",
+                frame_index=segment_number * 300 + index % 2 * 30,
+                ocr_text=f"subtitle-{segment_number}",
+                annotation={},
+            )
+        )
+    for index in range(negatives):
+        samples.append(
+            RoiSample(
+                image_path=Path(f"negative-{index}.jpg"),
+                label_path=Path(f"negative-{index}.txt"),
+                sample_id=f"negative-{index}",
+                root=Path("root"),
+                has_subtitle=False,
+                segment_id=f"empty-{index}",
+                video_id="video",
+                frame_index=10000 + index * 30,
+                ocr_text="",
+                annotation={},
+            )
+        )
+    return samples
+
+
 class RoiPresenceEmbeddingTests(unittest.TestCase):
+    def test_balanced_batch_sampler_realizes_presence_ratio_and_covers_every_sample(self):
+        samples = make_sampler_samples(positives=6, negatives=10)
+        sampler = RoiBalancedBatchSampler(samples, batch_size=4, negative_ratio=0.5, frame_window=90, seed=7)
+        batches = list(sampler)
+
+        self.assertTrue(all(sum(not samples[index].has_subtitle for index in batch) == 2 for batch in batches))
+        self.assertEqual({index for batch in batches for index in batch}, set(range(len(samples))))
+
+    def test_balanced_batch_sampler_is_reproducible_and_changes_by_epoch(self):
+        samples = make_sampler_samples(positives=8, negatives=8)
+        left = RoiBalancedBatchSampler(samples, batch_size=4, negative_ratio=0.5, frame_window=90, seed=11)
+        right = RoiBalancedBatchSampler(samples, batch_size=4, negative_ratio=0.5, frame_window=90, seed=11)
+
+        self.assertEqual(list(left), list(right))
+        left.set_epoch(1)
+        self.assertNotEqual(list(left), list(right))
+
+    def test_balanced_batch_sampler_places_valid_same_segment_pair_in_every_batch(self):
+        samples = make_sampler_samples(positives=8, negatives=8, repeated_segments=True)
+        sampler = RoiBalancedBatchSampler(samples, batch_size=4, negative_ratio=0.5, frame_window=90, seed=13)
+        for batch in sampler:
+            positives = [samples[index] for index in batch if samples[index].has_subtitle]
+            self.assertTrue(
+                any(
+                    left.root == right.root
+                    and left.video_id == right.video_id
+                    and left.segment_id == right.segment_id
+                    and abs(int(left.frame_index) - int(right.frame_index)) <= 90
+                    for offset, left in enumerate(positives)
+                    for right in positives[offset + 1 :]
+                )
+            )
+
+    def test_balance_embedding_pairs_keeps_all_positives_and_hardest_negatives(self):
+        similarities = torch.tensor([0.8, 0.7, 0.9, 0.6, 0.2, -0.1])
+        targets = torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+
+        selection = balance_embedding_pairs(similarities, targets, negative_ratio=0.5)
+
+        self.assertEqual(selection.indices.tolist(), [0, 1, 2, 3])
+        self.assertEqual(selection.candidate_positive_pairs, 2)
+        self.assertEqual(selection.candidate_negative_pairs, 4)
+        self.assertEqual(selection.selected_positive_pairs, 2)
+        self.assertEqual(selection.selected_negative_pairs, 2)
+
+    def test_balance_embedding_pairs_bounds_negative_only_batch(self):
+        similarities = torch.tensor([0.1, 0.9, 0.4])
+        targets = torch.zeros(3)
+
+        selection = balance_embedding_pairs(similarities, targets, negative_ratio=0.5)
+
+        self.assertEqual(selection.indices.tolist(), [1])
+
+    def test_embedding_margin_loss_enforces_tolerance_around_fixed_threshold(self):
+        similarities = torch.tensor([0.80, 0.20, 0.60, 0.40])
+        targets = torch.tensor([1.0, 0.0, 1.0, 0.0])
+
+        loss = embedding_margin_loss(similarities, targets)
+
+        self.assertAlmostEqual(float(loss), 0.1)
+
+    def test_embedding_margin_loss_balances_positive_and_negative_pairs(self):
+        similarities = torch.tensor([0.50] + [0.0] * 100)
+        targets = torch.tensor([1.0] + [0.0] * 100)
+
+        loss = embedding_margin_loss(similarities, targets)
+
+        self.assertAlmostEqual(float(loss), 0.16)
+
+    def test_embedding_margin_loss_keeps_hard_negative_from_easy_pair_dilution(self):
+        similarities = torch.tensor([0.50] + [0.0] * 99)
+        targets = torch.zeros(100)
+
+        loss = embedding_margin_loss(similarities, targets)
+
+        self.assertAlmostEqual(float(loss), 0.16)
+
+    def test_positive_embedding_memory_connects_same_segment_across_batches(self):
+        memory = EmbeddingPairMemory(frame_window=90)
+        first = torch.tensor([[1.0, 0.0]], requires_grad=True)
+        second = torch.tensor([[0.0, 1.0]], requires_grad=True)
+
+        first_loss, first_pairs = memory.loss_and_update(
+            first, torch.ones(1), ["segment-a"], ["root-a"], ["video-a"], [0], ["same text"]
+        )
+        second_loss, second_pairs = memory.loss_and_update(
+            second, torch.ones(1), ["segment-a"], ["root-a"], ["video-a"], [30], ["same text"]
+        )
+
+        self.assertEqual(first_pairs, 0)
+        self.assertEqual(float(first_loss.detach()), 0.0)
+        self.assertEqual(second_pairs, 1)
+        self.assertAlmostEqual(float(second_loss.detach()), 0.81, places=6)
+
+    def test_embedding_pair_memory_connects_local_negative_across_batches(self):
+        memory = EmbeddingPairMemory(frame_window=90)
+        first = torch.tensor([[1.0, 0.0]])
+        second = torch.tensor([[1.0, 0.0]], requires_grad=True)
+
+        memory.loss_and_update(first, torch.ones(1), ["segment-a"], ["root-a"], ["video-a"], [0], ["alpha text"])
+        loss, pairs = memory.loss_and_update(
+            second, torch.ones(1), ["segment-b"], ["root-a"], ["video-a"], [30], ["bravo text"]
+        )
+
+        self.assertEqual(pairs, 1)
+        self.assertAlmostEqual(float(loss.detach()), 0.81, places=6)
+
+    def test_embedding_pair_memory_connects_ocr_negative_across_batches(self):
+        memory = EmbeddingPairMemory(frame_window=90)
+        first = torch.tensor([[1.0, 0.0]])
+        second = torch.tensor([[1.0, 0.0]], requires_grad=True)
+
+        memory.loss_and_update(first, torch.ones(1), ["segment-a"], ["root-a"], ["video-a"], [0], ["alpha text"])
+        loss, pairs = memory.loss_and_update(
+            second, torch.ones(1), ["segment-b"], ["root-a"], ["video-b"], [300], ["9876 xyz"]
+        )
+
+        self.assertEqual(pairs, 1)
+        self.assertAlmostEqual(float(loss.detach()), 0.81, places=6)
+
+    def test_local_contrast_residual_removes_constant_background(self):
+        operator = LocalContrastResidual(kernel_size=3)
+        subtitle = torch.tensor(
+            [[[[0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, -2.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0]]]]
+        )
+
+        dark_background = operator(subtitle + 3.0)
+        bright_background = operator(subtitle + 30.0)
+
+        self.assertTrue(torch.allclose(dark_background, bright_background, atol=1e-4))
+
     def test_embedding_pair_selection_uses_only_local_subtitle_pairs(self):
         selection = select_embedding_pairs(
             presence=torch.tensor([1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0]),
@@ -195,6 +369,28 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertEqual(embedding.shape, (2, 128))
         self.assertTrue(torch.allclose(embedding.norm(dim=1), torch.ones(2), atol=1e-5))
 
+    def test_local_contrast_model_returns_normalized_embedding(self):
+        model = RoiPresenceEmbeddingModel(
+            width=8,
+            embedding_dim=128,
+            embedding_head_type="local_contrast",
+            embedding_sequence_channels=16,
+        )
+
+        presence_logit, embedding = model(torch.randn(2, 3, 16, 32))
+
+        self.assertEqual(presence_logit.shape, (2,))
+        self.assertEqual(embedding.shape, (2, 128))
+        self.assertTrue(torch.allclose(embedding.norm(dim=1), torch.ones(2), atol=1e-5))
+
+    def test_local_contrast_fusion_preserves_gap_embedding_at_initialization(self):
+        head = LocalContrastEmbeddingHead(feature_dim=16, embedding_dim=32, sequence_channels=8)
+
+        self.assertEqual(head.sequence[0].in_channels, 16)
+        self.assertTrue(torch.equal(head.fusion.weight[:, :32], torch.eye(32)))
+        self.assertTrue(torch.equal(head.fusion.weight[:, 32:], torch.zeros(32, 64)))
+        self.assertTrue(torch.equal(head.fusion.bias, torch.zeros(32)))
+
     def test_embedding_loss_skips_without_two_positive_samples(self):
         presence_logit = torch.zeros(2, requires_grad=True)
         embedding = torch.nn.functional.normalize(torch.randn(2, 128, requires_grad=True), dim=1)
@@ -306,7 +502,57 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
 
         self.assertEqual(settings.val_negative_ratio, 0.4)
 
-    def test_best_checkpoint_gate_ignores_embedding_only_gain_without_weak_area_improvement(self):
+    def test_parse_args_accepts_embedding_negative_ratio(self):
+        settings = parse_args(["--negative-ratio", "0.5", "--embedding-negative-ratio", "0.4"])
+
+        self.assertEqual(settings.negative_ratio, 0.5)
+        self.assertEqual(settings.embedding_negative_ratio, 0.4)
+
+    def test_parse_args_accepts_three_stage_schedule(self):
+        settings = parse_args(
+            ["--presence-epochs", "2", "--embedding-epochs", "3", "--joint-epochs", "4", "--joint-lr", "0.00002"]
+        )
+
+        self.assertEqual([phase.name for phase in training_phases(settings)], ["presence", "embedding", "joint"])
+        self.assertEqual([phase.end_epoch for phase in training_phases(settings)], [2, 5, 9])
+        self.assertEqual(settings.joint_learning_rate, 0.00002)
+
+    def test_parse_args_accepts_presence_only_schedule(self):
+        settings = parse_args(["--presence-epochs", "3", "--embedding-epochs", "0", "--joint-epochs", "0"])
+
+        phases = training_phases(settings)
+        self.assertEqual([phase.name for phase in phases], ["presence"])
+        self.assertEqual(phases[0].start_epoch, 1)
+        self.assertEqual(phases[0].end_epoch, 3)
+
+    def test_parse_args_rejects_empty_schedule(self):
+        with self.assertRaises(SystemExit):
+            parse_args(["--presence-epochs", "0", "--embedding-epochs", "0", "--joint-epochs", "0"])
+
+    def test_training_phase_freezes_exact_module_groups(self):
+        model = RoiPresenceEmbeddingModel(width=8, embedding_dim=16)
+
+        configure_training_phase(model, "presence")
+        self.assertTrue(all(parameter.requires_grad for parameter in model.backbone.parameters()))
+        self.assertTrue(all(parameter.requires_grad for parameter in model.presence_head.parameters()))
+        self.assertFalse(any(parameter.requires_grad for parameter in model.embedding_head.parameters()))
+
+        configure_training_phase(model, "embedding")
+        self.assertFalse(any(parameter.requires_grad for parameter in model.backbone.parameters()))
+        self.assertFalse(any(parameter.requires_grad for parameter in model.presence_head.parameters()))
+        self.assertTrue(all(parameter.requires_grad for parameter in model.embedding_head.parameters()))
+
+        configure_training_phase(model, "joint")
+        self.assertTrue(all(parameter.requires_grad for parameter in model.parameters()))
+
+    def test_validation_overlap_detects_same_resolved_root(self):
+        settings = RoiTrainSettings(train_roots=[Path("data/roi_samples6")], val_root=Path("data/roi_samples6"))
+
+        self.assertTrue(validation_overlaps_training(settings))
+        separate = settings.model_copy(update={"val_root": Path("data/roi_validation_samples")})
+        self.assertFalse(validation_overlaps_training(separate))
+
+    def test_best_checkpoint_score_accepts_embedding_gain(self):
         best = {
             "global_presence_f1": 0.95,
             "normal_presence_f1": 0.95,
@@ -318,7 +564,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         }
         current = dict(best, global_embedding_acc=0.83, normal_embedding_acc=0.82)
 
-        self.assertFalse(should_save_roi_best_checkpoint(current, best))
+        self.assertTrue(should_save_roi_best_checkpoint(current, best))
 
     def test_best_checkpoint_gate_saves_when_short_presence_improves_without_core_regression(self):
         best = {
@@ -334,7 +580,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
 
         self.assertTrue(should_save_roi_best_checkpoint(current, best))
 
-    def test_best_checkpoint_gate_blocks_obvious_normal_presence_regression(self):
+    def test_best_checkpoint_score_allows_compensating_presence_tradeoff(self):
         best = {
             "global_presence_f1": 0.95,
             "normal_presence_f1": 0.95,
@@ -346,9 +592,9 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         }
         current = dict(best, normal_presence_f1=0.91, short_presence_f1=0.78)
 
-        self.assertFalse(should_save_roi_best_checkpoint(current, best))
+        self.assertTrue(should_save_roi_best_checkpoint(current, best))
 
-    def test_best_checkpoint_gate_saves_when_hard_margin_improves_without_core_regression(self):
+    def test_best_checkpoint_score_does_not_use_margin_without_accuracy_gain(self):
         best = {
             "global_presence_f1": 0.95,
             "normal_presence_f1": 0.95,
@@ -361,7 +607,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         }
         current = dict(best, hard_margin=0.12, hard_negative_sim_p90=0.41)
 
-        self.assertTrue(should_save_roi_best_checkpoint(current, best))
+        self.assertFalse(should_save_roi_best_checkpoint(current, best))
 
     def test_format_epoch_summary_groups_roi_metrics(self):
         text = format_epoch_summary(
@@ -379,6 +625,8 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
                 "presence_fn": 2.0,
                 "presence_tn": 29.0,
                 "embedding_pair_accuracy": 0.83,
+                "embedding_false_positive_pairs": 7.0,
+                "embedding_false_negative_pairs": 4.0,
                 "embedding_same_similarity": 0.71,
                 "embedding_diff_similarity": 0.22,
                 "hard_negative_sim_p50": 0.31,
@@ -387,6 +635,10 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
                 "same_sim_p50": 0.72,
                 "same_sim_p10": 0.52,
                 "hard_margin": 0.11,
+                "checkpoint_score": 0.88,
+                "best_checkpoint_score": 0.90,
+                "best_epoch": 1.0,
+                "training_phase": "joint",
             },
         )
 
@@ -394,14 +646,48 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
             text,
             "\n".join(
                 [
-                    "roi epoch 2/5",
+                    "roi epoch 2/5 phase=joint",
                     "  loss: train=0.1235 presence=0.0200 embedding=0.0300 val=0.2346",
                     "  presence: f1=0.9100 accuracy=0.9200 tp=46 fp=3 fn=2 tn=29",
-                    "  embedding: acc=0.8300 same=0.7100 diff=0.2200 hard_margin=0.1100",
+                    "  embedding: acc=0.8300 fp=7 fn=4 same=0.7100 diff=0.2200 hard_margin=0.1100",
                     "  similarity: same_p10=0.5200 same_p50=0.7200 hard_neg_p50=0.3100 hard_neg_p90=0.4100 hard_neg_p95=0.4500",
+                    "  score: current=0.8800 best=0.9000 best_epoch=1",
                 ]
             ),
         )
+
+    def test_training_summary_points_to_best_outputs_without_last_metrics_blob(self):
+        settings = RoiTrainSettings(
+            output_dir=Path("outputs/roi_presence_only"),
+            presence_epochs=3,
+            embedding_epochs=0,
+            joint_epochs=0,
+        )
+        summary = training_summary(
+            settings,
+            completed_epoch=30,
+            total_epochs=30,
+            best_metrics={
+                "epoch": 3.0,
+                "step": 4974.0,
+                "training_phase": "presence",
+                "checkpoint_score": 1.0,
+                "presence_f1": 1.0,
+                "presence_accuracy": 1.0,
+                "presence_precision": 1.0,
+                "presence_recall": 1.0,
+                "presence_tp": 486.0,
+                "presence_fp": 0.0,
+                "presence_fn": 0.0,
+                "presence_tn": 625.0,
+            },
+        )
+
+        self.assertEqual(summary["record_type"], "roi_training_summary")
+        self.assertEqual(summary["best_epoch"], 3)
+        self.assertEqual(summary["best_checkpoint"], "outputs/roi_presence_only/best.pt")
+        self.assertEqual(summary["best_epoch_metrics"], "outputs/roi_presence_only/epoch_outputs/epoch_0003/metrics.json")
+        self.assertNotIn("last_metrics", summary)
 
     def test_one_epoch_roi_training_smoke(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -414,8 +700,10 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
                     train_roots=[root],
                     val_root=root,
                     output_dir=output,
-                    batch_size=2,
-                    epochs=1,
+                    batch_size=4,
+                    presence_epochs=1,
+                    embedding_epochs=1,
+                    joint_epochs=1,
                     max_train_samples=4,
                     max_val_samples=4,
                     width=8,
@@ -438,6 +726,14 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
             self.assertIn("same_sim_p50", metrics)
             self.assertIn("same_sim_p10", metrics)
             self.assertIn("hard_margin", metrics)
+            self.assertIn("train_presence_negative_ratio", metrics)
+            self.assertIn("train_embedding_negative_ratio", metrics)
+            self.assertIn("train_embedding_positive_pairs", metrics)
+            self.assertIn("train_embedding_negative_pairs", metrics)
+            self.assertEqual(metrics["training_phase"], "joint")
+            self.assertTrue((output / "best_presence.pt").exists())
+            self.assertTrue((output / "best_embedding.pt").exists())
+            self.assertTrue((output / "best_joint.pt").exists())
             self.assertTrue((output / "best.pt").exists())
 
 

@@ -133,11 +133,11 @@ class CliTests(unittest.TestCase):
         original = train_roi.main
         train_roi.main = lambda argv: calls.append(argv)
         try:
-            main(["train-roi", "--epochs", "1"])
+            main(["train-roi", "--presence-epochs", "3", "--embedding-epochs", "0", "--joint-epochs", "0"])
         finally:
             train_roi.main = original
 
-        self.assertEqual(calls, [["--epochs", "1"]])
+        self.assertEqual(calls, [["--presence-epochs", "3", "--embedding-epochs", "0", "--joint-epochs", "0"]])
 
 
 if __name__ == "__main__":

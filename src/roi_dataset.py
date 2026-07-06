@@ -36,7 +36,7 @@ class RoiSample:
 @dataclass(frozen=True)
 class RoiBatch:
     images: torch.Tensor
-    subtitle_masks: torch.Tensor
+    subtitle_masks: torch.Tensor | None
     presence: torch.Tensor
     segment_ids: list[str]
     sample_ids: list[str]
@@ -307,8 +307,10 @@ class RoiPresenceEmbeddingDataset(Dataset):
         max_samples: int | None = None,
         empty_ratio: float | None = None,
         segment_aware_limit: bool = False,
+        load_subtitle_masks: bool = True,
     ) -> None:
         self.resize_roi = resize_roi
+        self.load_subtitle_masks = load_subtitle_masks
         self.expected_roi_size: tuple[int, int] | None = None
         samples: list[RoiSample] = []
         for root in roots:
@@ -350,10 +352,14 @@ class RoiPresenceEmbeddingDataset(Dataset):
         image = (image - IMAGENET_MEAN) / IMAGENET_STD
         return {
             "image": image,
-            "subtitle_mask": subtitle_mask_from_labels(
-                sample.label_path,
-                output_size=self.output_roi_size,
-                label_size=tuple(expected),
+            "subtitle_mask": (
+                subtitle_mask_from_labels(
+                    sample.label_path,
+                    output_size=self.output_roi_size,
+                    label_size=tuple(expected),
+                )
+                if self.load_subtitle_masks
+                else None
             ),
             "presence": torch.tensor(1.0 if sample.has_subtitle else 0.0, dtype=torch.float32),
             "segment_id": sample.segment_id,
@@ -393,9 +399,15 @@ def collate_roi_batch(items: list[dict]) -> RoiBatch:
     def pad_mask(tensor: torch.Tensor) -> torch.Tensor:
         return F.pad(tensor, (0, max_w - tensor.shape[2], 0, max_h - tensor.shape[1]), value=0.0)
 
+    subtitle_masks = (
+        torch.stack([pad_mask(item["subtitle_mask"]) for item in items])
+        if items[0]["subtitle_mask"] is not None
+        else None
+    )
+
     return RoiBatch(
         images=torch.stack([pad_image(item["image"]) for item in items]),
-        subtitle_masks=torch.stack([pad_mask(item["subtitle_mask"]) for item in items]),
+        subtitle_masks=subtitle_masks,
         presence=torch.stack([item["presence"] for item in items]),
         segment_ids=[item["segment_id"] for item in items],
         sample_ids=[item["sample_id"] for item in items],

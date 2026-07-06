@@ -12,18 +12,22 @@ class RoiTrainSettings(BaseModel):
     resume: Path | None = None
     resize_roi: tuple[int, int] | None = None
     batch_size: int = 16
-    epochs: int = 3
+    presence_epochs: int = Field(default=1, ge=0)
+    embedding_epochs: int = Field(default=1, ge=0)
+    joint_epochs: int = Field(default=1, ge=0)
     learning_rate: float = 3e-4
+    joint_learning_rate: float = Field(default=3e-5, gt=0.0)
     weight_decay: float = 1e-4
     num_workers: int = 0
     max_train_samples: int | None = None
     max_val_samples: int | None = None
-    negative_ratio: float | None = 0.35
+    negative_ratio: float | None = Field(default=0.35, ge=0.0, le=1.0)
     val_negative_ratio: float | None = None
     short_positive_loss_weight: float = 1.0
     short_positive_mask_loss_weight: float = 0.0
     embedding_loss_weight: float = 1.0
     embedding_loss_alpha: float = 1.0
+    embedding_negative_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
     embedding_pair_frame_window: int = 90
     embedding_ocr_negative_enabled: bool = True
     embedding_ocr_negative_max_similarity: float = 0.2
@@ -32,7 +36,7 @@ class RoiTrainSettings(BaseModel):
     embedding_temperature: float = 0.1
     embedding_similarity_threshold: float = 0.5
     presence_topk_ratio: float = 0.05
-    embedding_head_type: str = "gap"
+    embedding_head_type: str = "local_contrast"
     embedding_sequence_channels: int = 16
     width: int = 32
     embedding_dim: int = 128

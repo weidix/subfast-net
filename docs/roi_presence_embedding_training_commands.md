@@ -31,7 +31,33 @@ uv run subfast-net train-roi \
   --output-dir outputs/roi_presence_embedding_full \
   --resize-roi 256x64 \
   --batch-size 32 \
-  --epochs 10 \
+  --presence-epochs 3 \
+  --embedding-epochs 3 \
+  --joint-epochs 4 \
+  --lr 0.0003 \
+  --joint-lr 0.00003 \
+  --negative-ratio 0.35 \
+  --embedding-negative-ratio 0.5 \
+  --log-interval 50 \
+  --device auto
+```
+
+## Presence-only Training
+
+```bash
+uv run subfast-net train-roi \
+  --train-root data/roi_samples1 \
+  --train-root data/roi_samples2 \
+  --train-root data/roi_samples4 \
+  --train-root data/roi_samples5 \
+  --train-root data/roi_samples6 \
+  --val-root data/roi_validation_samples \
+  --output-dir outputs/roi_presence_only \
+  --resize-roi 256x64 \
+  --batch-size 32 \
+  --presence-epochs 3 \
+  --embedding-epochs 0 \
+  --joint-epochs 0 \
   --lr 0.0003 \
   --negative-ratio 0.35 \
   --log-interval 50 \
@@ -53,11 +79,15 @@ uv run subfast-net train-roi \
   --output-dir outputs/roi_presence_embedding_effect_check \
   --resize-roi 256x64 \
   --batch-size 32 \
-  --epochs 5 \
+  --presence-epochs 2 \
+  --embedding-epochs 2 \
+  --joint-epochs 1 \
   --lr 0.0003 \
+  --joint-lr 0.00003 \
   --max-train-samples 4000 \
   --max-val-samples 600 \
   --negative-ratio 0.35 \
+  --embedding-negative-ratio 0.5 \
   --val-negative-ratio 0.35 \
   --width 16 \
   --log-interval 50 \
@@ -71,6 +101,8 @@ Embedding metrics now use trusted pairs only:
 - OCR negative pairs: same root, both subtitle-present, different `segment_id`, usable OCR text on both sides, and normalized OCR similarity at or below `--embedding-ocr-negative-max-similarity`.
 
 No-subtitle samples still train the Presence head, but they are not used for embedding pairs.
+
+Stage 3 checkpoint score is `0.5 * mean(global/normal/short Presence F1) + 0.5 * mean(global/normal/style-hard-negative Embedding accuracy)`.
 
 ## Validate Checkpoint
 
@@ -110,9 +142,13 @@ uv run subfast-net train-roi \
   --resume outputs/roi_presence_embedding_full \
   --resize-roi 256x64 \
   --batch-size 32 \
-  --epochs 20 \
+  --presence-epochs 3 \
+  --embedding-epochs 3 \
+  --joint-epochs 14 \
   --lr 0.0003 \
+  --joint-lr 0.00003 \
   --negative-ratio 0.35 \
+  --embedding-negative-ratio 0.5 \
   --log-interval 50 \
   --device auto
 ```
@@ -129,10 +165,14 @@ Each ROI training run writes:
 
 | Path | Meaning |
 |---|---|
-| `best.pt` | Best ROI checkpoint by composite validation gate across global/normal/short presence, embedding accuracy, and style hard negatives |
+| `best_presence.pt` | Best first-stage checkpoint by validation Presence score, when Presence stage runs |
+| `best_embedding.pt` | Best second-stage checkpoint by validation Embedding score, when Embedding stage runs |
+| `best_joint.pt` | Best third-stage checkpoint by the combined Presence + Embedding validation score, when joint stage runs |
+| `best.pt` | Best checkpoint from the latest completed stage; after normal three-stage training this is the same model as `best_joint.pt` |
 | `metrics.jsonl` | ROI train-step and validation metrics |
-| `summary.json` | Last ROI validation summary |
+| `summary.json` | Best ROI checkpoint summary, with key validation metrics and output file paths |
 | `epoch_outputs/epoch_000N/model.pt` | Per-epoch ROI checkpoint |
+| `epoch_outputs/epoch_000N/metrics.json` | Per-epoch ROI validation and training metrics |
 
 ROI checkpoints include `model_type = "roi_presence_embedding"` and are not compatible with bbox detector checkpoints.
 
@@ -145,15 +185,19 @@ ROI checkpoints include `model_type = "roi_presence_embedding"` and are not comp
 | `--output-dir` | Run output directory. |
 | `--resize-roi` | Explicit deterministic resize as `WIDTHxHEIGHT`; required when ROI roots have different native sizes. |
 | `--batch-size` | PyTorch training batch size. |
-| `--epochs` | Final epoch number to run to. For resume, set this higher than the completed epoch. |
-| `--lr` | AdamW learning rate. |
+| `--presence-epochs` | Stage 1 epochs: train Backbone + Presence Head with Presence loss; freeze Embedding Head. Use `0` to skip. |
+| `--embedding-epochs` | Stage 2 epochs: train Embedding Head with Embedding loss; freeze Backbone + Presence Head. Use `0` to skip. |
+| `--joint-epochs` | Stage 3 epochs: jointly fine-tune all modules and select by combined validation performance. Use `0` to skip. |
+| `--lr` | AdamW learning rate for stages 1 and 2. |
+| `--joint-lr` | Smaller AdamW learning rate for stage 3. |
 | `--max-train-samples` | Cap the training sample count. |
 | `--max-val-samples` | Cap the validation sample count with segment-aware ROI sampling. |
-| `--positive-ratio` | Target subtitle-present ratio in a capped training set. |
-| `--negative-ratio` | Target no-subtitle ratio in a capped training set. |
+| `--positive-ratio` | Alias that sets the complementary subtitle-present fraction for each full training batch. |
+| `--negative-ratio` | Target no-subtitle fraction in each full training batch. The sampler cycles samples so none are discarded. |
 | `--val-positive-ratio` | Target subtitle-present ratio in a capped validation set. Positive validation samples are selected by subtitle segment so same-subtitle pairs remain available when possible. |
 | `--val-negative-ratio` | Target no-subtitle ratio in a capped validation set. |
 | `--embedding-loss-weight` | Weight applied to embedding loss in `total_loss`. |
+| `--embedding-negative-ratio` | Target fraction of selected in-batch embedding pairs that come from different segments. All positive pairs are retained and the hardest negative pairs are selected first. |
 | `--embedding-pair-frame-window` | Maximum frame-index distance for local embedding pairs. Samples missing video or frame metadata cannot form local pairs. |
 | `--embedding-ocr-negative-enabled` / `--no-embedding-ocr-negative-enabled` | Enable or disable conservative OCR strong-difference negative pairs. |
 | `--embedding-ocr-negative-max-similarity` | Maximum normalized OCR text similarity allowed for OCR negative pairs. Lower is more conservative. |

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from functools import lru_cache
 
 import torch
 
@@ -76,6 +78,11 @@ def normalize_ocr_text(text: str | None) -> str:
 def ocr_text_similarity(left: str | None, right: str | None) -> float | None:
     left_norm = normalize_ocr_text(left)
     right_norm = normalize_ocr_text(right)
+    return normalized_ocr_text_similarity(left_norm, right_norm)
+
+
+@lru_cache(maxsize=65_536)
+def normalized_ocr_text_similarity(left_norm: str, right_norm: str) -> float | None:
     if len(left_norm) < _MIN_OCR_TEXT_LENGTH or len(right_norm) < _MIN_OCR_TEXT_LENGTH:
         return None
     if left_norm == right_norm:
@@ -85,6 +92,29 @@ def ocr_text_similarity(left: str | None, right: str | None) -> float | None:
     right_chars = set(right_norm)
     overlap_ratio = len(left_chars & right_chars) / max(1, len(left_chars | right_chars))
     return max(sequence_ratio, overlap_ratio)
+
+
+@lru_cache(maxsize=65_536)
+def normalized_ocr_text_similarity_at_most(left_norm: str, right_norm: str, maximum: float) -> bool:
+    if len(left_norm) < _MIN_OCR_TEXT_LENGTH or len(right_norm) < _MIN_OCR_TEXT_LENGTH:
+        return False
+    if left_norm == right_norm:
+        return 1.0 <= maximum
+    left_chars, left_counts = _ocr_text_profile(left_norm)
+    right_chars, right_counts = _ocr_text_profile(right_norm)
+    overlap_ratio = len(left_chars & right_chars) / max(1, len(left_chars | right_chars))
+    if overlap_ratio > maximum:
+        return False
+    matches = sum(min(count, right_counts.get(char, 0)) for char, count in left_counts.items())
+    quick_ratio = 2.0 * matches / (len(left_norm) + len(right_norm))
+    if quick_ratio <= maximum:
+        return True
+    return SequenceMatcher(None, left_norm, right_norm).ratio() <= maximum
+
+
+@lru_cache(maxsize=65_536)
+def _ocr_text_profile(text: str) -> tuple[frozenset[str], Counter[str]]:
+    return frozenset(text), Counter(text)
 
 
 def select_embedding_pairs(
@@ -110,6 +140,7 @@ def select_embedding_pairs(
     ocr_negative_pairs = 0
     skipped_pairs = 0
     presence_mask = (presence.detach().cpu() > 0.5).tolist()
+    normalized_ocr_texts = [normalize_ocr_text(text) for text in ocr_texts] if ocr_negative_enabled else []
 
     for i in range(len(segment_ids)):
         for j in range(i + 1, len(segment_ids)):
@@ -142,8 +173,11 @@ def select_embedding_pairs(
                 and segment_ids[i] != segment_ids[j]
                 and (i, j) not in seen
             ):
-                similarity = ocr_text_similarity(ocr_texts[i], ocr_texts[j])
-                if similarity is not None and similarity <= ocr_negative_max_similarity:
+                if normalized_ocr_text_similarity_at_most(
+                    normalized_ocr_texts[i],
+                    normalized_ocr_texts[j],
+                    ocr_negative_max_similarity,
+                ):
                     pairs.append(EmbeddingPair(i=i, j=j, same=False, source="ocr"))
                     seen.add((i, j))
                     ocr_negative_pairs += 1
