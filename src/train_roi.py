@@ -870,7 +870,11 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                 images = batch.images.to(device)
                 presence = batch.presence.to(device)
                 optimizer.zero_grad(set_to_none=True)
-                if settings.short_positive_mask_loss_weight > 0.0:
+                if phase.name == "embedding":
+                    embedding = model.forward_embedding(images)
+                    presence_logit = presence.new_zeros(presence.shape)
+                    mask_loss = embedding.sum() * 0.0
+                elif settings.short_positive_mask_loss_weight > 0.0:
                     presence_logit, embedding, textness_map = model.forward_with_presence_map(images)
                     if batch.subtitle_masks is None:
                         raise RuntimeError("subtitle masks are required when short positive mask loss is enabled")
@@ -889,10 +893,14 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                     embedding,
                     presence,
                     batch.segment_ids,
-                    presence_loss_weights=short_positive_presence_weights(
-                        presence,
-                        batch.ocr_texts,
-                        settings.short_positive_loss_weight,
+                    presence_loss_weights=(
+                        short_positive_presence_weights(
+                            presence,
+                            batch.ocr_texts,
+                            settings.short_positive_loss_weight,
+                        )
+                        if phase.name != "embedding"
+                        else None
                     ),
                     roots=batch.roots,
                     video_ids=batch.video_ids,
@@ -907,6 +915,7 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                     embedding_positive_consistency_margin=settings.embedding_positive_consistency_margin,
                     embedding_temperature=settings.embedding_temperature,
                     embedding_negative_ratio=settings.embedding_negative_ratio,
+                    presence_loss_enabled=phase.name != "embedding",
                 )
                 memory_loss, memory_pairs = embedding_pair_memory.loss_and_update(
                     embedding,

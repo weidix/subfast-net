@@ -139,14 +139,16 @@ def select_embedding_pairs(
     local_negative_pairs = 0
     ocr_negative_pairs = 0
     skipped_pairs = 0
-    presence_mask = (presence.detach().cpu() > 0.5).tolist()
-    normalized_ocr_texts = [normalize_ocr_text(text) for text in ocr_texts] if ocr_negative_enabled else []
+    total_candidate_pairs = len(segment_ids) * (len(segment_ids) - 1) // 2
+    positive_indices = [index for index, value in enumerate((presence.detach().cpu() > 0.5).tolist()) if value]
+    normalized_ocr_texts = (
+        {index: normalize_ocr_text(ocr_texts[index]) for index in positive_indices}
+        if ocr_negative_enabled
+        else {}
+    )
 
-    for i in range(len(segment_ids)):
-        for j in range(i + 1, len(segment_ids)):
-            if not presence_mask[i] or not presence_mask[j]:
-                skipped_pairs += 1
-                continue
+    for offset, i in enumerate(positive_indices):
+        for j in positive_indices[offset + 1 :]:
 
             same_root = roots[i] == roots[j]
             same_video = video_ids[i] is not None and video_ids[i] == video_ids[j]
@@ -185,6 +187,7 @@ def select_embedding_pairs(
 
             skipped_pairs += 1
 
+    skipped_pairs += total_candidate_pairs - (len(positive_indices) * (len(positive_indices) - 1) // 2)
     return EmbeddingPairSelection(
         pairs=pairs,
         local_positive_pairs=local_positive_pairs,

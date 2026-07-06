@@ -286,8 +286,13 @@ def roi_presence_embedding_loss(
     embedding_positive_consistency_margin: float = 0.75,
     embedding_temperature: float = 0.1,
     embedding_negative_ratio: float = 0.5,
+    presence_loss_enabled: bool = True,
 ) -> RoiLossBreakdown:
-    presence_loss = F.binary_cross_entropy_with_logits(presence_logit, presence, weight=presence_loss_weights)
+    presence_loss = (
+        F.binary_cross_entropy_with_logits(presence_logit, presence, weight=presence_loss_weights)
+        if presence_loss_enabled
+        else presence_logit.sum() * 0.0
+    )
     (
         embedding_loss,
         embedding_pairs,
