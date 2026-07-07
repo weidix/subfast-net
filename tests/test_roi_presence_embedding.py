@@ -8,7 +8,14 @@ from PIL import Image
 
 from src.roi_config import RoiTrainSettings
 from src.roi_dataset import RoiPresenceEmbeddingDataset, RoiSample, collate_roi_batch
-from src.roi_loss import EmbeddingPairMemory, balance_embedding_pairs, embedding_margin_loss, roi_presence_embedding_loss
+from src.roi_loss import (
+    EmbeddingPairMemory,
+    balance_embedding_pairs,
+    embedding_margin_loss,
+    roi_presence_embedding_loss,
+    supervised_contrastive_embedding_loss,
+)
+from src.roi_metrics import embedding_metrics
 from src.roi_pairs import select_embedding_pairs
 from src.roi_model import LocalContrastEmbeddingHead, LocalContrastResidual, LocalTextnessPresenceHead, RoiPresenceEmbeddingModel
 from src.train_roi import (
@@ -162,7 +169,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
 
         loss = embedding_margin_loss(similarities, targets)
 
-        self.assertAlmostEqual(float(loss), 0.1)
+        self.assertAlmostEqual(float(loss), 0.9009242, places=6)
 
     def test_embedding_margin_loss_balances_positive_and_negative_pairs(self):
         similarities = torch.tensor([0.50] + [0.0] * 100)
@@ -170,7 +177,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
 
         loss = embedding_margin_loss(similarities, targets)
 
-        self.assertAlmostEqual(float(loss), 0.16)
+        self.assertAlmostEqual(float(loss), 0.4, places=6)
 
     def test_embedding_margin_loss_keeps_hard_negative_from_easy_pair_dilution(self):
         similarities = torch.tensor([0.50] + [0.0] * 99)
@@ -178,7 +185,48 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
 
         loss = embedding_margin_loss(similarities, targets)
 
-        self.assertAlmostEqual(float(loss), 0.16)
+        self.assertAlmostEqual(float(loss), 0.8, places=6)
+
+    def test_supervised_contrastive_embedding_loss_uses_same_segment_positives(self):
+        embedding = torch.nn.functional.normalize(
+            torch.tensor(
+                [
+                    [1.0, 0.0],
+                    [0.8, 0.2],
+                    [0.0, 1.0],
+                ]
+            ),
+            dim=1,
+        )
+
+        loss = supervised_contrastive_embedding_loss(
+            embedding,
+            torch.ones(3),
+            ["seg-a", "seg-a", "seg-b"],
+            ["root", "root", "root"],
+            temperature=0.1,
+        )
+
+        self.assertGreater(float(loss), 0.0)
+
+    def test_embedding_metrics_calibrates_best_threshold_without_strict_zip_error(self):
+        embedding = torch.nn.functional.normalize(torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.8, 0.6]]), dim=1)
+
+        metrics = embedding_metrics(
+            embedding,
+            torch.ones(3),
+            ["seg-a", "seg-b", "seg-a"],
+            roots=["root", "root", "root"],
+            video_ids=["video", "video", "video"],
+            frame_indices=[0, 1, 2],
+            ocr_texts=["alpha", "bravo", "alpha"],
+            frame_window=10,
+            ocr_negative_enabled=False,
+            ocr_negative_max_similarity=0.2,
+            threshold=0.5,
+        )
+
+        self.assertAlmostEqual(metrics["embedding_best_f1"], 1.0)
 
     def test_positive_embedding_memory_connects_same_segment_across_batches(self):
         memory = EmbeddingPairMemory(frame_window=90)
@@ -195,7 +243,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertEqual(first_pairs, 0)
         self.assertEqual(float(first_loss.detach()), 0.0)
         self.assertEqual(second_pairs, 1)
-        self.assertAlmostEqual(float(second_loss.detach()), 0.81, places=6)
+        self.assertAlmostEqual(float(second_loss.detach()), 0.9, places=6)
 
     def test_embedding_pair_memory_connects_local_negative_across_batches(self):
         memory = EmbeddingPairMemory(frame_window=90)
@@ -208,7 +256,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         )
 
         self.assertEqual(pairs, 1)
-        self.assertAlmostEqual(float(loss.detach()), 0.81, places=6)
+        self.assertAlmostEqual(float(loss.detach()), 1.8, places=6)
 
     def test_embedding_pair_memory_connects_ocr_negative_across_batches(self):
         memory = EmbeddingPairMemory(frame_window=90)
@@ -221,7 +269,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         )
 
         self.assertEqual(pairs, 1)
-        self.assertAlmostEqual(float(loss.detach()), 0.81, places=6)
+        self.assertAlmostEqual(float(loss.detach()), 1.8, places=6)
 
     def test_local_contrast_residual_removes_constant_background(self):
         operator = LocalContrastResidual(kernel_size=3)
@@ -649,7 +697,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
                     "roi epoch 2/5 phase=joint",
                     "  loss: train=0.1235 presence=0.0200 embedding=0.0300 val=0.2346",
                     "  presence: f1=0.9100 accuracy=0.9200 tp=46 fp=3 fn=2 tn=29",
-                    "  embedding: acc=0.8300 fp=7 fn=4 same=0.7100 diff=0.2200 hard_margin=0.1100",
+                    "  embedding: acc=0.8300 fp=7 fn=4 same=0.7100 diff=0.2200 hard_margin=0.1100 gap=0.0000 best_threshold=0.0000",
                     "  similarity: same_p10=0.5200 same_p50=0.7200 hard_neg_p50=0.3100 hard_neg_p90=0.4100 hard_neg_p95=0.4500",
                     "  score: current=0.8800 best=0.9000 best_epoch=1",
                 ]
@@ -735,6 +783,8 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
             self.assertTrue((output / "best_embedding.pt").exists())
             self.assertTrue((output / "best_joint.pt").exists())
             self.assertTrue((output / "best.pt").exists())
+            self.assertTrue((output / "error_pairs" / "epoch_0003.jsonl").exists())
+            self.assertTrue((output / "error_pairs" / "epoch_0003.html").exists())
 
 
 if __name__ == "__main__":

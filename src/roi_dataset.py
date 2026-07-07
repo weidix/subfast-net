@@ -40,6 +40,7 @@ class RoiBatch:
     presence: torch.Tensor
     segment_ids: list[str]
     sample_ids: list[str]
+    image_paths: list[str]
     roots: list[str]
     video_ids: list[str | None]
     frame_indices: list[int | None]
@@ -364,6 +365,7 @@ class RoiPresenceEmbeddingDataset(Dataset):
             "presence": torch.tensor(1.0 if sample.has_subtitle else 0.0, dtype=torch.float32),
             "segment_id": sample.segment_id,
             "sample_id": sample.sample_id,
+            "image_path": str(sample.image_path),
             "root": str(sample.root),
             "video_id": sample.video_id,
             "frame_index": sample.frame_index,
@@ -411,6 +413,7 @@ def collate_roi_batch(items: list[dict]) -> RoiBatch:
         presence=torch.stack([item["presence"] for item in items]),
         segment_ids=[item["segment_id"] for item in items],
         sample_ids=[item["sample_id"] for item in items],
+        image_paths=[item["image_path"] for item in items],
         roots=[item["root"] for item in items],
         video_ids=[item["video_id"] for item in items],
         frame_indices=[item["frame_index"] for item in items],

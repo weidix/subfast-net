@@ -28,12 +28,17 @@ class RoiTrainSettings(BaseModel):
     embedding_loss_weight: float = 1.0
     embedding_loss_alpha: float = 1.0
     embedding_negative_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
+    embedding_samples_per_segment: int = Field(default=2, ge=1)
     embedding_pair_frame_window: int = 90
     embedding_ocr_negative_enabled: bool = True
     embedding_ocr_negative_max_similarity: float = 0.2
     embedding_positive_consistency_beta: float = 0.0
     embedding_positive_consistency_margin: float = 0.75
     embedding_temperature: float = 0.1
+    embedding_supcon_weight: float = Field(default=0.5, ge=0.0)
+    embedding_tail_gamma_positive: float = Field(default=20.0, gt=0.0)
+    embedding_tail_gamma_negative: float = Field(default=40.0, gt=0.0)
+    embedding_tail_hard_negative_weight: float = Field(default=2.0, gt=0.0)
     embedding_similarity_threshold: float = 0.5
     presence_topk_ratio: float = 0.05
     embedding_head_type: str = "local_contrast"

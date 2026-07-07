@@ -21,6 +21,7 @@ class RoiBalancedBatchSampler(Sampler[list[int]]):
         negative_ratio: float,
         frame_window: int,
         seed: int,
+        embedding_samples_per_segment: int = 2,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -28,10 +29,13 @@ class RoiBalancedBatchSampler(Sampler[list[int]]):
             raise ValueError("negative_ratio must be in [0, 1]")
         if frame_window < 0:
             raise ValueError("frame_window must be non-negative")
+        if embedding_samples_per_segment < 1:
+            raise ValueError("embedding_samples_per_segment must be positive")
         self.samples = samples
         self.batch_size = batch_size
         self.negative_ratio = negative_ratio
         self.frame_window = frame_window
+        self.embedding_samples_per_segment = embedding_samples_per_segment
         self.seed = seed
         self.epoch = 0
         self.positive_indices = [index for index, sample in enumerate(samples) if sample.has_subtitle]
@@ -53,6 +57,7 @@ class RoiBalancedBatchSampler(Sampler[list[int]]):
             self.positive_slots = batch_size
 
         self._pairs = self._build_positive_pairs()
+        self._segment_groups = self._build_segment_groups()
         counts = []
         if self.positive_indices:
             counts.append(math.ceil(len(self.positive_indices) / self.positive_slots))
@@ -76,6 +81,13 @@ class RoiBalancedBatchSampler(Sampler[list[int]]):
                     if right_frame is not None and abs(left_frame - right_frame) <= self.frame_window:
                         pairs.append((left_index, right_index))
         return pairs
+
+    def _build_segment_groups(self) -> list[list[int]]:
+        groups: dict[tuple[str, str | None, str], list[int]] = defaultdict(list)
+        for index in self.positive_indices:
+            sample = self.samples[index]
+            groups[(str(sample.root.resolve()), sample.video_id, sample.segment_id)].append(index)
+        return [indices for indices in groups.values() if len(indices) >= 2]
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
@@ -112,15 +124,35 @@ class RoiBalancedBatchSampler(Sampler[list[int]]):
         positive_queue = list(self.positive_indices)
         negative_queue = list(self.negative_indices)
         pairs = list(self._pairs)
+        segment_groups = [list(group) for group in self._segment_groups]
         rng.shuffle(positive_queue)
         rng.shuffle(negative_queue)
         rng.shuffle(pairs)
+        rng.shuffle(segment_groups)
         unseen_positive = set(self.positive_indices)
 
         for batch_number in range(self._batch_count):
             positive_batch: list[int] = []
             batches_left = self._batch_count - batch_number
-            if pairs and self.positive_slots >= 2:
+            if segment_groups and self.positive_slots >= self.embedding_samples_per_segment:
+                segments_per_batch = max(1, self.positive_slots // self.embedding_samples_per_segment)
+                selected: set[int] = set()
+                for _ in range(min(segments_per_batch, len(segment_groups))):
+                    group = segment_groups.pop(0)
+                    segment_groups.append(group)
+                    group_queue = [index for index in group if index in unseen_positive and index not in selected]
+                    if len(group_queue) < self.embedding_samples_per_segment:
+                        group_queue = [index for index in group if index not in selected]
+                    rng.shuffle(group_queue)
+                    picks = group_queue[: self.embedding_samples_per_segment]
+                    if len(picks) < self.embedding_samples_per_segment:
+                        picks.extend(rng.choices(group, k=self.embedding_samples_per_segment - len(picks)))
+                    positive_batch.extend(picks)
+                    selected.update(picks)
+                    unseen_positive.difference_update(picks)
+                    if len(positive_batch) + self.embedding_samples_per_segment > self.positive_slots:
+                        break
+            elif pairs and self.positive_slots >= 2:
                 # Do not sacrifice source coverage merely to repeat a pair.
                 pair_capacity_left = (batches_left - 1) * self.positive_slots + (self.positive_slots - 2)
                 if len(unseen_positive) <= pair_capacity_left + 2:

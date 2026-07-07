@@ -140,6 +140,7 @@ class RoiLossBreakdown:
     embedding_selected_negative_pairs: int
     embedding_margin_loss: torch.Tensor
     positive_consistency_loss: torch.Tensor
+    supervised_contrastive_loss: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -192,6 +193,9 @@ def embedding_margin_loss(
     *,
     positive_margin: float = 0.9,
     negative_margin: float = 0.1,
+    gamma_positive: float = 20.0,
+    gamma_negative: float = 40.0,
+    hard_negative_weight: float = 2.0,
 ) -> torch.Tensor:
     positive_violation = F.relu(positive_margin - similarities)
     negative_violation = F.relu(similarities - negative_margin)
@@ -199,9 +203,49 @@ def embedding_margin_loss(
     negative_mask = ~positive_mask
     hard_positive_mask = positive_mask & (positive_violation > 0.0)
     hard_negative_mask = negative_mask & (negative_violation > 0.0)
-    positive_loss = (positive_violation.square() * hard_positive_mask).sum() / hard_positive_mask.sum().clamp_min(1)
-    negative_loss = (negative_violation.square() * hard_negative_mask).sum() / hard_negative_mask.sum().clamp_min(1)
-    return positive_loss + negative_loss
+    positive_loss = (
+        torch.logsumexp(gamma_positive * positive_violation[hard_positive_mask], dim=0) / gamma_positive
+        if bool(hard_positive_mask.any())
+        else similarities.sum() * 0.0
+    )
+    negative_loss = (
+        torch.logsumexp(gamma_negative * negative_violation[hard_negative_mask], dim=0) / gamma_negative
+        if bool(hard_negative_mask.any())
+        else similarities.sum() * 0.0
+    )
+    return positive_loss + hard_negative_weight * negative_loss
+
+
+def supervised_contrastive_embedding_loss(
+    embedding: torch.Tensor,
+    presence: torch.Tensor,
+    segment_ids: list[str],
+    roots: list[str],
+    *,
+    temperature: float = 0.1,
+) -> torch.Tensor:
+    positive_indices = [index for index, is_present in enumerate((presence.detach() > 0.5).tolist()) if is_present]
+    if len(positive_indices) < 2:
+        return embedding.sum() * 0.0
+    index_tensor = torch.tensor(positive_indices, dtype=torch.long, device=embedding.device)
+    scoped_embedding = embedding[index_tensor]
+    labels = [(roots[index], segment_ids[index]) for index in positive_indices]
+    label_equal = [
+        [left == right for right in labels]
+        for left in labels
+    ]
+    positive_mask = torch.tensor(label_equal, dtype=torch.bool, device=embedding.device)
+    self_mask = torch.eye(len(positive_indices), dtype=torch.bool, device=embedding.device)
+    positive_mask = positive_mask & ~self_mask
+    valid_anchor = positive_mask.any(dim=1)
+    if not bool(valid_anchor.any()):
+        return embedding.sum() * 0.0
+    logits = scoped_embedding @ scoped_embedding.T / temperature
+    logits = logits - logits.detach().max(dim=1, keepdim=True).values
+    logits = logits.masked_fill(self_mask, torch.finfo(logits.dtype).min)
+    log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+    positive_log_prob = (log_prob * positive_mask).sum(dim=1) / positive_mask.sum(dim=1).clamp_min(1)
+    return -positive_log_prob[valid_anchor].mean()
 
 
 def metric_embedding_loss(
@@ -221,7 +265,11 @@ def metric_embedding_loss(
     positive_consistency_margin: float = 0.75,
     temperature: float = 0.1,
     embedding_negative_ratio: float = 0.5,
-) -> tuple[torch.Tensor, int, int, int, int, int, int, int, int, int, torch.Tensor, torch.Tensor]:
+    embedding_supcon_weight: float = 0.5,
+    embedding_tail_gamma_positive: float = 20.0,
+    embedding_tail_gamma_negative: float = 40.0,
+    embedding_tail_hard_negative_weight: float = 2.0,
+) -> tuple[torch.Tensor, int, int, int, int, int, int, int, int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
     selection = select_embedding_pairs(
         presence=presence,
         segment_ids=segment_ids,
@@ -235,7 +283,14 @@ def metric_embedding_loss(
     )
     if not selection.pairs:
         zero = embedding.sum() * 0.0
-        return zero, 0, 0, 0, 0, selection.skipped_pairs, 0, 0, 0, 0, zero, zero
+        supcon_loss = supervised_contrastive_embedding_loss(
+            embedding,
+            presence,
+            segment_ids,
+            roots,
+            temperature=temperature,
+        )
+        return supcon_loss * embedding_supcon_weight, 0, 0, 0, 0, selection.skipped_pairs, 0, 0, 0, 0, zero, zero, supcon_loss
     left = torch.tensor([pair.i for pair in selection.pairs], dtype=torch.long, device=embedding.device)
     right = torch.tensor([pair.j for pair in selection.pairs], dtype=torch.long, device=embedding.device)
     targets = torch.tensor([1.0 if pair.same else 0.0 for pair in selection.pairs], dtype=embedding.dtype, device=embedding.device)
@@ -243,13 +298,29 @@ def metric_embedding_loss(
     balanced = balance_embedding_pairs(similarities, targets, negative_ratio=embedding_negative_ratio)
     selected_similarities = similarities[balanced.indices]
     selected_targets = targets[balanced.indices]
-    margin_loss = embedding_margin_loss(selected_similarities, selected_targets) * alpha
+    margin_loss = (
+        embedding_margin_loss(
+            selected_similarities,
+            selected_targets,
+            gamma_positive=embedding_tail_gamma_positive,
+            gamma_negative=embedding_tail_gamma_negative,
+            hard_negative_weight=embedding_tail_hard_negative_weight,
+        )
+        * alpha
+    )
     positive_similarities = selected_similarities[selected_targets > 0.5]
     if positive_similarities.numel() == 0 or positive_consistency_beta <= 0.0:
         consistency_loss = embedding.sum() * 0.0
     else:
         consistency_loss = F.relu(positive_consistency_margin - positive_similarities).pow(2).mean()
-    embedding_loss = margin_loss + positive_consistency_beta * consistency_loss
+    supcon_loss = supervised_contrastive_embedding_loss(
+        embedding,
+        presence,
+        segment_ids,
+        roots,
+        temperature=temperature,
+    )
+    embedding_loss = margin_loss + positive_consistency_beta * consistency_loss + embedding_supcon_weight * supcon_loss
     return (
         embedding_loss,
         int(balanced.indices.numel()),
@@ -263,6 +334,7 @@ def metric_embedding_loss(
         balanced.selected_negative_pairs,
         margin_loss,
         consistency_loss,
+        supcon_loss,
     )
 
 
@@ -286,6 +358,10 @@ def roi_presence_embedding_loss(
     embedding_positive_consistency_margin: float = 0.75,
     embedding_temperature: float = 0.1,
     embedding_negative_ratio: float = 0.5,
+    embedding_supcon_weight: float = 0.5,
+    embedding_tail_gamma_positive: float = 20.0,
+    embedding_tail_gamma_negative: float = 40.0,
+    embedding_tail_hard_negative_weight: float = 2.0,
     presence_loss_enabled: bool = True,
 ) -> RoiLossBreakdown:
     presence_loss = (
@@ -306,6 +382,7 @@ def roi_presence_embedding_loss(
         embedding_selected_negative_pairs,
         pair_margin_loss,
         positive_consistency_loss,
+        supervised_contrastive_loss,
     ) = metric_embedding_loss(
         embedding,
         presence,
@@ -322,6 +399,10 @@ def roi_presence_embedding_loss(
         positive_consistency_margin=embedding_positive_consistency_margin,
         temperature=embedding_temperature,
         embedding_negative_ratio=embedding_negative_ratio,
+        embedding_supcon_weight=embedding_supcon_weight,
+        embedding_tail_gamma_positive=embedding_tail_gamma_positive,
+        embedding_tail_gamma_negative=embedding_tail_gamma_negative,
+        embedding_tail_hard_negative_weight=embedding_tail_hard_negative_weight,
     )
     total = presence_loss + embedding_loss_weight * embedding_loss
     return RoiLossBreakdown(
@@ -339,4 +420,5 @@ def roi_presence_embedding_loss(
         embedding_selected_negative_pairs=embedding_selected_negative_pairs,
         embedding_margin_loss=pair_margin_loss,
         positive_consistency_loss=positive_consistency_loss,
+        supervised_contrastive_loss=supervised_contrastive_loss,
     )
