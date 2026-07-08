@@ -1,41 +1,36 @@
 from __future__ import annotations
 
-from bisect import bisect_left, bisect_right, insort
 from dataclasses import dataclass
 
 import torch
 from torch.nn import functional as F
 
-from .roi_pairs import normalize_ocr_text, normalized_ocr_text_similarity_at_most, select_embedding_pairs
+from .roi_pairs import max_ocr_negative_pairs, normalize_ocr_text, normalized_ocr_text_similarity_at_most, select_embedding_pairs
 
 
-class _LocalPairIndex:
-    def __init__(self) -> None:
-        self.frames: list[int] = []
-        self.entries: dict[int, list[tuple[int, str, torch.Tensor]]] = {}
-        self.next_order = 0
-
-    def add(self, frame_index: int, segment_id: str, embedding: torch.Tensor) -> None:
-        if frame_index not in self.entries:
-            insort(self.frames, frame_index)
-            self.entries[frame_index] = []
-        self.entries[frame_index].append((self.next_order, segment_id, embedding))
-        self.next_order += 1
-
-    def within(self, frame_index: int, frame_window: int) -> list[tuple[str, torch.Tensor]]:
-        start = bisect_left(self.frames, frame_index - frame_window)
-        end = bisect_right(self.frames, frame_index + frame_window)
-        matches = [entry for frame in self.frames[start:end] for entry in self.entries[frame]]
-        matches.sort(key=lambda entry: entry[0])
-        return [(segment_id, embedding) for _, segment_id, embedding in matches]
+@dataclass(frozen=True)
+class _EmbeddingMemoryNegative:
+    segment_id: str
+    video_id: str | None
+    normalized_ocr: str
+    embedding: torch.Tensor
 
 
 class EmbeddingPairMemory:
-    def __init__(self, frame_window: int) -> None:
-        self.frame_window = frame_window
+    def __init__(self, *, ocr_negative_max_similarity: float, ocr_negative_ratio: float) -> None:
+        self.ocr_negative_max_similarity = ocr_negative_max_similarity
+        self.ocr_negative_ratio = ocr_negative_ratio
         self._embeddings: dict[tuple[str, str], torch.Tensor] = {}
-        self._local: dict[tuple[str, str], _LocalPairIndex] = {}
-        self._negative_bank: dict[str, list[tuple[str, str | None, int | None, str, torch.Tensor]]] = {}
+        self._local_negative_index: dict[tuple[str, str, str], list[torch.Tensor]] = {}
+        self._ocr_negative_bank: dict[str, list[_EmbeddingMemoryNegative]] = {}
+
+    def _rebuild_local_negative_index(self, root: str) -> None:
+        for key in [key for key in self._local_negative_index if key[0] == root]:
+            del self._local_negative_index[key]
+        for entry in self._ocr_negative_bank.get(root, []):
+            if entry.video_id is None:
+                continue
+            self._local_negative_index.setdefault((root, entry.video_id, entry.segment_id), []).append(entry.embedding)
 
     def loss_and_update(
         self,
@@ -44,14 +39,13 @@ class EmbeddingPairMemory:
         segment_ids: list[str],
         roots: list[str],
         video_ids: list[str | None],
-        frame_indices: list[int | None],
         ocr_texts: list[str],
+        adjacent_segment_ids: list[set[str] | frozenset[str] | list[str] | tuple[str, ...]],
     ) -> tuple[torch.Tensor, int]:
         current_indices: list[int] = []
         previous_embeddings: list[torch.Tensor] = []
         targets: list[float] = []
         updates: list[tuple[tuple[str, str], torch.Tensor]] = []
-        local_updates: list[tuple[tuple[str, str], int, str, torch.Tensor]] = []
         for index, is_positive in enumerate((presence.detach() > 0.5).tolist()):
             if not is_positive:
                 continue
@@ -63,55 +57,63 @@ class EmbeddingPairMemory:
                 targets.append(1.0)
             updates.append((key, embedding[index].detach()))
             video_id = video_ids[index]
-            frame_index = frame_indices[index]
             normalized_ocr = normalize_ocr_text(ocr_texts[index])
-            if video_id is not None and frame_index is not None:
-                local_key = (roots[index], video_id)
-                local_index = self._local.get(local_key)
-                for previous_segment, previous_embedding in (
-                    local_index.within(frame_index, self.frame_window) if local_index is not None else []
-                ):
-                    if previous_segment != segment_ids[index]:
-                        current_indices.append(index)
-                        previous_embeddings.append(previous_embedding)
-                        targets.append(0.0)
-                local_updates.append((local_key, frame_index, segment_ids[index], embedding[index].detach()))
-            for previous_segment, previous_video, previous_frame, previous_ocr, previous_embedding in self._negative_bank.get(roots[index], []):
-                if previous_segment == segment_ids[index]:
+            local_negative_embeddings: list[torch.Tensor] = []
+            ocr_negative_embeddings: list[torch.Tensor] = []
+            adjacent_ids = adjacent_segment_ids[index]
+            if video_id is not None:
+                for adjacent_segment_id in adjacent_ids:
+                    if adjacent_segment_id == segment_ids[index]:
+                        continue
+                    local_negative_embeddings.extend(
+                        self._local_negative_index.get((roots[index], video_id, adjacent_segment_id), [])
+                    )
+            for previous in self._ocr_negative_bank.get(roots[index], []):
+                if previous.segment_id == segment_ids[index]:
                     continue
-                is_local = (
+                if (
                     video_id is not None
-                    and video_id == previous_video
-                    and frame_index is not None
-                    and previous_frame is not None
-                    and abs(frame_index - previous_frame) <= self.frame_window
-                )
-                if not is_local:
-                    if normalized_ocr_text_similarity_at_most(normalized_ocr, previous_ocr, 0.2):
-                        current_indices.append(index)
-                        previous_embeddings.append(previous_embedding)
-                        targets.append(0.0)
+                    and previous.video_id == video_id
+                    and previous.segment_id in adjacent_ids
+                ):
+                    continue
+                if normalized_ocr_text_similarity_at_most(
+                    normalized_ocr,
+                    previous.normalized_ocr,
+                    self.ocr_negative_max_similarity,
+                ):
+                    ocr_negative_embeddings.append(previous.embedding)
+            ocr_limit = max_ocr_negative_pairs(
+                local_negative_pairs=len(local_negative_embeddings),
+                positive_pairs=1,
+                ocr_negative_ratio=self.ocr_negative_ratio,
+            )
+            for previous_embedding in local_negative_embeddings:
+                current_indices.append(index)
+                previous_embeddings.append(previous_embedding)
+                targets.append(0.0)
+            for previous_embedding in ocr_negative_embeddings[:ocr_limit]:
+                current_indices.append(index)
+                previous_embeddings.append(previous_embedding)
+                targets.append(0.0)
         for key, value in updates:
             self._embeddings[key] = value
-        for key, frame_index, segment_id, value in local_updates:
-            local_index = self._local.get(key)
-            if local_index is None:
-                local_index = _LocalPairIndex()
-                self._local[key] = local_index
-            local_index.add(frame_index, segment_id, value)
         for index, is_positive in enumerate((presence.detach() > 0.5).tolist()):
             if is_positive:
-                bank = self._negative_bank.setdefault(roots[index], [])
-                bank.append(
-                    (
-                        segment_ids[index],
-                        video_ids[index],
-                        frame_indices[index],
-                        normalize_ocr_text(ocr_texts[index]),
-                        embedding[index].detach(),
-                    )
+                root = roots[index]
+                bank = self._ocr_negative_bank.setdefault(root, [])
+                entry = _EmbeddingMemoryNegative(
+                    segment_id=segment_ids[index],
+                    video_id=video_ids[index],
+                    normalized_ocr=normalize_ocr_text(ocr_texts[index]),
+                    embedding=embedding[index].detach(),
                 )
-                del bank[:-512]
+                bank.append(entry)
+                if entry.video_id is not None:
+                    self._local_negative_index.setdefault((root, entry.video_id, entry.segment_id), []).append(entry.embedding)
+                if len(bank) > 512:
+                    del bank[:-512]
+                    self._rebuild_local_negative_index(root)
         if not current_indices:
             return embedding.sum() * 0.0, 0
         # Calculate every selected pair in one tensor operation. Performing one
@@ -256,11 +258,11 @@ def metric_embedding_loss(
     alpha: float = 1.0,
     roots: list[str],
     video_ids: list[str | None],
-    frame_indices: list[int | None],
     ocr_texts: list[str],
-    frame_window: int,
+    adjacent_segment_ids: list[set[str] | frozenset[str] | list[str] | tuple[str, ...]],
     ocr_negative_enabled: bool,
     ocr_negative_max_similarity: float,
+    ocr_negative_ratio: float,
     positive_consistency_beta: float = 0.0,
     positive_consistency_margin: float = 0.75,
     temperature: float = 0.1,
@@ -275,11 +277,11 @@ def metric_embedding_loss(
         segment_ids=segment_ids,
         roots=roots,
         video_ids=video_ids,
-        frame_indices=frame_indices,
         ocr_texts=ocr_texts,
-        frame_window=frame_window,
+        adjacent_segment_ids=adjacent_segment_ids,
         ocr_negative_enabled=ocr_negative_enabled,
         ocr_negative_max_similarity=ocr_negative_max_similarity,
+        ocr_negative_ratio=ocr_negative_ratio,
     )
     if not selection.pairs:
         zero = embedding.sum() * 0.0
@@ -347,13 +349,13 @@ def roi_presence_embedding_loss(
     presence_loss_weights: torch.Tensor | None = None,
     roots: list[str],
     video_ids: list[str | None],
-    frame_indices: list[int | None],
     ocr_texts: list[str],
     embedding_loss_weight: float,
     embedding_loss_alpha: float = 1.0,
-    embedding_pair_frame_window: int,
+    adjacent_segment_ids: list[set[str] | frozenset[str] | list[str] | tuple[str, ...]],
     embedding_ocr_negative_enabled: bool,
     embedding_ocr_negative_max_similarity: float,
+    embedding_ocr_negative_ratio: float,
     embedding_positive_consistency_beta: float = 0.0,
     embedding_positive_consistency_margin: float = 0.75,
     embedding_temperature: float = 0.1,
@@ -389,12 +391,12 @@ def roi_presence_embedding_loss(
         segment_ids,
         roots=roots,
         video_ids=video_ids,
-        frame_indices=frame_indices,
         ocr_texts=ocr_texts,
         alpha=embedding_loss_alpha,
-        frame_window=embedding_pair_frame_window,
+        adjacent_segment_ids=adjacent_segment_ids,
         ocr_negative_enabled=embedding_ocr_negative_enabled,
         ocr_negative_max_similarity=embedding_ocr_negative_max_similarity,
+        ocr_negative_ratio=embedding_ocr_negative_ratio,
         positive_consistency_beta=embedding_positive_consistency_beta,
         positive_consistency_margin=embedding_positive_consistency_margin,
         temperature=embedding_temperature,

@@ -96,9 +96,9 @@ uv run subfast-net train-roi \
 
 Embedding metrics now use trusted pairs only:
 
-- Local positive pairs: same root, same video, both subtitle-present, frame distance within `--embedding-pair-frame-window`, same `segment_id`.
-- Local negative pairs: same root, same video, both subtitle-present, frame distance within `--embedding-pair-frame-window`, different `segment_id`.
-- OCR negative pairs: same root, both subtitle-present, different `segment_id`, usable OCR text on both sides, and normalized OCR similarity at or below `--embedding-ocr-negative-max-similarity`.
+- Local positive pairs: same root, both subtitle-present, same `segment_id`.
+- Local negative pairs: same root, same video, both subtitle-present, adjacent different `segment_id` values in the dataset frame order.
+- OCR negative pairs: same root, both subtitle-present, different `segment_id`, usable OCR text on both sides, normalized OCR similarity at or below `--embedding-ocr-negative-max-similarity`, capped by `--embedding-ocr-negative-ratio`.
 
 No-subtitle samples still train the Presence head, but they are not used for embedding pairs.
 
@@ -198,9 +198,9 @@ ROI checkpoints include `model_type = "roi_presence_embedding"` and are not comp
 | `--val-negative-ratio` | Target no-subtitle ratio in a capped validation set. |
 | `--embedding-loss-weight` | Weight applied to embedding loss in `total_loss`. |
 | `--embedding-negative-ratio` | Target fraction of selected in-batch embedding pairs that come from different segments. All positive pairs are retained and the hardest negative pairs are selected first. |
-| `--embedding-pair-frame-window` | Maximum frame-index distance for local embedding pairs. Samples missing video or frame metadata cannot form local pairs. |
 | `--embedding-ocr-negative-enabled` / `--no-embedding-ocr-negative-enabled` | Enable or disable conservative OCR strong-difference negative pairs. |
 | `--embedding-ocr-negative-max-similarity` | Maximum normalized OCR text similarity allowed for OCR negative pairs. Lower is more conservative. |
+| `--embedding-ocr-negative-ratio` | Maximum OCR strong-difference negative share relative to trusted local negatives. Default is `0.3`. |
 | `--embedding-temperature` | Temperature used by pairwise embedding loss. |
 | `--embedding-similarity-threshold` | Similarity threshold used by embedding pair accuracy. |
 | `--width` | Small backbone width. |

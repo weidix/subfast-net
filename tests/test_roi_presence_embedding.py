@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from PIL import Image
@@ -112,7 +113,7 @@ def make_sampler_samples(
 class RoiPresenceEmbeddingTests(unittest.TestCase):
     def test_balanced_batch_sampler_realizes_presence_ratio_and_covers_every_sample(self):
         samples = make_sampler_samples(positives=6, negatives=10)
-        sampler = RoiBalancedBatchSampler(samples, batch_size=4, negative_ratio=0.5, frame_window=90, seed=7)
+        sampler = RoiBalancedBatchSampler(samples, batch_size=4, negative_ratio=0.5, seed=7)
         batches = list(sampler)
 
         self.assertTrue(all(sum(not samples[index].has_subtitle for index in batch) == 2 for batch in batches))
@@ -120,8 +121,8 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
 
     def test_balanced_batch_sampler_is_reproducible_and_changes_by_epoch(self):
         samples = make_sampler_samples(positives=8, negatives=8)
-        left = RoiBalancedBatchSampler(samples, batch_size=4, negative_ratio=0.5, frame_window=90, seed=11)
-        right = RoiBalancedBatchSampler(samples, batch_size=4, negative_ratio=0.5, frame_window=90, seed=11)
+        left = RoiBalancedBatchSampler(samples, batch_size=4, negative_ratio=0.5, seed=11)
+        right = RoiBalancedBatchSampler(samples, batch_size=4, negative_ratio=0.5, seed=11)
 
         self.assertEqual(list(left), list(right))
         left.set_epoch(1)
@@ -129,15 +130,13 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
 
     def test_balanced_batch_sampler_places_valid_same_segment_pair_in_every_batch(self):
         samples = make_sampler_samples(positives=8, negatives=8, repeated_segments=True)
-        sampler = RoiBalancedBatchSampler(samples, batch_size=4, negative_ratio=0.5, frame_window=90, seed=13)
+        sampler = RoiBalancedBatchSampler(samples, batch_size=4, negative_ratio=0.5, seed=13)
         for batch in sampler:
             positives = [samples[index] for index in batch if samples[index].has_subtitle]
             self.assertTrue(
                 any(
                     left.root == right.root
-                    and left.video_id == right.video_id
                     and left.segment_id == right.segment_id
-                    and abs(int(left.frame_index) - int(right.frame_index)) <= 90
                     for offset, left in enumerate(positives)
                     for right in positives[offset + 1 :]
                 )
@@ -218,26 +217,26 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
             ["seg-a", "seg-b", "seg-a"],
             roots=["root", "root", "root"],
             video_ids=["video", "video", "video"],
-            frame_indices=[0, 1, 2],
             ocr_texts=["alpha", "bravo", "alpha"],
-            frame_window=10,
+            adjacent_segment_ids=[frozenset({"seg-b"}), frozenset({"seg-a"}), frozenset({"seg-b"})],
             ocr_negative_enabled=False,
             ocr_negative_max_similarity=0.2,
+            ocr_negative_ratio=0.3,
             threshold=0.5,
         )
 
         self.assertAlmostEqual(metrics["embedding_best_f1"], 1.0)
 
-    def test_positive_embedding_memory_connects_same_segment_across_batches(self):
-        memory = EmbeddingPairMemory(frame_window=90)
+    def test_positive_embedding_memory_connects_same_root_segment_across_batches(self):
+        memory = EmbeddingPairMemory(ocr_negative_max_similarity=0.2, ocr_negative_ratio=0.3)
         first = torch.tensor([[1.0, 0.0]], requires_grad=True)
         second = torch.tensor([[0.0, 1.0]], requires_grad=True)
 
         first_loss, first_pairs = memory.loss_and_update(
-            first, torch.ones(1), ["segment-a"], ["root-a"], ["video-a"], [0], ["same text"]
+            first, torch.ones(1), ["segment-a"], ["root-a"], ["video-a"], ["same text"], [frozenset()]
         )
         second_loss, second_pairs = memory.loss_and_update(
-            second, torch.ones(1), ["segment-a"], ["root-a"], ["video-a"], [30], ["same text"]
+            second, torch.ones(1), ["segment-a"], ["root-a"], ["video-b"], ["same text"], [frozenset()]
         )
 
         self.assertEqual(first_pairs, 0)
@@ -246,30 +245,57 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertAlmostEqual(float(second_loss.detach()), 0.9, places=6)
 
     def test_embedding_pair_memory_connects_local_negative_across_batches(self):
-        memory = EmbeddingPairMemory(frame_window=90)
+        memory = EmbeddingPairMemory(ocr_negative_max_similarity=0.2, ocr_negative_ratio=0.3)
         first = torch.tensor([[1.0, 0.0]])
         second = torch.tensor([[1.0, 0.0]], requires_grad=True)
 
-        memory.loss_and_update(first, torch.ones(1), ["segment-a"], ["root-a"], ["video-a"], [0], ["alpha text"])
+        memory.loss_and_update(
+            first,
+            torch.ones(1),
+            ["segment-a"],
+            ["root-a"],
+            ["video-a"],
+            ["alpha text"],
+            [frozenset({"segment-b"})],
+        )
         loss, pairs = memory.loss_and_update(
-            second, torch.ones(1), ["segment-b"], ["root-a"], ["video-a"], [30], ["bravo text"]
+            second,
+            torch.ones(1),
+            ["segment-b"],
+            ["root-a"],
+            ["video-a"],
+            ["bravo text"],
+            [frozenset({"segment-a"})],
         )
 
         self.assertEqual(pairs, 1)
         self.assertAlmostEqual(float(loss.detach()), 1.8, places=6)
 
     def test_embedding_pair_memory_connects_ocr_negative_across_batches(self):
-        memory = EmbeddingPairMemory(frame_window=90)
+        memory = EmbeddingPairMemory(ocr_negative_max_similarity=0.2, ocr_negative_ratio=0.3)
         first = torch.tensor([[1.0, 0.0]])
         second = torch.tensor([[1.0, 0.0]], requires_grad=True)
 
-        memory.loss_and_update(first, torch.ones(1), ["segment-a"], ["root-a"], ["video-a"], [0], ["alpha text"])
+        memory.loss_and_update(first, torch.ones(1), ["segment-a"], ["root-a"], ["video-a"], ["alpha text"], [frozenset()])
         loss, pairs = memory.loss_and_update(
-            second, torch.ones(1), ["segment-b"], ["root-a"], ["video-b"], [300], ["9876 xyz"]
+            second, torch.ones(1), ["segment-b"], ["root-a"], ["video-b"], ["9876 xyz"], [frozenset()]
         )
 
         self.assertEqual(pairs, 1)
         self.assertAlmostEqual(float(loss.detach()), 1.8, places=6)
+
+    def test_embedding_pair_memory_limits_ocr_negatives_by_ratio(self):
+        memory = EmbeddingPairMemory(ocr_negative_max_similarity=0.2, ocr_negative_ratio=0.0)
+        first = torch.tensor([[1.0, 0.0]])
+        second = torch.tensor([[1.0, 0.0]], requires_grad=True)
+
+        memory.loss_and_update(first, torch.ones(1), ["segment-a"], ["root-a"], ["video-a"], ["alpha text"], [frozenset()])
+        loss, pairs = memory.loss_and_update(
+            second, torch.ones(1), ["segment-b"], ["root-a"], ["video-b"], ["9876 xyz"], [frozenset()]
+        )
+
+        self.assertEqual(pairs, 0)
+        self.assertEqual(float(loss.detach()), 0.0)
 
     def test_local_contrast_residual_removes_constant_background(self):
         operator = LocalContrastResidual(kernel_size=3)
@@ -288,16 +314,27 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
             segment_ids=["seg-a", "seg-a", "seg-b", "seg-c", "empty", "seg-d", "seg-a"],
             roots=["root-a", "root-a", "root-a", "root-b", "root-a", "root-a", "root-a"],
             video_ids=["video-1", "video-1", "video-1", "video-1", "video-1", "video-2", "video-1"],
-            frame_indices=[100, 130, 160, 160, 190, 190, 400],
             ocr_texts=["alpha", "alpha", "bravo", "charlie", "", "delta", "alpha"],
-            frame_window=30,
+            adjacent_segment_ids=[
+                frozenset({"seg-b"}),
+                frozenset({"seg-b"}),
+                frozenset({"seg-a"}),
+                frozenset(),
+                frozenset(),
+                frozenset(),
+                frozenset({"seg-b"}),
+            ],
             ocr_negative_enabled=False,
             ocr_negative_max_similarity=0.2,
+            ocr_negative_ratio=0.3,
         )
 
-        self.assertEqual([(pair.i, pair.j, pair.same) for pair in selection.pairs], [(0, 1, True), (1, 2, False)])
-        self.assertEqual(selection.local_positive_pairs, 1)
-        self.assertEqual(selection.local_negative_pairs, 1)
+        self.assertEqual(
+            [(pair.i, pair.j, pair.same) for pair in selection.pairs],
+            [(0, 1, True), (0, 2, False), (0, 6, True), (1, 2, False), (1, 6, True), (2, 6, False)],
+        )
+        self.assertEqual(selection.local_positive_pairs, 3)
+        self.assertEqual(selection.local_negative_pairs, 3)
         self.assertEqual(selection.ocr_negative_pairs, 0)
         self.assertGreater(selection.skipped_pairs, 0)
 
@@ -307,15 +344,15 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
             segment_ids=["seg-a", "seg-b", "seg-b", "seg-d", "seg-a", "seg-e"],
             roots=["root-a", "root-a", "root-a", "root-a", "root-a", "root-b"],
             video_ids=["video-1"] * 6,
-            frame_indices=[0, 300, 600, 900, 1200, 1500],
             ocr_texts=["今晚吃饭", "abcXYZ987", "今晚吃飯", "", "xyz", "abcXYZ987"],
-            frame_window=30,
+            adjacent_segment_ids=[frozenset() for _ in range(6)],
             ocr_negative_enabled=True,
             ocr_negative_max_similarity=0.2,
+            ocr_negative_ratio=0.3,
         )
 
-        self.assertEqual([(pair.i, pair.j, pair.same) for pair in selection.pairs], [(0, 1, False)])
-        self.assertEqual(selection.local_positive_pairs, 0)
+        self.assertEqual([(pair.i, pair.j, pair.same) for pair in selection.pairs], [(0, 4, True), (1, 2, True), (0, 1, False)])
+        self.assertEqual(selection.local_positive_pairs, 2)
         self.assertEqual(selection.local_negative_pairs, 0)
         self.assertEqual(selection.ocr_negative_pairs, 1)
 
@@ -449,12 +486,12 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
             ["seg-a", "empty"],
             roots=["root-a", "root-a"],
             video_ids=["video-1", "video-1"],
-            frame_indices=[0, 30],
             ocr_texts=["subtitle", ""],
             embedding_loss_weight=1.0,
-            embedding_pair_frame_window=30,
+            adjacent_segment_ids=[frozenset(), frozenset()],
             embedding_ocr_negative_enabled=True,
             embedding_ocr_negative_max_similarity=0.2,
+            embedding_ocr_negative_ratio=0.3,
             embedding_temperature=0.1,
         )
 
@@ -474,12 +511,12 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
             presence_loss_weights=torch.tensor([3.0, 1.0, 1.0]),
             roots=["root-a", "root-a", "root-a"],
             video_ids=["video-1", "video-1", "video-1"],
-            frame_indices=[0, 30, 60],
             ocr_texts=["好", "subtitle", ""],
             embedding_loss_weight=0.0,
-            embedding_pair_frame_window=30,
+            adjacent_segment_ids=[frozenset({"seg-b"}), frozenset({"seg-a"}), frozenset()],
             embedding_ocr_negative_enabled=True,
             embedding_ocr_negative_max_similarity=0.2,
+            embedding_ocr_negative_ratio=0.3,
             embedding_temperature=0.1,
         )
 
@@ -736,6 +773,42 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertEqual(summary["best_checkpoint"], "outputs/roi_presence_only/best.pt")
         self.assertEqual(summary["best_epoch_metrics"], "outputs/roi_presence_only/epoch_outputs/epoch_0003/metrics.json")
         self.assertNotIn("last_metrics", summary)
+
+    def test_presence_training_skips_embedding_pair_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "roi"
+            output = Path(tmp) / "out"
+            write_roi_dataset(root)
+
+            with patch("src.train_roi.EmbeddingPairMemory") as memory_class:
+                metrics = run_training(
+                    RoiTrainSettings(
+                        train_roots=[root],
+                        val_root=root,
+                        output_dir=output,
+                        batch_size=4,
+                        presence_epochs=1,
+                        embedding_epochs=0,
+                        joint_epochs=0,
+                        max_train_samples=4,
+                        max_val_samples=4,
+                        width=8,
+                        device="cpu",
+                    )
+                )
+
+            memory_class.assert_not_called()
+            self.assertEqual(metrics["training_phase"], "presence")
+            self.assertEqual(metrics["train_embedding_memory_loss"], 0.0)
+            self.assertEqual(metrics["train_embedding_memory_pairs"], 0.0)
+            step_records = [
+                json.loads(line)
+                for line in (output / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+                if json.loads(line).get("record_type") == "roi_train_step"
+            ]
+            self.assertTrue(step_records)
+            self.assertTrue(all(record["embedding_memory_loss"] == 0.0 for record in step_records))
+            self.assertTrue(all(record["embedding_memory_pairs"] == 0.0 for record in step_records))
 
     def test_one_epoch_roi_training_smoke(self):
         with tempfile.TemporaryDirectory() as tmp:

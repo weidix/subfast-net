@@ -98,11 +98,11 @@ def embedding_metrics(
     *,
     roots: list[str],
     video_ids: list[str | None],
-    frame_indices: list[int | None],
     ocr_texts: list[str],
-    frame_window: int,
+    adjacent_segment_ids: list[set[str] | frozenset[str] | list[str] | tuple[str, ...]],
     ocr_negative_enabled: bool,
     ocr_negative_max_similarity: float,
+    ocr_negative_ratio: float,
     threshold: float,
 ) -> dict[str, float]:
     selection = select_embedding_pairs(
@@ -110,11 +110,11 @@ def embedding_metrics(
         segment_ids=segment_ids,
         roots=roots,
         video_ids=video_ids,
-        frame_indices=frame_indices,
         ocr_texts=ocr_texts,
-        frame_window=frame_window,
+        adjacent_segment_ids=adjacent_segment_ids,
         ocr_negative_enabled=ocr_negative_enabled,
         ocr_negative_max_similarity=ocr_negative_max_similarity,
+        ocr_negative_ratio=ocr_negative_ratio,
     )
     if not selection.pairs:
         return {

@@ -89,7 +89,7 @@ def make_sampler_samples(
 def test_balanced_batch_sampler_realizes_presence_ratio_and_covers_every_sample(self):
     samples = make_sampler_samples(positives=6, negatives=10)
     sampler = RoiBalancedBatchSampler(
-        samples, batch_size=4, negative_ratio=0.5, frame_window=90, seed=7
+        samples, batch_size=4, negative_ratio=0.5, seed=7
     )
     batches = list(sampler)
     self.assertTrue(all(
@@ -103,15 +103,15 @@ def test_balanced_batch_sampler_realizes_presence_ratio_and_covers_every_sample(
 
 def test_balanced_batch_sampler_is_reproducible_and_changes_by_epoch(self):
     samples = make_sampler_samples(positives=8, negatives=8)
-    left = RoiBalancedBatchSampler(samples, batch_size=4, negative_ratio=0.5, frame_window=90, seed=11)
-    right = RoiBalancedBatchSampler(samples, batch_size=4, negative_ratio=0.5, frame_window=90, seed=11)
+    left = RoiBalancedBatchSampler(samples, batch_size=4, negative_ratio=0.5, seed=11)
+    right = RoiBalancedBatchSampler(samples, batch_size=4, negative_ratio=0.5, seed=11)
     self.assertEqual(list(left), list(right))
     left.set_epoch(1)
     self.assertNotEqual(list(left), list(right))
 
 def test_balanced_batch_sampler_places_valid_same_segment_pair_in_every_batch(self):
     samples = make_sampler_samples(positives=8, negatives=8, repeated_segments=True)
-    sampler = RoiBalancedBatchSampler(samples, batch_size=4, negative_ratio=0.5, frame_window=90, seed=13)
+    sampler = RoiBalancedBatchSampler(samples, batch_size=4, negative_ratio=0.5, seed=13)
     for batch in sampler:
         positives = [samples[index] for index in batch if samples[index].has_subtitle]
         self.assertTrue(any(
@@ -137,9 +137,9 @@ Expected: import failure because src.roi_sampler does not exist.
 
 - [ ] **Step 3: Implement the sampler**
 
-Create RoiBalancedBatchSampler as Sampler[list[int]]. Its constructor accepts samples, batch_size, negative_ratio, frame_window, and seed. It exposes set_epoch(epoch), __len__(), and __iter__().
+Create RoiBalancedBatchSampler as Sampler[list[int]]. Its constructor accepts samples, batch_size, negative_ratio, and seed. It exposes set_epoch(epoch), __len__(), and __iter__().
 
-Compute negative_slots by rounded batch_size times negative_ratio and use the remainder as positive_slots. Require at least two positive slots and one negative slot when both classes exist. Build positive pair candidates from matching root, video_id, and segment_id groups whose non-null frame indices differ by at most frame_window. Shuffle queues with random.Random(seed + epoch), start each mixed batch with a valid pair, fill remaining slots from cycling class queues without duplicates inside a batch, and choose the batch count so every original index is visited.
+Compute negative_slots by rounded batch_size times negative_ratio and use the remainder as positive_slots. Require at least two positive slots and one negative slot when both classes exist. Build positive pair candidates from matching root and segment_id groups. Shuffle queues with random.Random(seed + epoch), start each mixed batch with a valid pair, fill remaining slots from cycling class queues without duplicates inside a batch, and choose the batch count so every original index is visited.
 
 - [ ] **Step 4: Run the Step 2 command and verify GREEN**
 
@@ -330,7 +330,7 @@ Expected: all tests pass.
 
 - [ ] **Step 2: Audit full training metadata**
 
-Use the five documented training roots with batch_size 32, negative_ratio 0.35, frame_window 90, and seed 2026. Iterate RoiBalancedBatchSampler without loading images and assert:
+Use the five documented training roots with batch_size 32, negative_ratio 0.35, and seed 2026. Iterate RoiBalancedBatchSampler without loading images and assert:
 
 ~~~python
 assert covered == set(range(len(dataset)))

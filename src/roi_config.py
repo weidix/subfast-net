@@ -29,9 +29,9 @@ class RoiTrainSettings(BaseModel):
     embedding_loss_alpha: float = 1.0
     embedding_negative_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
     embedding_samples_per_segment: int = Field(default=2, ge=1)
-    embedding_pair_frame_window: int = 90
     embedding_ocr_negative_enabled: bool = True
     embedding_ocr_negative_max_similarity: float = 0.2
+    embedding_ocr_negative_ratio: float = Field(default=0.3, ge=0.0, le=1.0)
     embedding_positive_consistency_beta: float = 0.0
     embedding_positive_consistency_margin: float = 0.75
     embedding_temperature: float = 0.1

@@ -14,7 +14,7 @@ from torch.utils.data import Dataset
 
 from .dataset import IMAGENET_MEAN, IMAGENET_STD
 from .geometry import Box, yolo_to_box
-from .roi_pairs import parse_frame_index, parse_video_frame_from_sample_id, parse_video_id
+from .roi_pairs import infer_adjacent_segment_ids, parse_frame_index, parse_video_frame_from_sample_id, parse_video_id
 
 REVIEW_FILENAME = "segment_review.json"
 
@@ -45,6 +45,7 @@ class RoiBatch:
     video_ids: list[str | None]
     frame_indices: list[int | None]
     ocr_texts: list[str]
+    adjacent_segment_ids: list[frozenset[str]]
 
 
 @dataclass(frozen=True)
@@ -331,6 +332,17 @@ class RoiPresenceEmbeddingDataset(Dataset):
             self.samples = limit_roi_validation_samples(samples, max_samples, empty_ratio)
         else:
             self.samples = limit_roi_samples(samples, max_samples, empty_ratio)
+        self.adjacent_segment_ids = infer_adjacent_segment_ids(
+            presence=torch.tensor([1.0 if sample.has_subtitle else 0.0 for sample in samples], dtype=torch.float32),
+            segment_ids=[sample.segment_id for sample in samples],
+            roots=[str(sample.root) for sample in samples],
+            video_ids=[sample.video_id for sample in samples],
+            frame_indices=[sample.frame_index for sample in samples],
+        )
+        self.adjacent_segment_ids_by_sample_id = {
+            (str(sample.root), sample.sample_id): adjacent
+            for sample, adjacent in zip(samples, self.adjacent_segment_ids, strict=True)
+        }
         self.summary = self._summarize()
 
     def __len__(self) -> int:
@@ -370,6 +382,7 @@ class RoiPresenceEmbeddingDataset(Dataset):
             "video_id": sample.video_id,
             "frame_index": sample.frame_index,
             "ocr_text": sample.ocr_text,
+            "adjacent_segment_ids": self.adjacent_segment_ids_by_sample_id.get((str(sample.root), sample.sample_id), frozenset()),
         }
 
     def _summarize(self) -> RoiDatasetSummary:
@@ -418,4 +431,5 @@ def collate_roi_batch(items: list[dict]) -> RoiBatch:
         video_ids=[item["video_id"] for item in items],
         frame_indices=[item["frame_index"] for item in items],
         ocr_texts=[item["ocr_text"] for item in items],
+        adjacent_segment_ids=[item["adjacent_segment_ids"] for item in items],
     )

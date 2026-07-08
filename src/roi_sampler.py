@@ -19,7 +19,6 @@ class RoiBalancedBatchSampler(Sampler[list[int]]):
         *,
         batch_size: int,
         negative_ratio: float,
-        frame_window: int,
         seed: int,
         embedding_samples_per_segment: int = 2,
     ) -> None:
@@ -27,14 +26,11 @@ class RoiBalancedBatchSampler(Sampler[list[int]]):
             raise ValueError("batch_size must be positive")
         if not 0.0 <= negative_ratio <= 1.0:
             raise ValueError("negative_ratio must be in [0, 1]")
-        if frame_window < 0:
-            raise ValueError("frame_window must be non-negative")
         if embedding_samples_per_segment < 1:
             raise ValueError("embedding_samples_per_segment must be positive")
         self.samples = samples
         self.batch_size = batch_size
         self.negative_ratio = negative_ratio
-        self.frame_window = frame_window
         self.embedding_samples_per_segment = embedding_samples_per_segment
         self.seed = seed
         self.epoch = 0
@@ -66,27 +62,22 @@ class RoiBalancedBatchSampler(Sampler[list[int]]):
         self._batch_count = max(counts, default=0)
 
     def _build_positive_pairs(self) -> list[tuple[int, int]]:
-        groups: dict[tuple[str, str | None, str], list[int]] = defaultdict(list)
+        groups: dict[tuple[str, str], list[int]] = defaultdict(list)
         for index in self.positive_indices:
             sample = self.samples[index]
-            groups[(str(sample.root.resolve()), sample.video_id, sample.segment_id)].append(index)
+            groups[(str(sample.root.resolve()), sample.segment_id)].append(index)
         pairs: list[tuple[int, int]] = []
         for indices in groups.values():
             for offset, left_index in enumerate(indices):
-                left_frame = self.samples[left_index].frame_index
-                if left_frame is None:
-                    continue
                 for right_index in indices[offset + 1 :]:
-                    right_frame = self.samples[right_index].frame_index
-                    if right_frame is not None and abs(left_frame - right_frame) <= self.frame_window:
-                        pairs.append((left_index, right_index))
+                    pairs.append((left_index, right_index))
         return pairs
 
     def _build_segment_groups(self) -> list[list[int]]:
-        groups: dict[tuple[str, str | None, str], list[int]] = defaultdict(list)
+        groups: dict[tuple[str, str], list[int]] = defaultdict(list)
         for index in self.positive_indices:
             sample = self.samples[index]
-            groups[(str(sample.root.resolve()), sample.video_id, sample.segment_id)].append(index)
+            groups[(str(sample.root.resolve()), sample.segment_id)].append(index)
         return [indices for indices in groups.values() if len(indices) >= 2]
 
     def set_epoch(self, epoch: int) -> None:

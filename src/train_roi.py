@@ -498,11 +498,11 @@ def scoped_validation_metrics(
     *,
     roots: list[str],
     video_ids: list[str | None],
-    frame_indices: list[int | None],
     ocr_texts: list[str],
-    frame_window: int,
+    adjacent_segment_ids: list[set[str] | frozenset[str] | list[str] | tuple[str, ...]],
     ocr_negative_enabled: bool,
     ocr_negative_max_similarity: float,
+    ocr_negative_ratio: float,
     threshold: float,
 ) -> dict[str, float]:
     positive_mask = presence > 0.5
@@ -526,11 +526,11 @@ def scoped_validation_metrics(
         segment_ids=segment_ids,
         roots=roots,
         video_ids=video_ids,
-        frame_indices=frame_indices,
         ocr_texts=ocr_texts,
-        frame_window=frame_window,
+        adjacent_segment_ids=adjacent_segment_ids,
         ocr_negative_enabled=ocr_negative_enabled,
         ocr_negative_max_similarity=ocr_negative_max_similarity,
+        ocr_negative_ratio=ocr_negative_ratio,
     )
     normal_scores: list[float] = []
     normal_targets: list[bool] = []
@@ -578,9 +578,10 @@ def embedding_error_pair_records(
     video_ids: list[str | None],
     frame_indices: list[int | None],
     ocr_texts: list[str],
-    frame_window: int,
+    adjacent_segment_ids: list[set[str] | frozenset[str] | list[str] | tuple[str, ...]],
     ocr_negative_enabled: bool,
     ocr_negative_max_similarity: float,
+    ocr_negative_ratio: float,
     threshold: float,
 ) -> list[dict[str, Any]]:
     selection = select_embedding_pairs(
@@ -588,11 +589,11 @@ def embedding_error_pair_records(
         segment_ids=segment_ids,
         roots=roots,
         video_ids=video_ids,
-        frame_indices=frame_indices,
         ocr_texts=ocr_texts,
-        frame_window=frame_window,
+        adjacent_segment_ids=adjacent_segment_ids,
         ocr_negative_enabled=ocr_negative_enabled,
         ocr_negative_max_similarity=ocr_negative_max_similarity,
+        ocr_negative_ratio=ocr_negative_ratio,
     )
     records: list[dict[str, Any]] = []
     for pair in selection.pairs:
@@ -682,6 +683,7 @@ def validate(
     video_ids: list[str | None] = []
     frame_indices: list[int | None] = []
     ocr_texts: list[str] = []
+    adjacent_segment_ids: list[frozenset[str]] = []
     for batch in loader:
         images = batch.images.to(device)
         presence = batch.presence.to(device)
@@ -693,13 +695,13 @@ def validate(
             batch.segment_ids,
             roots=batch.roots,
             video_ids=batch.video_ids,
-            frame_indices=batch.frame_indices,
             ocr_texts=batch.ocr_texts,
             embedding_loss_weight=settings.embedding_loss_weight,
             embedding_loss_alpha=settings.embedding_loss_alpha,
-            embedding_pair_frame_window=settings.embedding_pair_frame_window,
+            adjacent_segment_ids=batch.adjacent_segment_ids,
             embedding_ocr_negative_enabled=settings.embedding_ocr_negative_enabled,
             embedding_ocr_negative_max_similarity=settings.embedding_ocr_negative_max_similarity,
+            embedding_ocr_negative_ratio=settings.embedding_ocr_negative_ratio,
             embedding_positive_consistency_beta=settings.embedding_positive_consistency_beta,
             embedding_positive_consistency_margin=settings.embedding_positive_consistency_margin,
             embedding_temperature=settings.embedding_temperature,
@@ -720,6 +722,7 @@ def validate(
         video_ids.extend(batch.video_ids)
         frame_indices.extend(batch.frame_indices)
         ocr_texts.extend(batch.ocr_texts)
+        adjacent_segment_ids.extend(batch.adjacent_segment_ids)
     logits = torch.cat(logits_all).cpu()
     presence = torch.cat(presence_all).cpu()
     embedding = torch.cat(embedding_all).cpu()
@@ -738,11 +741,11 @@ def validate(
             segment_ids,
             roots=roots,
             video_ids=video_ids,
-            frame_indices=frame_indices,
             ocr_texts=ocr_texts,
-            frame_window=settings.embedding_pair_frame_window,
+            adjacent_segment_ids=adjacent_segment_ids,
             ocr_negative_enabled=settings.embedding_ocr_negative_enabled,
             ocr_negative_max_similarity=settings.embedding_ocr_negative_max_similarity,
+            ocr_negative_ratio=settings.embedding_ocr_negative_ratio,
             threshold=settings.embedding_similarity_threshold,
         )
     )
@@ -756,11 +759,11 @@ def validate(
             segment_ids,
             roots=roots,
             video_ids=video_ids,
-            frame_indices=frame_indices,
             ocr_texts=ocr_texts,
-            frame_window=settings.embedding_pair_frame_window,
+            adjacent_segment_ids=adjacent_segment_ids,
             ocr_negative_enabled=settings.embedding_ocr_negative_enabled,
             ocr_negative_max_similarity=settings.embedding_ocr_negative_max_similarity,
+            ocr_negative_ratio=settings.embedding_ocr_negative_ratio,
             threshold=settings.embedding_similarity_threshold,
         )
     )
@@ -776,9 +779,10 @@ def validate(
                 video_ids=video_ids,
                 frame_indices=frame_indices,
                 ocr_texts=ocr_texts,
-                frame_window=settings.embedding_pair_frame_window,
+                adjacent_segment_ids=adjacent_segment_ids,
                 ocr_negative_enabled=settings.embedding_ocr_negative_enabled,
                 ocr_negative_max_similarity=settings.embedding_ocr_negative_max_similarity,
+                ocr_negative_ratio=settings.embedding_ocr_negative_ratio,
                 threshold=settings.embedding_similarity_threshold,
             ),
             error_pair_audit_path,
@@ -847,7 +851,6 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
             train_dataset.samples,
             batch_size=settings.batch_size,
             negative_ratio=settings.negative_ratio,
-            frame_window=settings.embedding_pair_frame_window,
             embedding_samples_per_segment=settings.embedding_samples_per_segment,
             seed=settings.seed,
         )
@@ -916,9 +919,9 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
         f"short_positive_mask_loss_weight={settings.short_positive_mask_loss_weight:g} "
         f"embedding_loss_weight={settings.embedding_loss_weight:g} resize_roi={settings.resize_roi} "
         f"embedding_loss_alpha={settings.embedding_loss_alpha:g} "
-        f"embedding_pair_frame_window={settings.embedding_pair_frame_window} "
         f"embedding_ocr_negative_enabled={settings.embedding_ocr_negative_enabled} "
         f"embedding_ocr_negative_max_similarity={settings.embedding_ocr_negative_max_similarity:g} "
+        f"embedding_ocr_negative_ratio={settings.embedding_ocr_negative_ratio:g} "
         f"embedding_positive_consistency_beta={settings.embedding_positive_consistency_beta:g} "
         f"embedding_positive_consistency_margin={settings.embedding_positive_consistency_margin:g} "
         f"embedding_samples_per_segment={settings.embedding_samples_per_segment} "
@@ -979,7 +982,14 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
             assert optimizer is not None
             if train_batch_sampler is not None:
                 train_batch_sampler.set_epoch(epoch)
-            embedding_pair_memory = EmbeddingPairMemory(settings.embedding_pair_frame_window)
+            embedding_pair_memory = (
+                None
+                if phase.name == "presence"
+                else EmbeddingPairMemory(
+                    ocr_negative_max_similarity=settings.embedding_ocr_negative_max_similarity,
+                    ocr_negative_ratio=settings.embedding_ocr_negative_ratio,
+                )
+            )
             model.train()
             configure_training_phase(model, phase.name)
             train_loss = 0.0
@@ -1043,13 +1053,13 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                     ),
                     roots=batch.roots,
                     video_ids=batch.video_ids,
-                    frame_indices=batch.frame_indices,
                     ocr_texts=batch.ocr_texts,
                     embedding_loss_weight=settings.embedding_loss_weight,
                     embedding_loss_alpha=settings.embedding_loss_alpha,
-                    embedding_pair_frame_window=settings.embedding_pair_frame_window,
+                    adjacent_segment_ids=batch.adjacent_segment_ids,
                     embedding_ocr_negative_enabled=settings.embedding_ocr_negative_enabled,
                     embedding_ocr_negative_max_similarity=settings.embedding_ocr_negative_max_similarity,
+                    embedding_ocr_negative_ratio=settings.embedding_ocr_negative_ratio,
                     embedding_positive_consistency_beta=settings.embedding_positive_consistency_beta,
                     embedding_positive_consistency_margin=settings.embedding_positive_consistency_margin,
                     embedding_temperature=settings.embedding_temperature,
@@ -1060,15 +1070,19 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                     embedding_tail_hard_negative_weight=settings.embedding_tail_hard_negative_weight,
                     presence_loss_enabled=phase.name != "embedding",
                 )
-                memory_loss, memory_pairs = embedding_pair_memory.loss_and_update(
-                    embedding,
-                    presence,
-                    batch.segment_ids,
-                    batch.roots,
-                    batch.video_ids,
-                    batch.frame_indices,
-                    batch.ocr_texts,
-                )
+                if embedding_pair_memory is None:
+                    memory_loss = embedding.sum() * 0.0
+                    memory_pairs = 0
+                else:
+                    memory_loss, memory_pairs = embedding_pair_memory.loss_and_update(
+                        embedding,
+                        presence,
+                        batch.segment_ids,
+                        batch.roots,
+                        batch.video_ids,
+                        batch.ocr_texts,
+                        batch.adjacent_segment_ids,
+                    )
                 if phase.name == "presence":
                     total_loss = loss.presence_loss + mask_loss
                 elif phase.name == "embedding":
@@ -1290,13 +1304,13 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
         help="Target different-segment fraction among selected in-batch embedding pairs.",
     )
     parser.add_argument("--embedding-samples-per-segment", type=int, default=RoiTrainSettings().embedding_samples_per_segment)
-    parser.add_argument("--embedding-pair-frame-window", type=int, default=RoiTrainSettings().embedding_pair_frame_window)
     parser.add_argument(
         "--embedding-ocr-negative-enabled",
         action=argparse.BooleanOptionalAction,
         default=RoiTrainSettings().embedding_ocr_negative_enabled,
     )
     parser.add_argument("--embedding-ocr-negative-max-similarity", type=float, default=RoiTrainSettings().embedding_ocr_negative_max_similarity)
+    parser.add_argument("--embedding-ocr-negative-ratio", type=float, default=RoiTrainSettings().embedding_ocr_negative_ratio)
     parser.add_argument("--embedding-positive-consistency-beta", type=float, default=RoiTrainSettings().embedding_positive_consistency_beta)
     parser.add_argument("--embedding-positive-consistency-margin", type=float, default=RoiTrainSettings().embedding_positive_consistency_margin)
     parser.add_argument("--embedding-temperature", type=float, default=RoiTrainSettings().embedding_temperature)
@@ -1348,8 +1362,6 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
         positive_name="--val-positive-ratio",
         negative_name="--val-negative-ratio",
     )
-    if args.embedding_pair_frame_window < 0:
-        parser.error("--embedding-pair-frame-window must be non-negative")
     phase_epoch_values = (args.presence_epochs, args.embedding_epochs, args.joint_epochs)
     if any(value < 0 for value in phase_epoch_values):
         parser.error("phase epoch counts must be non-negative")
@@ -1377,6 +1389,8 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
         parser.error("--presence-topk-ratio must be in (0, 1]")
     if not 0.0 <= args.embedding_ocr_negative_max_similarity <= 1.0:
         parser.error("--embedding-ocr-negative-max-similarity must be in [0, 1]")
+    if not 0.0 <= args.embedding_ocr_negative_ratio <= 1.0:
+        parser.error("--embedding-ocr-negative-ratio must be in [0, 1]")
     max_train_samples = args.max_train_samples if args.max_train_samples is not None else args.max_samples
     return RoiTrainSettings(
         train_roots=args.train_roots if args.train_roots is not None else RoiTrainSettings().train_roots,
@@ -1400,9 +1414,9 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
         embedding_loss_alpha=args.embedding_loss_alpha,
         embedding_negative_ratio=args.embedding_negative_ratio,
         embedding_samples_per_segment=args.embedding_samples_per_segment,
-        embedding_pair_frame_window=args.embedding_pair_frame_window,
         embedding_ocr_negative_enabled=args.embedding_ocr_negative_enabled,
         embedding_ocr_negative_max_similarity=args.embedding_ocr_negative_max_similarity,
+        embedding_ocr_negative_ratio=args.embedding_ocr_negative_ratio,
         embedding_positive_consistency_beta=args.embedding_positive_consistency_beta,
         embedding_positive_consistency_margin=args.embedding_positive_consistency_margin,
         embedding_temperature=args.embedding_temperature,
@@ -1435,9 +1449,9 @@ def parse_validate_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--embedding-loss-weight", type=float, default=RoiTrainSettings().embedding_loss_weight)
     parser.add_argument("--embedding-loss-alpha", type=float)
-    parser.add_argument("--embedding-pair-frame-window", type=int)
     parser.add_argument("--embedding-ocr-negative-enabled", action=argparse.BooleanOptionalAction)
     parser.add_argument("--embedding-ocr-negative-max-similarity", type=float)
+    parser.add_argument("--embedding-ocr-negative-ratio", type=float)
     parser.add_argument("--embedding-positive-consistency-beta", type=float)
     parser.add_argument("--embedding-positive-consistency-margin", type=float)
     parser.add_argument("--embedding-temperature", type=float, default=RoiTrainSettings().embedding_temperature)
@@ -1445,10 +1459,10 @@ def parse_validate_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--error-pair-audit", type=Path)
     parser.add_argument("--device", default=RoiTrainSettings().device)
     args = parser.parse_args(argv)
-    if args.embedding_pair_frame_window is not None and args.embedding_pair_frame_window < 0:
-        parser.error("--embedding-pair-frame-window must be non-negative")
     if args.embedding_ocr_negative_max_similarity is not None and not 0.0 <= args.embedding_ocr_negative_max_similarity <= 1.0:
         parser.error("--embedding-ocr-negative-max-similarity must be in [0, 1]")
+    if args.embedding_ocr_negative_ratio is not None and not 0.0 <= args.embedding_ocr_negative_ratio <= 1.0:
+        parser.error("--embedding-ocr-negative-ratio must be in [0, 1]")
     return args
 
 
@@ -1465,11 +1479,6 @@ def run_validation(args: argparse.Namespace) -> dict[str, float]:
         max_val_samples=args.max_samples,
         embedding_loss_weight=args.embedding_loss_weight,
         embedding_loss_alpha=float(raw_settings.get("embedding_loss_alpha", RoiTrainSettings().embedding_loss_alpha) if args.embedding_loss_alpha is None else args.embedding_loss_alpha),
-        embedding_pair_frame_window=int(
-            raw_settings.get("embedding_pair_frame_window", RoiTrainSettings().embedding_pair_frame_window)
-            if args.embedding_pair_frame_window is None
-            else args.embedding_pair_frame_window
-        ),
         embedding_ocr_negative_enabled=bool(
             raw_settings.get("embedding_ocr_negative_enabled", RoiTrainSettings().embedding_ocr_negative_enabled)
             if args.embedding_ocr_negative_enabled is None
@@ -1479,6 +1488,11 @@ def run_validation(args: argparse.Namespace) -> dict[str, float]:
             raw_settings.get("embedding_ocr_negative_max_similarity", RoiTrainSettings().embedding_ocr_negative_max_similarity)
             if args.embedding_ocr_negative_max_similarity is None
             else args.embedding_ocr_negative_max_similarity
+        ),
+        embedding_ocr_negative_ratio=float(
+            raw_settings.get("embedding_ocr_negative_ratio", RoiTrainSettings().embedding_ocr_negative_ratio)
+            if args.embedding_ocr_negative_ratio is None
+            else args.embedding_ocr_negative_ratio
         ),
         embedding_positive_consistency_beta=float(
             raw_settings.get("embedding_positive_consistency_beta", RoiTrainSettings().embedding_positive_consistency_beta)
