@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
 from torch.nn import functional as F
 
-from .roi_pairs import max_ocr_negative_pairs, normalize_ocr_text, normalized_ocr_text_similarity_at_most, select_embedding_pairs
+from .roi_pairs import EmbeddingPair, EmbeddingPairSelection, max_ocr_negative_pairs, normalize_ocr_text, normalized_ocr_text_similarity_at_most, select_embedding_pairs
 
 
 @dataclass(frozen=True)
@@ -271,35 +272,61 @@ def metric_embedding_loss(
     embedding_tail_gamma_positive: float = 20.0,
     embedding_tail_gamma_negative: float = 40.0,
     embedding_tail_hard_negative_weight: float = 2.0,
+    explicit_pairs: Sequence[EmbeddingPair] | None = None,
 ) -> tuple[torch.Tensor, int, int, int, int, int, int, int, int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
-    selection = select_embedding_pairs(
-        presence=presence,
-        segment_ids=segment_ids,
-        roots=roots,
-        video_ids=video_ids,
-        ocr_texts=ocr_texts,
-        adjacent_segment_ids=adjacent_segment_ids,
-        ocr_negative_enabled=ocr_negative_enabled,
-        ocr_negative_max_similarity=ocr_negative_max_similarity,
-        ocr_negative_ratio=ocr_negative_ratio,
-    )
+    if explicit_pairs is None:
+        selection = select_embedding_pairs(
+            presence=presence,
+            segment_ids=segment_ids,
+            roots=roots,
+            video_ids=video_ids,
+            ocr_texts=ocr_texts,
+            adjacent_segment_ids=adjacent_segment_ids,
+            ocr_negative_enabled=ocr_negative_enabled,
+            ocr_negative_max_similarity=ocr_negative_max_similarity,
+            ocr_negative_ratio=ocr_negative_ratio,
+        )
+    else:
+        selection = EmbeddingPairSelection(
+            pairs=list(explicit_pairs),
+            local_positive_pairs=sum(1 for pair in explicit_pairs if pair.same and pair.source == "local"),
+            local_negative_pairs=sum(1 for pair in explicit_pairs if not pair.same and pair.source == "local"),
+            ocr_negative_pairs=sum(1 for pair in explicit_pairs if not pair.same and pair.source == "ocr"),
+            skipped_pairs=0,
+        )
     if not selection.pairs:
         zero = embedding.sum() * 0.0
-        supcon_loss = supervised_contrastive_embedding_loss(
-            embedding,
-            presence,
-            segment_ids,
-            roots,
-            temperature=temperature,
+        supcon_loss = (
+            zero
+            if explicit_pairs is not None
+            else supervised_contrastive_embedding_loss(
+                embedding,
+                presence,
+                segment_ids,
+                roots,
+                temperature=temperature,
+            )
         )
         return supcon_loss * embedding_supcon_weight, 0, 0, 0, 0, selection.skipped_pairs, 0, 0, 0, 0, zero, zero, supcon_loss
     left = torch.tensor([pair.i for pair in selection.pairs], dtype=torch.long, device=embedding.device)
     right = torch.tensor([pair.j for pair in selection.pairs], dtype=torch.long, device=embedding.device)
     targets = torch.tensor([1.0 if pair.same else 0.0 for pair in selection.pairs], dtype=embedding.dtype, device=embedding.device)
     similarities = (embedding[left] * embedding[right]).sum(dim=1)
-    balanced = balance_embedding_pairs(similarities, targets, negative_ratio=embedding_negative_ratio)
-    selected_similarities = similarities[balanced.indices]
-    selected_targets = targets[balanced.indices]
+    if explicit_pairs is None:
+        balanced = balance_embedding_pairs(similarities, targets, negative_ratio=embedding_negative_ratio)
+        selected_similarities = similarities[balanced.indices]
+        selected_targets = targets[balanced.indices]
+        candidate_positive_pairs = balanced.candidate_positive_pairs
+        candidate_negative_pairs = balanced.candidate_negative_pairs
+        selected_positive_pairs = balanced.selected_positive_pairs
+        selected_negative_pairs = balanced.selected_negative_pairs
+    else:
+        selected_similarities = similarities
+        selected_targets = targets
+        candidate_positive_pairs = int((targets > 0.5).sum().item())
+        candidate_negative_pairs = int((targets <= 0.5).sum().item())
+        selected_positive_pairs = candidate_positive_pairs
+        selected_negative_pairs = candidate_negative_pairs
     margin_loss = (
         embedding_margin_loss(
             selected_similarities,
@@ -315,25 +342,29 @@ def metric_embedding_loss(
         consistency_loss = embedding.sum() * 0.0
     else:
         consistency_loss = F.relu(positive_consistency_margin - positive_similarities).pow(2).mean()
-    supcon_loss = supervised_contrastive_embedding_loss(
-        embedding,
-        presence,
-        segment_ids,
-        roots,
-        temperature=temperature,
+    supcon_loss = (
+        embedding.sum() * 0.0
+        if explicit_pairs is not None
+        else supervised_contrastive_embedding_loss(
+            embedding,
+            presence,
+            segment_ids,
+            roots,
+            temperature=temperature,
+        )
     )
     embedding_loss = margin_loss + positive_consistency_beta * consistency_loss + embedding_supcon_weight * supcon_loss
     return (
         embedding_loss,
-        int(balanced.indices.numel()),
+        int(selected_similarities.numel()),
         selection.local_positive_pairs,
         selection.local_negative_pairs,
         selection.ocr_negative_pairs,
         selection.skipped_pairs,
-        balanced.candidate_positive_pairs,
-        balanced.candidate_negative_pairs,
-        balanced.selected_positive_pairs,
-        balanced.selected_negative_pairs,
+        candidate_positive_pairs,
+        candidate_negative_pairs,
+        selected_positive_pairs,
+        selected_negative_pairs,
         margin_loss,
         consistency_loss,
         supcon_loss,
@@ -366,6 +397,7 @@ def roi_presence_embedding_loss(
     embedding_tail_hard_negative_weight: float = 2.0,
     presence_loss_enabled: bool = True,
     embedding_loss_enabled: bool = True,
+    explicit_embedding_pairs: Sequence[EmbeddingPair] | None = None,
 ) -> RoiLossBreakdown:
     presence_loss = (
         F.binary_cross_entropy_with_logits(presence_logit, presence, weight=presence_loss_weights)
@@ -407,6 +439,7 @@ def roi_presence_embedding_loss(
             embedding_tail_gamma_positive=embedding_tail_gamma_positive,
             embedding_tail_gamma_negative=embedding_tail_gamma_negative,
             embedding_tail_hard_negative_weight=embedding_tail_hard_negative_weight,
+            explicit_pairs=explicit_embedding_pairs,
         )
     else:
         embedding_loss = embedding.sum() * 0.0

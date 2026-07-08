@@ -20,7 +20,14 @@ from .roi_dataset import RoiPresenceEmbeddingDataset, collate_roi_batch
 from .roi_loss import EmbeddingPairMemory, roi_presence_embedding_loss
 from .roi_metrics import embedding_metrics, presence_metrics, similarity_percentile
 from .roi_model import RoiPresenceEmbeddingModel
-from .roi_pairs import normalize_ocr_text, select_embedding_pairs
+from .roi_pairs import (
+    EmbeddingPair,
+    ScheduledEmbeddingBatch,
+    build_embedding_pair_epoch_schedule,
+    build_embedding_pair_pools,
+    normalize_ocr_text,
+    select_embedding_pairs,
+)
 from .roi_sampler import RoiBalancedBatchSampler
 from .train import choose_device
 
@@ -58,6 +65,9 @@ class RoiTrainBatchResult:
     embedding_selected_positive_pairs: int
     embedding_selected_negative_pairs: int
     embedding_memory_pairs: int
+    embedding_positive_pair_ids: tuple[str, ...]
+    embedding_negative_pair_ids: tuple[str, ...]
+    embedding_positive_roi_ids: tuple[str, ...]
 
 
 def training_phases(settings: RoiTrainSettings) -> list[RoiTrainingPhase]:
@@ -891,6 +901,13 @@ def make_training_loader(
     )
 
 
+def load_scheduled_embedding_batch(
+    dataset: RoiPresenceEmbeddingDataset,
+    schedule_batch: ScheduledEmbeddingBatch,
+) -> Any:
+    return collate_roi_batch([dataset[index] for index in schedule_batch.sample_indices])
+
+
 def compute_train_batch_result(
     *,
     model: RoiPresenceEmbeddingModel,
@@ -900,6 +917,7 @@ def compute_train_batch_result(
     mode: str,
     embedding_negative_ratio: float,
     embedding_pair_memory: EmbeddingPairMemory | None,
+    explicit_embedding_pairs: tuple[EmbeddingPair, ...] | None = None,
 ) -> RoiTrainBatchResult:
     if mode not in {"presence", "embedding"}:
         raise ValueError(f"unsupported ROI train batch mode: {mode}")
@@ -956,6 +974,7 @@ def compute_train_batch_result(
         embedding_tail_hard_negative_weight=settings.embedding_tail_hard_negative_weight,
         presence_loss_enabled=mode == "presence",
         embedding_loss_enabled=mode == "embedding",
+        explicit_embedding_pairs=explicit_embedding_pairs,
     )
     if embedding_pair_memory is None:
         memory_loss = embedding.sum() * 0.0
@@ -977,6 +996,30 @@ def compute_train_batch_result(
     sample_count = len(batch.sample_ids)
     presence_positive_samples = positive_samples if mode == "presence" else 0
     presence_negative_samples = sample_count - positive_samples if mode == "presence" else 0
+    positive_pair_ids = (
+        tuple(pair.pair_id for pair in explicit_embedding_pairs if pair.same)
+        if explicit_embedding_pairs is not None
+        else ()
+    )
+    negative_pair_ids = (
+        tuple(pair.pair_id for pair in explicit_embedding_pairs if not pair.same)
+        if explicit_embedding_pairs is not None
+        else ()
+    )
+    positive_roi_ids = (
+        tuple(
+            sorted(
+                {
+                    f"{batch.roots[index]}::{batch.sample_ids[index]}"
+                    for pair in explicit_embedding_pairs
+                    if pair.same
+                    for index in (pair.i, pair.j)
+                }
+            )
+        )
+        if explicit_embedding_pairs is not None
+        else ()
+    )
     return RoiTrainBatchResult(
         total_loss=total_loss,
         presence_loss=loss.presence_loss,
@@ -999,6 +1042,9 @@ def compute_train_batch_result(
         embedding_selected_positive_pairs=loss.embedding_selected_positive_pairs,
         embedding_selected_negative_pairs=loss.embedding_selected_negative_pairs,
         embedding_memory_pairs=memory_pairs,
+        embedding_positive_pair_ids=positive_pair_ids,
+        embedding_negative_pair_ids=negative_pair_ids,
+        embedding_positive_roi_ids=positive_roi_ids,
     )
 
 
@@ -1036,24 +1082,10 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
         num_workers=settings.num_workers,
         seed=settings.seed,
     )
-    embedding_loader, embedding_batch_sampler = make_training_loader(
-        train_dataset,
-        batch_size=settings.embedding_batch_size,
-        negative_ratio=0.0,
-        num_workers=settings.num_workers,
-        seed=settings.seed,
-    )
     joint_presence_loader, joint_presence_batch_sampler = make_training_loader(
         train_dataset,
         batch_size=joint_presence_batch_size,
         negative_ratio=joint_presence_negative_ratio,
-        num_workers=settings.num_workers,
-        seed=settings.seed,
-    )
-    joint_embedding_loader, joint_embedding_batch_sampler = make_training_loader(
-        train_dataset,
-        batch_size=joint_embedding_batch_size,
-        negative_ratio=0.0,
         num_workers=settings.num_workers,
         seed=settings.seed,
     )
@@ -1148,6 +1180,37 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                 f"the training dataset contains only one presence class; realized_ratio={realized_ratio}",
                 flush=True,
             )
+    embedding_pair_pools = None
+    if any(phase.name != "presence" for phase in phases):
+        embedding_pool_negative_ratio = max(
+            [
+                settings.embedding_negative_ratio
+                for phase in phases
+                if phase.name == "embedding"
+            ]
+            + [
+                joint_embedding_negative_ratio
+                for phase in phases
+                if phase.name == "joint"
+            ],
+            default=0.0,
+        )
+        pool_start = time.perf_counter()
+        embedding_pair_pools = build_embedding_pair_pools(
+            train_dataset.samples,
+            ocr_negative_enabled=settings.embedding_ocr_negative_enabled,
+            ocr_negative_max_similarity=settings.embedding_ocr_negative_max_similarity,
+            skip_ocr_if_local_negative_ratio_satisfied=embedding_pool_negative_ratio,
+        )
+        print(
+            "embedding_pair_pools "
+            f"positive={len(embedding_pair_pools.positive_pairs)} "
+            f"local_negative={len(embedding_pair_pools.local_negative_pairs)} "
+            f"ocr_negative={len(embedding_pair_pools.ocr_negative_pairs)} "
+            f"positive_roi={embedding_pair_pools.total_positive_roi_count} "
+            f"build_seconds={time.perf_counter() - pool_start:.3f}",
+            flush=True,
+        )
     metrics_mode = "a" if settings.resume is not None else "w"
     with metrics_path.open(metrics_mode, encoding="utf-8") as metrics_file:
         for epoch in range(start_epoch, total_epochs + 1):
@@ -1182,12 +1245,25 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
             assert optimizer is not None
             for sampler in (
                 presence_batch_sampler,
-                embedding_batch_sampler,
                 joint_presence_batch_sampler,
-                joint_embedding_batch_sampler,
             ):
                 if sampler is not None:
                     sampler.set_epoch(epoch)
+            if phase.name == "presence":
+                embedding_schedule = None
+            else:
+                assert embedding_pair_pools is not None
+                embedding_schedule = build_embedding_pair_epoch_schedule(
+                    train_dataset.samples,
+                    batch_size=settings.embedding_batch_size if phase.name == "embedding" else joint_embedding_batch_size,
+                    negative_ratio=settings.embedding_negative_ratio if phase.name == "embedding" else joint_embedding_negative_ratio,
+                    ocr_negative_enabled=settings.embedding_ocr_negative_enabled,
+                    ocr_negative_max_similarity=settings.embedding_ocr_negative_max_similarity,
+                    ocr_negative_ratio=settings.embedding_ocr_negative_ratio,
+                    seed=settings.seed,
+                    epoch=epoch,
+                    pair_pools=embedding_pair_pools,
+                )
             embedding_pair_memory = (
                 None
                 if phase.name == "presence"
@@ -1215,6 +1291,11 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
             train_embedding_candidate_negative_pairs = 0
             train_embedding_positive_pairs = 0
             train_embedding_negative_pairs = 0
+            train_embedding_positive_pair_count = 0
+            train_embedding_negative_pair_count = 0
+            train_embedding_unique_positive_pair_ids: set[str] = set()
+            train_embedding_unique_negative_pair_ids: set[str] = set()
+            train_embedding_unique_positive_roi_ids: set[str] = set()
             train_embedding_batches_without_positive_pairs = 0
             batches = 0
             epoch_start = time.perf_counter()
@@ -1223,13 +1304,14 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                 phase_iterator = iter(phase_loader)
                 total_batches = len(phase_loader)
             elif phase.name == "embedding":
-                phase_loader = embedding_loader
-                phase_iterator = iter(phase_loader)
-                total_batches = len(phase_loader)
+                assert embedding_schedule is not None
+                phase_embedding_batches = iter(embedding_schedule.batches)
+                total_batches = len(embedding_schedule.batches)
             else:
                 joint_presence_iterator = iter(joint_presence_loader)
-                joint_embedding_iterator = iter(joint_embedding_loader)
-                total_batches = max(len(joint_presence_loader), len(joint_embedding_loader))
+                assert embedding_schedule is not None
+                joint_embedding_batches = iter(embedding_schedule.batches)
+                total_batches = max(len(joint_presence_loader), len(embedding_schedule.batches))
             progress = tqdm(range(1, total_batches + 1), desc=f"roi epoch {epoch}/{total_epochs} {phase.name}", leave=False)
             for batch_index in progress:
                 batch_start = time.perf_counter()
@@ -1240,11 +1322,6 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                     except StopIteration:
                         joint_presence_iterator = iter(joint_presence_loader)
                         presence_batch = next(joint_presence_iterator)
-                    try:
-                        embedding_batch = next(joint_embedding_iterator)
-                    except StopIteration:
-                        joint_embedding_iterator = iter(joint_embedding_loader)
-                        embedding_batch = next(joint_embedding_iterator)
                     batch_results = [
                         compute_train_batch_result(
                             model=model,
@@ -1255,18 +1332,33 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                             embedding_negative_ratio=0.0,
                             embedding_pair_memory=None,
                         ),
-                        compute_train_batch_result(
-                            model=model,
-                            batch=embedding_batch,
-                            device=device,
-                            settings=settings,
-                            mode="embedding",
-                            embedding_negative_ratio=joint_embedding_negative_ratio,
-                            embedding_pair_memory=embedding_pair_memory,
-                        ),
                     ]
+                    try:
+                        schedule_batch = next(joint_embedding_batches)
+                    except StopIteration:
+                        schedule_batch = None
+                    if schedule_batch is not None:
+                        embedding_batch = load_scheduled_embedding_batch(train_dataset, schedule_batch)
+                        batch_results.append(
+                            compute_train_batch_result(
+                                model=model,
+                                batch=embedding_batch,
+                                device=device,
+                                settings=settings,
+                                mode="embedding",
+                                embedding_negative_ratio=joint_embedding_negative_ratio,
+                                embedding_pair_memory=embedding_pair_memory,
+                                explicit_embedding_pairs=schedule_batch.pairs,
+                            )
+                        )
                 else:
-                    batch = next(phase_iterator)
+                    if phase.name == "embedding":
+                        schedule_batch = next(phase_embedding_batches)
+                        batch = load_scheduled_embedding_batch(train_dataset, schedule_batch)
+                        explicit_pairs = schedule_batch.pairs
+                    else:
+                        batch = next(phase_iterator)
+                        explicit_pairs = None
                     batch_results = [
                         compute_train_batch_result(
                             model=model,
@@ -1276,6 +1368,7 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                             mode=phase.name,
                             embedding_negative_ratio=settings.embedding_negative_ratio if phase.name == "embedding" else 0.0,
                             embedding_pair_memory=embedding_pair_memory,
+                            explicit_embedding_pairs=explicit_pairs,
                         )
                     ]
                 total_loss = batch_results[0].total_loss
@@ -1352,6 +1445,12 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                 train_embedding_candidate_negative_pairs += embedding_candidate_negative_pairs
                 train_embedding_positive_pairs += embedding_selected_positive_pairs
                 train_embedding_negative_pairs += embedding_selected_negative_pairs
+                for result in batch_results:
+                    train_embedding_positive_pair_count += len(result.embedding_positive_pair_ids)
+                    train_embedding_negative_pair_count += len(result.embedding_negative_pair_ids)
+                    train_embedding_unique_positive_pair_ids.update(result.embedding_positive_pair_ids)
+                    train_embedding_unique_negative_pair_ids.update(result.embedding_negative_pair_ids)
+                    train_embedding_unique_positive_roi_ids.update(result.embedding_positive_roi_ids)
                 train_embedding_batches_without_positive_pairs += int(embedding_selected_positive_pairs == 0)
                 batches += 1
                 global_step += 1
@@ -1384,6 +1483,12 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                     "embedding_candidate_negative_pairs": float(embedding_candidate_negative_pairs),
                     "embedding_positive_pairs": float(embedding_selected_positive_pairs),
                     "embedding_negative_pairs": float(embedding_selected_negative_pairs),
+                    "embedding_unique_positive_pairs": float(
+                        len({pair_id for result in batch_results for pair_id in result.embedding_positive_pair_ids})
+                    ),
+                    "embedding_unique_negative_pairs": float(
+                        len({pair_id for result in batch_results for pair_id in result.embedding_negative_pair_ids})
+                    ),
                     "embedding_negative_ratio": embedding_selected_negative_pairs
                     / max(1, embedding_selected_positive_pairs + embedding_selected_negative_pairs),
                     "samples_per_second": float(sample_count) / batch_time,
@@ -1426,6 +1531,22 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                     "train_embedding_candidate_negative_pairs": float(train_embedding_candidate_negative_pairs),
                     "train_embedding_positive_pairs": float(train_embedding_positive_pairs),
                     "train_embedding_negative_pairs": float(train_embedding_negative_pairs),
+                    "train_embedding_unique_positive_pairs": float(len(train_embedding_unique_positive_pair_ids)),
+                    "train_embedding_unique_negative_pairs": float(len(train_embedding_unique_negative_pair_ids)),
+                    "train_embedding_positive_pair_repeat_rate": (
+                        1.0 - len(train_embedding_unique_positive_pair_ids) / train_embedding_positive_pair_count
+                        if train_embedding_positive_pair_count
+                        else 0.0
+                    ),
+                    "train_embedding_negative_pair_repeat_rate": (
+                        1.0 - len(train_embedding_unique_negative_pair_ids) / train_embedding_negative_pair_count
+                        if train_embedding_negative_pair_count
+                        else 0.0
+                    ),
+                    "train_embedding_positive_roi_coverage": len(train_embedding_unique_positive_roi_ids)
+                    / max(1, train_dataset.summary.positive),
+                    "train_embedding_unique_positive_roi": float(len(train_embedding_unique_positive_roi_ids)),
+                    "train_embedding_total_positive_roi": float(train_dataset.summary.positive),
                     "train_embedding_negative_ratio": train_embedding_negative_pairs
                     / max(1, train_embedding_positive_pairs + train_embedding_negative_pairs),
                     "train_embedding_batches_without_positive_pairs": float(train_embedding_batches_without_positive_pairs),

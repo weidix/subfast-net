@@ -17,7 +17,7 @@ from src.roi_loss import (
     supervised_contrastive_embedding_loss,
 )
 from src.roi_metrics import embedding_metrics
-from src.roi_pairs import select_embedding_pairs
+from src.roi_pairs import build_embedding_pair_epoch_schedule, select_embedding_pairs
 from src.roi_model import LocalContrastEmbeddingHead, LocalContrastResidual, LocalTextnessPresenceHead, RoiPresenceEmbeddingModel
 from src.train_roi import (
     configure_training_phase,
@@ -110,6 +110,28 @@ def make_sampler_samples(
     return samples
 
 
+def make_scheduler_samples(*, segments: int = 3, per_segment: int = 4) -> list[RoiSample]:
+    samples: list[RoiSample] = []
+    for segment_index in range(segments):
+        for offset in range(per_segment):
+            sample_index = segment_index * per_segment + offset
+            samples.append(
+                RoiSample(
+                    image_path=Path(f"positive-{sample_index}.jpg"),
+                    label_path=Path(f"positive-{sample_index}.txt"),
+                    sample_id=f"positive-{sample_index}",
+                    root=Path("root"),
+                    has_subtitle=True,
+                    segment_id=f"segment-{segment_index}",
+                    video_id="video",
+                    frame_index=segment_index * 100 + offset,
+                    ocr_text=f"subtitle {segment_index}",
+                    annotation={},
+                )
+            )
+    return samples
+
+
 class RoiPresenceEmbeddingTests(unittest.TestCase):
     def test_balanced_batch_sampler_realizes_presence_ratio_and_covers_every_sample(self):
         samples = make_sampler_samples(positives=6, negatives=10)
@@ -141,6 +163,86 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
                     for right in positives[offset + 1 :]
                 )
             )
+
+    def test_embedding_pair_scheduler_does_not_repeat_positive_pairs_when_pool_is_sufficient(self):
+        schedule = build_embedding_pair_epoch_schedule(
+            make_scheduler_samples(),
+            batch_size=4,
+            negative_ratio=0.0,
+            ocr_negative_enabled=False,
+            ocr_negative_max_similarity=0.2,
+            ocr_negative_ratio=0.3,
+            seed=7,
+            epoch=1,
+        )
+
+        self.assertEqual(schedule.positive_pair_count, 12)
+        self.assertEqual(schedule.unique_positive_pair_count, schedule.positive_pair_count)
+        self.assertEqual(schedule.positive_pair_repeat_rate, 0.0)
+
+    def test_embedding_pair_scheduler_does_not_repeat_positive_pairs_when_pool_is_smaller_than_roi_count(self):
+        schedule = build_embedding_pair_epoch_schedule(
+            make_scheduler_samples(segments=3, per_segment=2),
+            batch_size=4,
+            negative_ratio=0.0,
+            ocr_negative_enabled=False,
+            ocr_negative_max_similarity=0.2,
+            ocr_negative_ratio=0.3,
+            seed=7,
+            epoch=1,
+        )
+
+        self.assertEqual(schedule.total_positive_roi_count, 6)
+        self.assertEqual(schedule.positive_pair_count, 3)
+        self.assertEqual(schedule.unique_positive_pair_count, schedule.positive_pair_count)
+        self.assertEqual(schedule.positive_pair_repeat_rate, 0.0)
+
+    def test_embedding_pair_scheduler_does_not_repeat_negative_pairs_when_pool_is_sufficient(self):
+        schedule = build_embedding_pair_epoch_schedule(
+            make_scheduler_samples(),
+            batch_size=4,
+            negative_ratio=0.5,
+            ocr_negative_enabled=False,
+            ocr_negative_max_similarity=0.2,
+            ocr_negative_ratio=0.3,
+            seed=11,
+            epoch=1,
+        )
+
+        self.assertEqual(schedule.negative_pair_count, 12)
+        self.assertEqual(schedule.unique_negative_pair_count, schedule.negative_pair_count)
+        self.assertEqual(schedule.negative_pair_repeat_rate, 0.0)
+
+    def test_embedding_pair_scheduler_prioritizes_positive_roi_coverage(self):
+        schedule = build_embedding_pair_epoch_schedule(
+            make_scheduler_samples(),
+            batch_size=4,
+            negative_ratio=0.0,
+            ocr_negative_enabled=False,
+            ocr_negative_max_similarity=0.2,
+            ocr_negative_ratio=0.3,
+            seed=13,
+            epoch=1,
+        )
+
+        self.assertEqual(schedule.unique_positive_roi_count, schedule.total_positive_roi_count)
+        self.assertEqual(schedule.unique_positive_roi_count, 12)
+
+    def test_embedding_pair_scheduler_respects_embedding_negative_ratio(self):
+        schedule = build_embedding_pair_epoch_schedule(
+            make_scheduler_samples(),
+            batch_size=4,
+            negative_ratio=0.5,
+            ocr_negative_enabled=False,
+            ocr_negative_max_similarity=0.2,
+            ocr_negative_ratio=0.3,
+            seed=17,
+            epoch=1,
+        )
+
+        actual_ratio = schedule.negative_pair_count / schedule.pair_count
+        self.assertAlmostEqual(actual_ratio, 0.5, places=6)
+        self.assertTrue(all(len(batch.sample_indices) <= 4 for batch in schedule.batches))
 
     def test_balance_embedding_pairs_keeps_all_positives_and_hardest_negatives(self):
         similarities = torch.tensor([0.8, 0.7, 0.9, 0.6, 0.2, -0.1])
@@ -885,6 +987,13 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
             self.assertIn("train_embedding_negative_ratio", metrics)
             self.assertIn("train_embedding_positive_pairs", metrics)
             self.assertIn("train_embedding_negative_pairs", metrics)
+            self.assertIn("train_embedding_unique_positive_pairs", metrics)
+            self.assertIn("train_embedding_unique_negative_pairs", metrics)
+            self.assertIn("train_embedding_positive_pair_repeat_rate", metrics)
+            self.assertIn("train_embedding_negative_pair_repeat_rate", metrics)
+            self.assertIn("train_embedding_positive_roi_coverage", metrics)
+            self.assertIn("train_embedding_unique_positive_roi", metrics)
+            self.assertIn("train_embedding_total_positive_roi", metrics)
             self.assertEqual(metrics["training_phase"], "joint")
             self.assertTrue((output / "best_presence.pt").exists())
             self.assertTrue((output / "best_embedding.pt").exists())
