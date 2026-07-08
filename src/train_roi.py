@@ -35,6 +35,31 @@ class RoiTrainingPhase:
     learning_rate: float
 
 
+@dataclass(frozen=True)
+class RoiTrainBatchResult:
+    total_loss: torch.Tensor
+    presence_loss: torch.Tensor
+    mask_loss: torch.Tensor
+    embedding_loss: torch.Tensor
+    embedding_margin_loss: torch.Tensor
+    memory_loss: torch.Tensor
+    positive_consistency_loss: torch.Tensor
+    supervised_contrastive_loss: torch.Tensor
+    embedding_pairs: int
+    embedding_local_positive_pairs: int
+    embedding_local_negative_pairs: int
+    embedding_ocr_negative_pairs: int
+    embedding_skipped_pairs: int
+    presence_positive_samples: int
+    presence_negative_samples: int
+    sample_count: int
+    embedding_candidate_positive_pairs: int
+    embedding_candidate_negative_pairs: int
+    embedding_selected_positive_pairs: int
+    embedding_selected_negative_pairs: int
+    embedding_memory_pairs: int
+
+
 def training_phases(settings: RoiTrainSettings) -> list[RoiTrainingPhase]:
     counts = (settings.presence_epochs, settings.embedding_epochs, settings.joint_epochs)
     phases: list[RoiTrainingPhase] = []
@@ -830,6 +855,153 @@ def short_positive_mask_loss(
     return F.binary_cross_entropy_with_logits(textness_map[short_positive], target[short_positive]) * weight
 
 
+def make_training_loader(
+    dataset: RoiPresenceEmbeddingDataset,
+    *,
+    batch_size: int,
+    negative_ratio: float | None,
+    num_workers: int,
+    seed: int,
+) -> tuple[DataLoader, RoiBalancedBatchSampler | None]:
+    if negative_ratio is None:
+        return (
+            DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=num_workers,
+                collate_fn=collate_roi_batch,
+            ),
+            None,
+        )
+    sampler = RoiBalancedBatchSampler(
+        dataset.samples,
+        batch_size=batch_size,
+        negative_ratio=negative_ratio,
+        seed=seed,
+    )
+    return (
+        DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=num_workers,
+            collate_fn=collate_roi_batch,
+        ),
+        sampler,
+    )
+
+
+def compute_train_batch_result(
+    *,
+    model: RoiPresenceEmbeddingModel,
+    batch: Any,
+    device: torch.device,
+    settings: RoiTrainSettings,
+    mode: str,
+    embedding_negative_ratio: float,
+    embedding_pair_memory: EmbeddingPairMemory | None,
+) -> RoiTrainBatchResult:
+    if mode not in {"presence", "embedding"}:
+        raise ValueError(f"unsupported ROI train batch mode: {mode}")
+    images = batch.images.to(device)
+    presence = batch.presence.to(device)
+    if mode == "embedding":
+        embedding = model.forward_embedding(images)
+        presence_logit = presence.new_zeros(presence.shape)
+        mask_loss = embedding.sum() * 0.0
+    elif settings.short_positive_mask_loss_weight > 0.0:
+        presence_logit, embedding, textness_map = model.forward_with_presence_map(images)
+        if batch.subtitle_masks is None:
+            raise RuntimeError("subtitle masks are required when short positive mask loss is enabled")
+        mask_loss = short_positive_mask_loss(
+            textness_map,
+            batch.subtitle_masks,
+            presence,
+            batch.ocr_texts,
+            settings.short_positive_mask_loss_weight,
+        )
+    else:
+        presence_logit, embedding = model(images)
+        mask_loss = presence_logit.sum() * 0.0
+    loss = roi_presence_embedding_loss(
+        presence_logit,
+        embedding,
+        presence,
+        batch.segment_ids,
+        presence_loss_weights=(
+            short_positive_presence_weights(
+                presence,
+                batch.ocr_texts,
+                settings.short_positive_loss_weight,
+            )
+            if mode == "presence"
+            else None
+        ),
+        roots=batch.roots,
+        video_ids=batch.video_ids,
+        ocr_texts=batch.ocr_texts,
+        embedding_loss_weight=settings.embedding_loss_weight,
+        embedding_loss_alpha=settings.embedding_loss_alpha,
+        adjacent_segment_ids=batch.adjacent_segment_ids,
+        embedding_ocr_negative_enabled=settings.embedding_ocr_negative_enabled,
+        embedding_ocr_negative_max_similarity=settings.embedding_ocr_negative_max_similarity,
+        embedding_ocr_negative_ratio=settings.embedding_ocr_negative_ratio,
+        embedding_positive_consistency_beta=settings.embedding_positive_consistency_beta,
+        embedding_positive_consistency_margin=settings.embedding_positive_consistency_margin,
+        embedding_temperature=settings.embedding_temperature,
+        embedding_negative_ratio=embedding_negative_ratio,
+        embedding_supcon_weight=settings.embedding_supcon_weight,
+        embedding_tail_gamma_positive=settings.embedding_tail_gamma_positive,
+        embedding_tail_gamma_negative=settings.embedding_tail_gamma_negative,
+        embedding_tail_hard_negative_weight=settings.embedding_tail_hard_negative_weight,
+        presence_loss_enabled=mode == "presence",
+        embedding_loss_enabled=mode == "embedding",
+    )
+    if embedding_pair_memory is None:
+        memory_loss = embedding.sum() * 0.0
+        memory_pairs = 0
+    else:
+        memory_loss, memory_pairs = embedding_pair_memory.loss_and_update(
+            embedding,
+            presence,
+            batch.segment_ids,
+            batch.roots,
+            batch.video_ids,
+            batch.ocr_texts,
+            batch.adjacent_segment_ids,
+        )
+    total_loss = loss.presence_loss + mask_loss
+    if mode == "embedding":
+        total_loss = settings.embedding_loss_weight * (loss.embedding_loss + memory_loss)
+    positive_samples = int((batch.presence > 0.5).sum())
+    sample_count = len(batch.sample_ids)
+    presence_positive_samples = positive_samples if mode == "presence" else 0
+    presence_negative_samples = sample_count - positive_samples if mode == "presence" else 0
+    return RoiTrainBatchResult(
+        total_loss=total_loss,
+        presence_loss=loss.presence_loss,
+        mask_loss=mask_loss,
+        embedding_loss=loss.embedding_loss,
+        embedding_margin_loss=loss.embedding_margin_loss,
+        memory_loss=memory_loss,
+        positive_consistency_loss=loss.positive_consistency_loss,
+        supervised_contrastive_loss=loss.supervised_contrastive_loss,
+        embedding_pairs=loss.embedding_pairs,
+        embedding_local_positive_pairs=loss.embedding_local_positive_pairs,
+        embedding_local_negative_pairs=loss.embedding_local_negative_pairs,
+        embedding_ocr_negative_pairs=loss.embedding_ocr_negative_pairs,
+        embedding_skipped_pairs=loss.embedding_skipped_pairs,
+        presence_positive_samples=presence_positive_samples,
+        presence_negative_samples=presence_negative_samples,
+        sample_count=sample_count,
+        embedding_candidate_positive_pairs=loss.embedding_candidate_positive_pairs,
+        embedding_candidate_negative_pairs=loss.embedding_candidate_negative_pairs,
+        embedding_selected_positive_pairs=loss.embedding_selected_positive_pairs,
+        embedding_selected_negative_pairs=loss.embedding_selected_negative_pairs,
+        embedding_memory_pairs=memory_pairs,
+    )
+
+
 def run_training(settings: RoiTrainSettings) -> dict[str, float]:
     seed_everything(settings.seed)
     device = choose_device(settings.device)
@@ -845,30 +1017,53 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
         raise RuntimeError("no ROI training samples found")
     if len(val_dataset) == 0:
         raise RuntimeError("no ROI validation samples found")
-    train_batch_sampler: RoiBalancedBatchSampler | None = None
-    if settings.negative_ratio is not None:
-        train_batch_sampler = RoiBalancedBatchSampler(
-            train_dataset.samples,
-            batch_size=settings.batch_size,
-            negative_ratio=settings.negative_ratio,
-            embedding_samples_per_segment=settings.embedding_samples_per_segment,
-            seed=settings.seed,
-        )
-        train_loader = DataLoader(
-            train_dataset,
-            batch_sampler=train_batch_sampler,
-            num_workers=settings.num_workers,
-            collate_fn=collate_roi_batch,
-        )
-    else:
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=settings.batch_size,
-            shuffle=True,
-            num_workers=settings.num_workers,
-            collate_fn=collate_roi_batch,
-        )
-    val_loader = DataLoader(val_dataset, batch_size=settings.batch_size, shuffle=False, num_workers=settings.num_workers, collate_fn=collate_roi_batch)
+    joint_presence_batch_size = settings.joint_presence_batch_size or settings.presence_batch_size
+    joint_embedding_batch_size = settings.joint_embedding_batch_size or settings.embedding_batch_size
+    joint_presence_negative_ratio = (
+        settings.presence_negative_ratio
+        if settings.joint_presence_negative_ratio is None
+        else settings.joint_presence_negative_ratio
+    )
+    joint_embedding_negative_ratio = (
+        settings.embedding_negative_ratio
+        if settings.joint_embedding_batch_negative_ratio is None
+        else settings.joint_embedding_batch_negative_ratio
+    )
+    presence_loader, presence_batch_sampler = make_training_loader(
+        train_dataset,
+        batch_size=settings.presence_batch_size,
+        negative_ratio=settings.presence_negative_ratio,
+        num_workers=settings.num_workers,
+        seed=settings.seed,
+    )
+    embedding_loader, embedding_batch_sampler = make_training_loader(
+        train_dataset,
+        batch_size=settings.embedding_batch_size,
+        negative_ratio=0.0,
+        num_workers=settings.num_workers,
+        seed=settings.seed,
+    )
+    joint_presence_loader, joint_presence_batch_sampler = make_training_loader(
+        train_dataset,
+        batch_size=joint_presence_batch_size,
+        negative_ratio=joint_presence_negative_ratio,
+        num_workers=settings.num_workers,
+        seed=settings.seed,
+    )
+    joint_embedding_loader, joint_embedding_batch_sampler = make_training_loader(
+        train_dataset,
+        batch_size=joint_embedding_batch_size,
+        negative_ratio=0.0,
+        num_workers=settings.num_workers,
+        seed=settings.seed,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=settings.presence_batch_size,
+        shuffle=False,
+        num_workers=settings.num_workers,
+        collate_fn=collate_roi_batch,
+    )
     model = make_model(settings).to(device)
     phases = training_phases(settings)
     total_epochs = phases[-1].end_epoch
@@ -909,7 +1104,11 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
             flush=True,
         )
     print(
-        f"config: batch_size={settings.batch_size} epochs={total_epochs} lr={settings.learning_rate:g} "
+        f"config: presence_batch_size={settings.presence_batch_size} "
+        f"embedding_batch_size={settings.embedding_batch_size} "
+        f"joint_presence_batch_size={joint_presence_batch_size} "
+        f"joint_embedding_batch_size={joint_embedding_batch_size} "
+        f"epochs={total_epochs} lr={settings.learning_rate:g} "
         f"joint_lr={settings.joint_learning_rate:g} "
         f"phase_epochs={','.join(f'{phase.name}:{phase.end_epoch - phase.start_epoch + 1}' for phase in phases)} "
         f"weight_decay={settings.weight_decay:g} embedding_dim={settings.embedding_dim} "
@@ -924,14 +1123,15 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
         f"embedding_ocr_negative_ratio={settings.embedding_ocr_negative_ratio:g} "
         f"embedding_positive_consistency_beta={settings.embedding_positive_consistency_beta:g} "
         f"embedding_positive_consistency_margin={settings.embedding_positive_consistency_margin:g} "
-        f"embedding_samples_per_segment={settings.embedding_samples_per_segment} "
         f"embedding_supcon_weight={settings.embedding_supcon_weight:g} "
         f"embedding_tail_gamma_positive={settings.embedding_tail_gamma_positive:g} "
         f"embedding_tail_gamma_negative={settings.embedding_tail_gamma_negative:g} "
         f"embedding_tail_hard_negative_weight={settings.embedding_tail_hard_negative_weight:g} "
         f"max_train_samples={settings.max_train_samples} max_val_samples={settings.max_val_samples} "
-        f"presence_negative_ratio={settings.negative_ratio} "
+        f"presence_negative_ratio={settings.presence_negative_ratio} "
         f"embedding_negative_ratio={settings.embedding_negative_ratio} "
+        f"joint_presence_negative_ratio={joint_presence_negative_ratio} "
+        f"joint_embedding_batch_negative_ratio={joint_embedding_negative_ratio} "
         f"val_negative_ratio={settings.val_negative_ratio}",
         flush=True,
     )
@@ -940,11 +1140,11 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
         print("warning: validation root overlaps a training root; this run is not held-out quality evidence", flush=True)
     print(format_dataset_summary("train", train_dataset), flush=True)
     print(format_dataset_summary("val", val_dataset), flush=True)
-    if settings.negative_ratio is not None and (train_dataset.summary.positive == 0 or train_dataset.summary.empty == 0):
+    if settings.presence_negative_ratio is not None and (train_dataset.summary.positive == 0 or train_dataset.summary.empty == 0):
         realized_ratio = 1.0 if train_dataset.summary.positive == 0 else 0.0
-        if settings.negative_ratio != realized_ratio:
+        if settings.presence_negative_ratio != realized_ratio:
             print(
-                f"warning: presence_negative_ratio={settings.negative_ratio} cannot be achieved because "
+                f"warning: presence_negative_ratio={settings.presence_negative_ratio} cannot be achieved because "
                 f"the training dataset contains only one presence class; realized_ratio={realized_ratio}",
                 flush=True,
             )
@@ -980,8 +1180,14 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                     flush=True,
                 )
             assert optimizer is not None
-            if train_batch_sampler is not None:
-                train_batch_sampler.set_epoch(epoch)
+            for sampler in (
+                presence_batch_sampler,
+                embedding_batch_sampler,
+                joint_presence_batch_sampler,
+                joint_embedding_batch_sampler,
+            ):
+                if sampler is not None:
+                    sampler.set_epoch(epoch)
             embedding_pair_memory = (
                 None
                 if phase.name == "presence"
@@ -1012,83 +1218,96 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
             train_embedding_batches_without_positive_pairs = 0
             batches = 0
             epoch_start = time.perf_counter()
-            progress = tqdm(train_loader, desc=f"roi epoch {epoch}/{total_epochs} {phase.name}", leave=False)
-            total_batches = len(train_loader)
-            for batch_index, batch in enumerate(progress, start=1):
+            if phase.name == "presence":
+                phase_loader = presence_loader
+                phase_iterator = iter(phase_loader)
+                total_batches = len(phase_loader)
+            elif phase.name == "embedding":
+                phase_loader = embedding_loader
+                phase_iterator = iter(phase_loader)
+                total_batches = len(phase_loader)
+            else:
+                joint_presence_iterator = iter(joint_presence_loader)
+                joint_embedding_iterator = iter(joint_embedding_loader)
+                total_batches = max(len(joint_presence_loader), len(joint_embedding_loader))
+            progress = tqdm(range(1, total_batches + 1), desc=f"roi epoch {epoch}/{total_epochs} {phase.name}", leave=False)
+            for batch_index in progress:
                 batch_start = time.perf_counter()
-                images = batch.images.to(device)
-                presence = batch.presence.to(device)
                 optimizer.zero_grad(set_to_none=True)
-                if phase.name == "embedding":
-                    embedding = model.forward_embedding(images)
-                    presence_logit = presence.new_zeros(presence.shape)
-                    mask_loss = embedding.sum() * 0.0
-                elif settings.short_positive_mask_loss_weight > 0.0:
-                    presence_logit, embedding, textness_map = model.forward_with_presence_map(images)
-                    if batch.subtitle_masks is None:
-                        raise RuntimeError("subtitle masks are required when short positive mask loss is enabled")
-                    mask_loss = short_positive_mask_loss(
-                        textness_map,
-                        batch.subtitle_masks,
-                        presence,
-                        batch.ocr_texts,
-                        settings.short_positive_mask_loss_weight,
-                    )
+                if phase.name == "joint":
+                    try:
+                        presence_batch = next(joint_presence_iterator)
+                    except StopIteration:
+                        joint_presence_iterator = iter(joint_presence_loader)
+                        presence_batch = next(joint_presence_iterator)
+                    try:
+                        embedding_batch = next(joint_embedding_iterator)
+                    except StopIteration:
+                        joint_embedding_iterator = iter(joint_embedding_loader)
+                        embedding_batch = next(joint_embedding_iterator)
+                    batch_results = [
+                        compute_train_batch_result(
+                            model=model,
+                            batch=presence_batch,
+                            device=device,
+                            settings=settings,
+                            mode="presence",
+                            embedding_negative_ratio=0.0,
+                            embedding_pair_memory=None,
+                        ),
+                        compute_train_batch_result(
+                            model=model,
+                            batch=embedding_batch,
+                            device=device,
+                            settings=settings,
+                            mode="embedding",
+                            embedding_negative_ratio=joint_embedding_negative_ratio,
+                            embedding_pair_memory=embedding_pair_memory,
+                        ),
+                    ]
                 else:
-                    presence_logit, embedding = model(images)
-                    mask_loss = presence_logit.sum() * 0.0
-                loss = roi_presence_embedding_loss(
-                    presence_logit,
-                    embedding,
-                    presence,
-                    batch.segment_ids,
-                    presence_loss_weights=(
-                        short_positive_presence_weights(
-                            presence,
-                            batch.ocr_texts,
-                            settings.short_positive_loss_weight,
+                    batch = next(phase_iterator)
+                    batch_results = [
+                        compute_train_batch_result(
+                            model=model,
+                            batch=batch,
+                            device=device,
+                            settings=settings,
+                            mode=phase.name,
+                            embedding_negative_ratio=settings.embedding_negative_ratio if phase.name == "embedding" else 0.0,
+                            embedding_pair_memory=embedding_pair_memory,
                         )
-                        if phase.name != "embedding"
-                        else None
-                    ),
-                    roots=batch.roots,
-                    video_ids=batch.video_ids,
-                    ocr_texts=batch.ocr_texts,
-                    embedding_loss_weight=settings.embedding_loss_weight,
-                    embedding_loss_alpha=settings.embedding_loss_alpha,
-                    adjacent_segment_ids=batch.adjacent_segment_ids,
-                    embedding_ocr_negative_enabled=settings.embedding_ocr_negative_enabled,
-                    embedding_ocr_negative_max_similarity=settings.embedding_ocr_negative_max_similarity,
-                    embedding_ocr_negative_ratio=settings.embedding_ocr_negative_ratio,
-                    embedding_positive_consistency_beta=settings.embedding_positive_consistency_beta,
-                    embedding_positive_consistency_margin=settings.embedding_positive_consistency_margin,
-                    embedding_temperature=settings.embedding_temperature,
-                    embedding_negative_ratio=settings.embedding_negative_ratio,
-                    embedding_supcon_weight=settings.embedding_supcon_weight,
-                    embedding_tail_gamma_positive=settings.embedding_tail_gamma_positive,
-                    embedding_tail_gamma_negative=settings.embedding_tail_gamma_negative,
-                    embedding_tail_hard_negative_weight=settings.embedding_tail_hard_negative_weight,
-                    presence_loss_enabled=phase.name != "embedding",
-                )
-                if embedding_pair_memory is None:
-                    memory_loss = embedding.sum() * 0.0
-                    memory_pairs = 0
-                else:
-                    memory_loss, memory_pairs = embedding_pair_memory.loss_and_update(
-                        embedding,
-                        presence,
-                        batch.segment_ids,
-                        batch.roots,
-                        batch.video_ids,
-                        batch.ocr_texts,
-                        batch.adjacent_segment_ids,
-                    )
-                if phase.name == "presence":
-                    total_loss = loss.presence_loss + mask_loss
-                elif phase.name == "embedding":
-                    total_loss = settings.embedding_loss_weight * (loss.embedding_loss + memory_loss)
-                else:
-                    total_loss = loss.total + mask_loss + settings.embedding_loss_weight * memory_loss
+                    ]
+                total_loss = batch_results[0].total_loss
+                presence_loss_tensor = batch_results[0].presence_loss
+                mask_loss_tensor = batch_results[0].mask_loss
+                embedding_loss_tensor = batch_results[0].embedding_loss
+                embedding_margin_loss_tensor = batch_results[0].embedding_margin_loss
+                memory_loss_tensor = batch_results[0].memory_loss
+                positive_consistency_loss_tensor = batch_results[0].positive_consistency_loss
+                supervised_contrastive_loss_tensor = batch_results[0].supervised_contrastive_loss
+                for result in batch_results[1:]:
+                    total_loss = total_loss + result.total_loss
+                    presence_loss_tensor = presence_loss_tensor + result.presence_loss
+                    mask_loss_tensor = mask_loss_tensor + result.mask_loss
+                    embedding_loss_tensor = embedding_loss_tensor + result.embedding_loss
+                    embedding_margin_loss_tensor = embedding_margin_loss_tensor + result.embedding_margin_loss
+                    memory_loss_tensor = memory_loss_tensor + result.memory_loss
+                    positive_consistency_loss_tensor = positive_consistency_loss_tensor + result.positive_consistency_loss
+                    supervised_contrastive_loss_tensor = supervised_contrastive_loss_tensor + result.supervised_contrastive_loss
+                embedding_pairs = sum(result.embedding_pairs for result in batch_results)
+                embedding_local_positive_pairs = sum(result.embedding_local_positive_pairs for result in batch_results)
+                embedding_local_negative_pairs = sum(result.embedding_local_negative_pairs for result in batch_results)
+                embedding_ocr_negative_pairs = sum(result.embedding_ocr_negative_pairs for result in batch_results)
+                embedding_skipped_pairs = sum(result.embedding_skipped_pairs for result in batch_results)
+                positive_samples = sum(result.presence_positive_samples for result in batch_results)
+                negative_samples = sum(result.presence_negative_samples for result in batch_results)
+                sample_count = sum(result.sample_count for result in batch_results)
+                embedding_candidate_positive_pairs = sum(result.embedding_candidate_positive_pairs for result in batch_results)
+                embedding_candidate_negative_pairs = sum(result.embedding_candidate_negative_pairs for result in batch_results)
+                embedding_selected_positive_pairs = sum(result.embedding_selected_positive_pairs for result in batch_results)
+                embedding_selected_negative_pairs = sum(result.embedding_selected_negative_pairs for result in batch_results)
+                memory_pairs = sum(result.embedding_memory_pairs for result in batch_results)
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(
                     [parameter for parameter in model.parameters() if parameter.requires_grad],
@@ -1107,13 +1326,13 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                 ) = torch.stack(
                     (
                         total_loss,
-                        loss.presence_loss,
-                        mask_loss,
-                        loss.embedding_loss,
-                        loss.embedding_margin_loss,
-                        memory_loss,
-                        loss.positive_consistency_loss,
-                        loss.supervised_contrastive_loss,
+                        presence_loss_tensor,
+                        mask_loss_tensor,
+                        embedding_loss_tensor,
+                        embedding_margin_loss_tensor,
+                        memory_loss_tensor,
+                        positive_consistency_loss_tensor,
+                        supervised_contrastive_loss_tensor,
                     )
                 ).detach().cpu().tolist()
                 train_loss += total_loss_value
@@ -1122,20 +1341,18 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                 train_embedding_loss += embedding_loss_value
                 train_embedding_memory_loss += memory_loss_value
                 train_embedding_memory_pairs += memory_pairs
-                train_embedding_pairs += loss.embedding_pairs
-                train_embedding_local_positive_pairs += loss.embedding_local_positive_pairs
-                train_embedding_local_negative_pairs += loss.embedding_local_negative_pairs
-                train_embedding_ocr_negative_pairs += loss.embedding_ocr_negative_pairs
-                train_embedding_skipped_pairs += loss.embedding_skipped_pairs
-                positive_samples = int((batch.presence > 0.5).sum())
-                negative_samples = len(batch.sample_ids) - positive_samples
+                train_embedding_pairs += embedding_pairs
+                train_embedding_local_positive_pairs += embedding_local_positive_pairs
+                train_embedding_local_negative_pairs += embedding_local_negative_pairs
+                train_embedding_ocr_negative_pairs += embedding_ocr_negative_pairs
+                train_embedding_skipped_pairs += embedding_skipped_pairs
                 train_presence_positive_samples += positive_samples
                 train_presence_negative_samples += negative_samples
-                train_embedding_candidate_positive_pairs += loss.embedding_candidate_positive_pairs
-                train_embedding_candidate_negative_pairs += loss.embedding_candidate_negative_pairs
-                train_embedding_positive_pairs += loss.embedding_selected_positive_pairs
-                train_embedding_negative_pairs += loss.embedding_selected_negative_pairs
-                train_embedding_batches_without_positive_pairs += int(loss.embedding_selected_positive_pairs == 0)
+                train_embedding_candidate_positive_pairs += embedding_candidate_positive_pairs
+                train_embedding_candidate_negative_pairs += embedding_candidate_negative_pairs
+                train_embedding_positive_pairs += embedding_selected_positive_pairs
+                train_embedding_negative_pairs += embedding_selected_negative_pairs
+                train_embedding_batches_without_positive_pairs += int(embedding_selected_positive_pairs == 0)
                 batches += 1
                 global_step += 1
                 batch_time = max(time.perf_counter() - batch_start, 1e-9)
@@ -1155,21 +1372,21 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                     "embedding_memory_pairs": float(memory_pairs),
                     "positive_consistency_loss": positive_consistency_loss_value,
                     "supervised_contrastive_loss": supervised_contrastive_loss_value,
-                    "embedding_pairs": float(loss.embedding_pairs),
-                    "embedding_local_positive_pairs": float(loss.embedding_local_positive_pairs),
-                    "embedding_local_negative_pairs": float(loss.embedding_local_negative_pairs),
-                    "embedding_ocr_negative_pairs": float(loss.embedding_ocr_negative_pairs),
-                    "embedding_skipped_pairs": float(loss.embedding_skipped_pairs),
+                    "embedding_pairs": float(embedding_pairs),
+                    "embedding_local_positive_pairs": float(embedding_local_positive_pairs),
+                    "embedding_local_negative_pairs": float(embedding_local_negative_pairs),
+                    "embedding_ocr_negative_pairs": float(embedding_ocr_negative_pairs),
+                    "embedding_skipped_pairs": float(embedding_skipped_pairs),
                     "presence_positive_samples": float(positive_samples),
                     "presence_negative_samples": float(negative_samples),
-                    "presence_negative_ratio": negative_samples / max(1, len(batch.sample_ids)),
-                    "embedding_candidate_positive_pairs": float(loss.embedding_candidate_positive_pairs),
-                    "embedding_candidate_negative_pairs": float(loss.embedding_candidate_negative_pairs),
-                    "embedding_positive_pairs": float(loss.embedding_selected_positive_pairs),
-                    "embedding_negative_pairs": float(loss.embedding_selected_negative_pairs),
-                    "embedding_negative_ratio": loss.embedding_selected_negative_pairs
-                    / max(1, loss.embedding_selected_positive_pairs + loss.embedding_selected_negative_pairs),
-                    "samples_per_second": float(len(batch.sample_ids)) / batch_time,
+                    "presence_negative_ratio": negative_samples / max(1, sample_count),
+                    "embedding_candidate_positive_pairs": float(embedding_candidate_positive_pairs),
+                    "embedding_candidate_negative_pairs": float(embedding_candidate_negative_pairs),
+                    "embedding_positive_pairs": float(embedding_selected_positive_pairs),
+                    "embedding_negative_pairs": float(embedding_selected_negative_pairs),
+                    "embedding_negative_ratio": embedding_selected_negative_pairs
+                    / max(1, embedding_selected_positive_pairs + embedding_selected_negative_pairs),
+                    "samples_per_second": float(sample_count) / batch_time,
                     "batch_time": batch_time,
                 }
                 progress.set_postfix(loss=f"{step_metrics['total_loss']:.4f}")
@@ -1280,7 +1497,10 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
     parser.add_argument("--output-dir", type=Path, default=RoiTrainSettings().output_dir)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--resize-roi", type=parse_roi_size)
-    parser.add_argument("--batch-size", type=int, default=RoiTrainSettings().batch_size)
+    parser.add_argument("--presence-batch-size", type=int, default=RoiTrainSettings().presence_batch_size)
+    parser.add_argument("--embedding-batch-size", type=int, default=RoiTrainSettings().embedding_batch_size)
+    parser.add_argument("--joint-presence-batch-size", type=int)
+    parser.add_argument("--joint-embedding-batch-size", type=int)
     parser.add_argument("--presence-epochs", type=int, default=RoiTrainSettings().presence_epochs)
     parser.add_argument("--embedding-epochs", type=int, default=RoiTrainSettings().embedding_epochs)
     parser.add_argument("--joint-epochs", type=int, default=RoiTrainSettings().joint_epochs)
@@ -1289,8 +1509,8 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
     parser.add_argument("--max-samples", type=int, help="Maximum ROI training sample count.")
     parser.add_argument("--max-train-samples", type=int)
     parser.add_argument("--max-val-samples", type=int)
-    parser.add_argument("--positive-ratio", type=float, help="Target subtitle-present fraction in each training batch.")
-    parser.add_argument("--negative-ratio", type=float, help="Target no-subtitle fraction in each training batch.")
+    parser.add_argument("--presence-positive-ratio", type=float, help="Target subtitle-present fraction in each presence training batch.")
+    parser.add_argument("--presence-negative-ratio", type=float, help="Target no-subtitle fraction in each presence training batch.")
     parser.add_argument("--val-positive-ratio", type=float, help="Target subtitle-present ROI validation sample ratio in [0, 1].")
     parser.add_argument("--val-negative-ratio", type=float, help="Target no-subtitle ROI validation sample ratio in [0, 1].")
     parser.add_argument("--short-positive-loss-weight", type=float, default=RoiTrainSettings().short_positive_loss_weight)
@@ -1301,9 +1521,18 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
         "--embedding-negative-ratio",
         type=float,
         default=RoiTrainSettings().embedding_negative_ratio,
-        help="Target different-segment fraction among selected in-batch embedding pairs.",
+        help="Target different-segment fraction among selected embedding-stage in-batch embedding pairs.",
     )
-    parser.add_argument("--embedding-samples-per-segment", type=int, default=RoiTrainSettings().embedding_samples_per_segment)
+    parser.add_argument(
+        "--joint-presence-negative-ratio",
+        type=float,
+        help="Target no-subtitle fraction in each joint-stage presence batch.",
+    )
+    parser.add_argument(
+        "--joint-embedding-batch-negative-ratio",
+        type=float,
+        help="Target different-segment fraction among selected joint-stage embedding-batch pairs.",
+    )
     parser.add_argument(
         "--embedding-ocr-negative-enabled",
         action=argparse.BooleanOptionalAction,
@@ -1348,12 +1577,12 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
             return negative_ratio
         return default
 
-    empty_ratio = resolve_empty_ratio(
-        positive_ratio=args.positive_ratio,
-        negative_ratio=args.negative_ratio,
-        default=RoiTrainSettings().negative_ratio,
-        positive_name="--positive-ratio",
-        negative_name="--negative-ratio",
+    presence_empty_ratio = resolve_empty_ratio(
+        positive_ratio=args.presence_positive_ratio,
+        negative_ratio=args.presence_negative_ratio,
+        default=RoiTrainSettings().presence_negative_ratio,
+        positive_name="--presence-positive-ratio",
+        negative_name="--presence-negative-ratio",
     )
     val_empty_ratio = resolve_empty_ratio(
         positive_ratio=args.val_positive_ratio,
@@ -1367,12 +1596,22 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
         parser.error("phase epoch counts must be non-negative")
     if not any(value > 0 for value in phase_epoch_values):
         parser.error("at least one phase epoch count must be positive")
+    for name, value in (
+        ("--presence-batch-size", args.presence_batch_size),
+        ("--embedding-batch-size", args.embedding_batch_size),
+        ("--joint-presence-batch-size", args.joint_presence_batch_size),
+        ("--joint-embedding-batch-size", args.joint_embedding_batch_size),
+    ):
+        if value is not None and value <= 0:
+            parser.error(f"{name} must be positive")
     if args.joint_lr <= 0.0:
         parser.error("--joint-lr must be positive")
     if not 0.0 <= args.embedding_negative_ratio <= 1.0:
         parser.error("--embedding-negative-ratio must be in [0, 1]")
-    if args.embedding_samples_per_segment < 1:
-        parser.error("--embedding-samples-per-segment must be positive")
+    if args.joint_presence_negative_ratio is not None and not 0.0 <= args.joint_presence_negative_ratio <= 1.0:
+        parser.error("--joint-presence-negative-ratio must be in [0, 1]")
+    if args.joint_embedding_batch_negative_ratio is not None and not 0.0 <= args.joint_embedding_batch_negative_ratio <= 1.0:
+        parser.error("--joint-embedding-batch-negative-ratio must be in [0, 1]")
     if args.embedding_tail_gamma_positive <= 0.0:
         parser.error("--embedding-tail-gamma-positive must be positive")
     if args.embedding_tail_gamma_negative <= 0.0:
@@ -1398,7 +1637,10 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
         output_dir=args.output_dir,
         resume=args.resume,
         resize_roi=args.resize_roi,
-        batch_size=args.batch_size,
+        presence_batch_size=args.presence_batch_size,
+        embedding_batch_size=args.embedding_batch_size,
+        joint_presence_batch_size=args.joint_presence_batch_size,
+        joint_embedding_batch_size=args.joint_embedding_batch_size,
         presence_epochs=args.presence_epochs,
         embedding_epochs=args.embedding_epochs,
         joint_epochs=args.joint_epochs,
@@ -1406,14 +1648,15 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
         joint_learning_rate=args.joint_lr,
         max_train_samples=max_train_samples,
         max_val_samples=args.max_val_samples,
-        negative_ratio=empty_ratio,
+        presence_negative_ratio=presence_empty_ratio,
         val_negative_ratio=val_empty_ratio,
         short_positive_loss_weight=args.short_positive_loss_weight,
         short_positive_mask_loss_weight=args.short_positive_mask_loss_weight,
         embedding_loss_weight=args.embedding_loss_weight,
         embedding_loss_alpha=args.embedding_loss_alpha,
         embedding_negative_ratio=args.embedding_negative_ratio,
-        embedding_samples_per_segment=args.embedding_samples_per_segment,
+        joint_presence_negative_ratio=args.joint_presence_negative_ratio,
+        joint_embedding_batch_negative_ratio=args.joint_embedding_batch_negative_ratio,
         embedding_ocr_negative_enabled=args.embedding_ocr_negative_enabled,
         embedding_ocr_negative_max_similarity=args.embedding_ocr_negative_max_similarity,
         embedding_ocr_negative_ratio=args.embedding_ocr_negative_ratio,
@@ -1445,7 +1688,7 @@ def parse_validate_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--root", type=Path, required=True, help="ROI dataset root to validate.")
     parser.add_argument("--resize-roi", type=parse_roi_size)
-    parser.add_argument("--batch-size", type=int, default=RoiTrainSettings().batch_size)
+    parser.add_argument("--batch-size", type=int, default=RoiTrainSettings().presence_batch_size)
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--embedding-loss-weight", type=float, default=RoiTrainSettings().embedding_loss_weight)
     parser.add_argument("--embedding-loss-alpha", type=float)
@@ -1475,7 +1718,7 @@ def run_validation(args: argparse.Namespace) -> dict[str, float]:
         train_roots=[args.root],
         val_root=args.root,
         resize_roi=args.resize_roi or checkpoint_resize,
-        batch_size=args.batch_size,
+        presence_batch_size=args.batch_size,
         max_val_samples=args.max_samples,
         embedding_loss_weight=args.embedding_loss_weight,
         embedding_loss_alpha=float(raw_settings.get("embedding_loss_alpha", RoiTrainSettings().embedding_loss_alpha) if args.embedding_loss_alpha is None else args.embedding_loss_alpha),
@@ -1506,7 +1749,6 @@ def run_validation(args: argparse.Namespace) -> dict[str, float]:
         ),
         embedding_temperature=args.embedding_temperature,
         embedding_negative_ratio=float(raw_settings.get("embedding_negative_ratio", RoiTrainSettings().embedding_negative_ratio)),
-        embedding_samples_per_segment=int(raw_settings.get("embedding_samples_per_segment", RoiTrainSettings().embedding_samples_per_segment)),
         embedding_supcon_weight=float(raw_settings.get("embedding_supcon_weight", RoiTrainSettings().embedding_supcon_weight)),
         embedding_tail_gamma_positive=float(raw_settings.get("embedding_tail_gamma_positive", RoiTrainSettings().embedding_tail_gamma_positive)),
         embedding_tail_gamma_negative=float(raw_settings.get("embedding_tail_gamma_negative", RoiTrainSettings().embedding_tail_gamma_negative)),

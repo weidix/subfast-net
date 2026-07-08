@@ -365,47 +365,63 @@ def roi_presence_embedding_loss(
     embedding_tail_gamma_negative: float = 40.0,
     embedding_tail_hard_negative_weight: float = 2.0,
     presence_loss_enabled: bool = True,
+    embedding_loss_enabled: bool = True,
 ) -> RoiLossBreakdown:
     presence_loss = (
         F.binary_cross_entropy_with_logits(presence_logit, presence, weight=presence_loss_weights)
         if presence_loss_enabled
         else presence_logit.sum() * 0.0
     )
-    (
-        embedding_loss,
-        embedding_pairs,
-        embedding_local_positive_pairs,
-        embedding_local_negative_pairs,
-        embedding_ocr_negative_pairs,
-        embedding_skipped_pairs,
-        embedding_candidate_positive_pairs,
-        embedding_candidate_negative_pairs,
-        embedding_selected_positive_pairs,
-        embedding_selected_negative_pairs,
-        pair_margin_loss,
-        positive_consistency_loss,
-        supervised_contrastive_loss,
-    ) = metric_embedding_loss(
-        embedding,
-        presence,
-        segment_ids,
-        roots=roots,
-        video_ids=video_ids,
-        ocr_texts=ocr_texts,
-        alpha=embedding_loss_alpha,
-        adjacent_segment_ids=adjacent_segment_ids,
-        ocr_negative_enabled=embedding_ocr_negative_enabled,
-        ocr_negative_max_similarity=embedding_ocr_negative_max_similarity,
-        ocr_negative_ratio=embedding_ocr_negative_ratio,
-        positive_consistency_beta=embedding_positive_consistency_beta,
-        positive_consistency_margin=embedding_positive_consistency_margin,
-        temperature=embedding_temperature,
-        embedding_negative_ratio=embedding_negative_ratio,
-        embedding_supcon_weight=embedding_supcon_weight,
-        embedding_tail_gamma_positive=embedding_tail_gamma_positive,
-        embedding_tail_gamma_negative=embedding_tail_gamma_negative,
-        embedding_tail_hard_negative_weight=embedding_tail_hard_negative_weight,
-    )
+    if embedding_loss_enabled:
+        (
+            embedding_loss,
+            embedding_pairs,
+            embedding_local_positive_pairs,
+            embedding_local_negative_pairs,
+            embedding_ocr_negative_pairs,
+            embedding_skipped_pairs,
+            embedding_candidate_positive_pairs,
+            embedding_candidate_negative_pairs,
+            embedding_selected_positive_pairs,
+            embedding_selected_negative_pairs,
+            pair_margin_loss,
+            positive_consistency_loss,
+            supervised_contrastive_loss,
+        ) = metric_embedding_loss(
+            embedding,
+            presence,
+            segment_ids,
+            roots=roots,
+            video_ids=video_ids,
+            ocr_texts=ocr_texts,
+            alpha=embedding_loss_alpha,
+            adjacent_segment_ids=adjacent_segment_ids,
+            ocr_negative_enabled=embedding_ocr_negative_enabled,
+            ocr_negative_max_similarity=embedding_ocr_negative_max_similarity,
+            ocr_negative_ratio=embedding_ocr_negative_ratio,
+            positive_consistency_beta=embedding_positive_consistency_beta,
+            positive_consistency_margin=embedding_positive_consistency_margin,
+            temperature=embedding_temperature,
+            embedding_negative_ratio=embedding_negative_ratio,
+            embedding_supcon_weight=embedding_supcon_weight,
+            embedding_tail_gamma_positive=embedding_tail_gamma_positive,
+            embedding_tail_gamma_negative=embedding_tail_gamma_negative,
+            embedding_tail_hard_negative_weight=embedding_tail_hard_negative_weight,
+        )
+    else:
+        embedding_loss = embedding.sum() * 0.0
+        pair_margin_loss = embedding_loss
+        positive_consistency_loss = embedding_loss
+        supervised_contrastive_loss = embedding_loss
+        embedding_pairs = 0
+        embedding_local_positive_pairs = 0
+        embedding_local_negative_pairs = 0
+        embedding_ocr_negative_pairs = 0
+        embedding_skipped_pairs = 0
+        embedding_candidate_positive_pairs = 0
+        embedding_candidate_negative_pairs = 0
+        embedding_selected_positive_pairs = 0
+        embedding_selected_negative_pairs = 0
     total = presence_loss + embedding_loss_weight * embedding_loss
     return RoiLossBreakdown(
         total=total,

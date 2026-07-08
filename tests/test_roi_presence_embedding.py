@@ -573,14 +573,14 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertEqual(settings.embedding_head_type, "hybrid_lite")
         self.assertEqual(settings.embedding_sequence_channels, 16)
 
-    def test_parse_args_accepts_positive_and_negative_ratio_only(self):
-        positive_settings = parse_args(["--positive-ratio", "0.7"])
-        negative_settings = parse_args(["--negative-ratio", "0.2"])
+    def test_parse_args_accepts_presence_positive_and_negative_ratio_only(self):
+        positive_settings = parse_args(["--presence-positive-ratio", "0.7"])
+        negative_settings = parse_args(["--presence-negative-ratio", "0.2"])
 
-        self.assertEqual(positive_settings.negative_ratio, 0.30000000000000004)
-        self.assertEqual(negative_settings.negative_ratio, 0.2)
+        self.assertEqual(positive_settings.presence_negative_ratio, 0.30000000000000004)
+        self.assertEqual(negative_settings.presence_negative_ratio, 0.2)
         with self.assertRaises(SystemExit):
-            parse_args(["--train-empty-sample-ratio", "0.35"])
+            parse_args(["--negative-ratio", "0.35"])
 
     def test_parse_args_accepts_validation_ratio(self):
         settings = parse_args(["--val-positive-ratio", "0.6"])
@@ -588,10 +588,42 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertEqual(settings.val_negative_ratio, 0.4)
 
     def test_parse_args_accepts_embedding_negative_ratio(self):
-        settings = parse_args(["--negative-ratio", "0.5", "--embedding-negative-ratio", "0.4"])
+        settings = parse_args(
+            [
+                "--presence-negative-ratio",
+                "0.5",
+                "--embedding-negative-ratio",
+                "0.4",
+                "--joint-presence-negative-ratio",
+                "0.25",
+                "--joint-embedding-batch-negative-ratio",
+                "0.6",
+            ]
+        )
 
-        self.assertEqual(settings.negative_ratio, 0.5)
+        self.assertEqual(settings.presence_negative_ratio, 0.5)
         self.assertEqual(settings.embedding_negative_ratio, 0.4)
+        self.assertEqual(settings.joint_presence_negative_ratio, 0.25)
+        self.assertEqual(settings.joint_embedding_batch_negative_ratio, 0.6)
+
+    def test_parse_args_accepts_split_batch_sizes(self):
+        settings = parse_args(
+            [
+                "--presence-batch-size",
+                "8",
+                "--embedding-batch-size",
+                "12",
+                "--joint-presence-batch-size",
+                "10",
+                "--joint-embedding-batch-size",
+                "14",
+            ]
+        )
+
+        self.assertEqual(settings.presence_batch_size, 8)
+        self.assertEqual(settings.embedding_batch_size, 12)
+        self.assertEqual(settings.joint_presence_batch_size, 10)
+        self.assertEqual(settings.joint_embedding_batch_size, 14)
 
     def test_parse_args_accepts_three_stage_schedule(self):
         settings = parse_args(
@@ -786,7 +818,8 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
                         train_roots=[root],
                         val_root=root,
                         output_dir=output,
-                        batch_size=4,
+                        presence_batch_size=4,
+                        embedding_batch_size=4,
                         presence_epochs=1,
                         embedding_epochs=0,
                         joint_epochs=0,
@@ -821,7 +854,8 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
                     train_roots=[root],
                     val_root=root,
                     output_dir=output,
-                    batch_size=4,
+                    presence_batch_size=4,
+                    embedding_batch_size=4,
                     presence_epochs=1,
                     embedding_epochs=1,
                     joint_epochs=1,

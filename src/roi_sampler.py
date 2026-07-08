@@ -9,6 +9,8 @@ from torch.utils.data import Sampler
 
 from .roi_dataset import RoiSample
 
+_EMBEDDING_SAMPLES_PER_SEGMENT = 2
+
 
 class RoiBalancedBatchSampler(Sampler[list[int]]):
     """Build full, reproducible ROI batches without removing source samples."""
@@ -20,18 +22,14 @@ class RoiBalancedBatchSampler(Sampler[list[int]]):
         batch_size: int,
         negative_ratio: float,
         seed: int,
-        embedding_samples_per_segment: int = 2,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         if not 0.0 <= negative_ratio <= 1.0:
             raise ValueError("negative_ratio must be in [0, 1]")
-        if embedding_samples_per_segment < 1:
-            raise ValueError("embedding_samples_per_segment must be positive")
         self.samples = samples
         self.batch_size = batch_size
         self.negative_ratio = negative_ratio
-        self.embedding_samples_per_segment = embedding_samples_per_segment
         self.seed = seed
         self.epoch = 0
         self.positive_indices = [index for index, sample in enumerate(samples) if sample.has_subtitle]
@@ -40,7 +38,7 @@ class RoiBalancedBatchSampler(Sampler[list[int]]):
         if self.positive_indices and self.negative_indices:
             self.negative_slots = round(batch_size * negative_ratio)
             self.positive_slots = batch_size - self.negative_slots
-            if self.positive_slots < 2 or self.negative_slots < 1:
+            if self.positive_slots < 2 or (negative_ratio > 0.0 and self.negative_slots < 1):
                 raise ValueError(
                     "balanced ROI batches require at least two subtitle-present slots "
                     "and one empty slot when both classes exist"
@@ -55,9 +53,9 @@ class RoiBalancedBatchSampler(Sampler[list[int]]):
         self._pairs = self._build_positive_pairs()
         self._segment_groups = self._build_segment_groups()
         counts = []
-        if self.positive_indices:
+        if self.positive_indices and self.positive_slots > 0:
             counts.append(math.ceil(len(self.positive_indices) / self.positive_slots))
-        if self.negative_indices:
+        if self.negative_indices and self.negative_slots > 0:
             counts.append(math.ceil(len(self.negative_indices) / self.negative_slots))
         self._batch_count = max(counts, default=0)
 
@@ -125,23 +123,23 @@ class RoiBalancedBatchSampler(Sampler[list[int]]):
         for batch_number in range(self._batch_count):
             positive_batch: list[int] = []
             batches_left = self._batch_count - batch_number
-            if segment_groups and self.positive_slots >= self.embedding_samples_per_segment:
-                segments_per_batch = max(1, self.positive_slots // self.embedding_samples_per_segment)
+            if segment_groups and self.positive_slots >= _EMBEDDING_SAMPLES_PER_SEGMENT:
+                segments_per_batch = max(1, self.positive_slots // _EMBEDDING_SAMPLES_PER_SEGMENT)
                 selected: set[int] = set()
                 for _ in range(min(segments_per_batch, len(segment_groups))):
                     group = segment_groups.pop(0)
                     segment_groups.append(group)
                     group_queue = [index for index in group if index in unseen_positive and index not in selected]
-                    if len(group_queue) < self.embedding_samples_per_segment:
+                    if len(group_queue) < _EMBEDDING_SAMPLES_PER_SEGMENT:
                         group_queue = [index for index in group if index not in selected]
                     rng.shuffle(group_queue)
-                    picks = group_queue[: self.embedding_samples_per_segment]
-                    if len(picks) < self.embedding_samples_per_segment:
-                        picks.extend(rng.choices(group, k=self.embedding_samples_per_segment - len(picks)))
+                    picks = group_queue[:_EMBEDDING_SAMPLES_PER_SEGMENT]
+                    if len(picks) < _EMBEDDING_SAMPLES_PER_SEGMENT:
+                        picks.extend(rng.choices(group, k=_EMBEDDING_SAMPLES_PER_SEGMENT - len(picks)))
                     positive_batch.extend(picks)
                     selected.update(picks)
                     unseen_positive.difference_update(picks)
-                    if len(positive_batch) + self.embedding_samples_per_segment > self.positive_slots:
+                    if len(positive_batch) + _EMBEDDING_SAMPLES_PER_SEGMENT > self.positive_slots:
                         break
             elif pairs and self.positive_slots >= 2:
                 # Do not sacrifice source coverage merely to repeat a pair.

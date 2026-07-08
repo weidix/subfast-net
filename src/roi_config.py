@@ -11,7 +11,10 @@ class RoiTrainSettings(BaseModel):
     output_dir: Path = Path("outputs/roi_presence_embedding_run")
     resume: Path | None = None
     resize_roi: tuple[int, int] | None = None
-    batch_size: int = 16
+    presence_batch_size: int = Field(default=16, gt=0)
+    embedding_batch_size: int = Field(default=16, gt=0)
+    joint_presence_batch_size: int | None = Field(default=None, gt=0)
+    joint_embedding_batch_size: int | None = Field(default=None, gt=0)
     presence_epochs: int = Field(default=1, ge=0)
     embedding_epochs: int = Field(default=1, ge=0)
     joint_epochs: int = Field(default=1, ge=0)
@@ -21,14 +24,15 @@ class RoiTrainSettings(BaseModel):
     num_workers: int = 0
     max_train_samples: int | None = None
     max_val_samples: int | None = None
-    negative_ratio: float | None = Field(default=0.35, ge=0.0, le=1.0)
+    presence_negative_ratio: float | None = Field(default=0.35, ge=0.0, le=1.0)
     val_negative_ratio: float | None = None
     short_positive_loss_weight: float = 1.0
     short_positive_mask_loss_weight: float = 0.0
     embedding_loss_weight: float = 1.0
     embedding_loss_alpha: float = 1.0
     embedding_negative_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
-    embedding_samples_per_segment: int = Field(default=2, ge=1)
+    joint_presence_negative_ratio: float | None = Field(default=None, ge=0.0, le=1.0)
+    joint_embedding_batch_negative_ratio: float | None = Field(default=None, ge=0.0, le=1.0)
     embedding_ocr_negative_enabled: bool = True
     embedding_ocr_negative_max_similarity: float = 0.2
     embedding_ocr_negative_ratio: float = Field(default=0.3, ge=0.0, le=1.0)

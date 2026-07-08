@@ -30,14 +30,17 @@ uv run subfast-net train-roi \
   --val-root data/roi_validation_samples \
   --output-dir outputs/roi_presence_embedding_full \
   --resize-roi 256x64 \
-  --batch-size 32 \
+  --presence-batch-size 32 \
+  --embedding-batch-size 32 \
   --presence-epochs 3 \
   --embedding-epochs 3 \
   --joint-epochs 4 \
   --lr 0.0003 \
   --joint-lr 0.00003 \
-  --negative-ratio 0.35 \
+  --presence-negative-ratio 0.35 \
   --embedding-negative-ratio 0.5 \
+  --joint-presence-negative-ratio 0.35 \
+  --joint-embedding-batch-negative-ratio 0.5 \
   --log-interval 50 \
   --device auto
 ```
@@ -54,12 +57,13 @@ uv run subfast-net train-roi \
   --val-root data/roi_validation_samples \
   --output-dir outputs/roi_presence_only \
   --resize-roi 256x64 \
-  --batch-size 32 \
+  --presence-batch-size 32 \
+  --embedding-batch-size 32 \
   --presence-epochs 3 \
   --embedding-epochs 0 \
   --joint-epochs 0 \
   --lr 0.0003 \
-  --negative-ratio 0.35 \
+  --presence-negative-ratio 0.35 \
   --log-interval 50 \
   --device auto
 ```
@@ -78,7 +82,8 @@ uv run subfast-net train-roi \
   --val-root data/roi_validation_samples \
   --output-dir outputs/roi_presence_embedding_effect_check \
   --resize-roi 256x64 \
-  --batch-size 32 \
+  --presence-batch-size 32 \
+  --embedding-batch-size 32 \
   --presence-epochs 2 \
   --embedding-epochs 2 \
   --joint-epochs 1 \
@@ -86,8 +91,10 @@ uv run subfast-net train-roi \
   --joint-lr 0.00003 \
   --max-train-samples 4000 \
   --max-val-samples 600 \
-  --negative-ratio 0.35 \
+  --presence-negative-ratio 0.35 \
   --embedding-negative-ratio 0.5 \
+  --joint-presence-negative-ratio 0.35 \
+  --joint-embedding-batch-negative-ratio 0.5 \
   --val-negative-ratio 0.35 \
   --width 16 \
   --log-interval 50 \
@@ -141,14 +148,17 @@ uv run subfast-net train-roi \
   --output-dir outputs/roi_presence_embedding_full \
   --resume outputs/roi_presence_embedding_full \
   --resize-roi 256x64 \
-  --batch-size 32 \
+  --presence-batch-size 32 \
+  --embedding-batch-size 32 \
   --presence-epochs 3 \
   --embedding-epochs 3 \
   --joint-epochs 14 \
   --lr 0.0003 \
   --joint-lr 0.00003 \
-  --negative-ratio 0.35 \
+  --presence-negative-ratio 0.35 \
   --embedding-negative-ratio 0.5 \
+  --joint-presence-negative-ratio 0.35 \
+  --joint-embedding-batch-negative-ratio 0.5 \
   --log-interval 50 \
   --device auto
 ```
@@ -184,7 +194,10 @@ ROI checkpoints include `model_type = "roi_presence_embedding"` and are not comp
 | `--val-root` | ROI validation dataset root. |
 | `--output-dir` | Run output directory. |
 | `--resize-roi` | Explicit deterministic resize as `WIDTHxHEIGHT`; required when ROI roots have different native sizes. |
-| `--batch-size` | PyTorch training batch size. |
+| `--presence-batch-size` | Presence-stage training batch size. |
+| `--embedding-batch-size` | Embedding-stage training batch size. |
+| `--joint-presence-batch-size` | Joint-stage Presence batch size. Defaults to `--presence-batch-size` when omitted. |
+| `--joint-embedding-batch-size` | Joint-stage Embedding batch size. Defaults to `--embedding-batch-size` when omitted. |
 | `--presence-epochs` | Stage 1 epochs: train Backbone + Presence Head with Presence loss; freeze Embedding Head. Use `0` to skip. |
 | `--embedding-epochs` | Stage 2 epochs: train Embedding Head with Embedding loss; freeze Backbone + Presence Head. Use `0` to skip. |
 | `--joint-epochs` | Stage 3 epochs: jointly fine-tune all modules and select by combined validation performance. Use `0` to skip. |
@@ -192,12 +205,14 @@ ROI checkpoints include `model_type = "roi_presence_embedding"` and are not comp
 | `--joint-lr` | Smaller AdamW learning rate for stage 3. |
 | `--max-train-samples` | Cap the training sample count. |
 | `--max-val-samples` | Cap the validation sample count with segment-aware ROI sampling. |
-| `--positive-ratio` | Alias that sets the complementary subtitle-present fraction for each full training batch. |
-| `--negative-ratio` | Target no-subtitle fraction in each full training batch. The sampler cycles samples so none are discarded. |
+| `--presence-positive-ratio` | Sets the complementary subtitle-present fraction for Presence-stage batches. |
+| `--presence-negative-ratio` | Target no-subtitle fraction in Presence-stage batches. The sampler cycles samples so none are discarded. |
 | `--val-positive-ratio` | Target subtitle-present ratio in a capped validation set. Positive validation samples are selected by subtitle segment so same-subtitle pairs remain available when possible. |
 | `--val-negative-ratio` | Target no-subtitle ratio in a capped validation set. |
 | `--embedding-loss-weight` | Weight applied to embedding loss in `total_loss`. |
-| `--embedding-negative-ratio` | Target fraction of selected in-batch embedding pairs that come from different segments. All positive pairs are retained and the hardest negative pairs are selected first. |
+| `--embedding-negative-ratio` | Target fraction of selected Embedding-stage pairs that come from different segments. All positive pairs are retained and the hardest negative pairs are selected first. |
+| `--joint-presence-negative-ratio` | Target no-subtitle fraction in Joint-stage Presence batches. Defaults to `--presence-negative-ratio` when omitted. |
+| `--joint-embedding-batch-negative-ratio` | Target fraction of selected Joint-stage Embedding-batch pairs that come from different segments. Defaults to `--embedding-negative-ratio` when omitted. |
 | `--embedding-ocr-negative-enabled` / `--no-embedding-ocr-negative-enabled` | Enable or disable conservative OCR strong-difference negative pairs. |
 | `--embedding-ocr-negative-max-similarity` | Maximum normalized OCR text similarity allowed for OCR negative pairs. Lower is more conservative. |
 | `--embedding-ocr-negative-ratio` | Maximum OCR strong-difference negative share relative to trusted local negatives. Default is `0.3`. |
