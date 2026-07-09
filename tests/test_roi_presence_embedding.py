@@ -727,6 +727,13 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertEqual([phase.end_epoch for phase in training_phases(settings)], [2, 5, 9])
         self.assertEqual(settings.joint_learning_rate, 0.00002)
 
+    def test_training_phases_can_continue_from_resume_epoch(self):
+        settings = RoiTrainSettings(presence_epochs=0, embedding_epochs=32, joint_epochs=0)
+
+        phases = training_phases(settings, start_epoch=129)
+
+        self.assertEqual([(phase.name, phase.start_epoch, phase.end_epoch) for phase in phases], [("embedding", 129, 160)])
+
     def test_parse_args_accepts_presence_only_schedule(self):
         settings = parse_args(["--presence-epochs", "3", "--embedding-epochs", "0", "--joint-epochs", "0"])
 
@@ -898,6 +905,28 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertEqual(summary["best_checkpoint"], "outputs/roi_presence_only/best.pt")
         self.assertEqual(summary["best_epoch_metrics"], "outputs/roi_presence_only/epoch_outputs/epoch_0003/metrics.json")
         self.assertNotIn("last_metrics", summary)
+
+    def test_training_summary_accepts_resumed_best_epoch_with_saved_phase(self):
+        settings = RoiTrainSettings(
+            output_dir=Path("outputs/roi_embedding_resume"),
+            presence_epochs=0,
+            embedding_epochs=32,
+            joint_epochs=0,
+        )
+        summary = training_summary(
+            settings,
+            completed_epoch=160,
+            total_epochs=160,
+            best_metrics={
+                "epoch": 126.0,
+                "step": 38400.0,
+                "training_phase": "embedding",
+            },
+            phases=training_phases(settings, start_epoch=129),
+        )
+
+        self.assertEqual(summary["best_epoch"], 126)
+        self.assertEqual(summary["best_training_phase"], "embedding")
 
     def test_presence_training_skips_embedding_pair_memory(self):
         with tempfile.TemporaryDirectory() as tmp:

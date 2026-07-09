@@ -72,10 +72,10 @@ class RoiTrainBatchResult:
     embedding_positive_roi_ids: tuple[str, ...]
 
 
-def training_phases(settings: RoiTrainSettings) -> list[RoiTrainingPhase]:
+def training_phases(settings: RoiTrainSettings, *, start_epoch: int = 1) -> list[RoiTrainingPhase]:
     counts = (settings.presence_epochs, settings.embedding_epochs, settings.joint_epochs)
     phases: list[RoiTrainingPhase] = []
-    start_epoch = 1
+    next_epoch = start_epoch
     for name, count, learning_rate in zip(
         ("presence", "embedding", "joint"),
         counts,
@@ -84,9 +84,9 @@ def training_phases(settings: RoiTrainSettings) -> list[RoiTrainingPhase]:
     ):
         if count <= 0:
             continue
-        end_epoch = start_epoch + count - 1
-        phases.append(RoiTrainingPhase(name, start_epoch, end_epoch, learning_rate))
-        start_epoch = end_epoch + 1
+        end_epoch = next_epoch + count - 1
+        phases.append(RoiTrainingPhase(name, next_epoch, end_epoch, learning_rate))
+        next_epoch = end_epoch + 1
     if not phases:
         raise ValueError("at least one ROI training phase must have a positive epoch count")
     return phases
@@ -465,9 +465,13 @@ def training_summary(
     completed_epoch: int,
     total_epochs: int,
     best_metrics: dict[str, float],
+    phases: list[RoiTrainingPhase] | None = None,
 ) -> dict[str, Any]:
     best_epoch = int(best_metrics.get("epoch", best_metrics.get("best_epoch", completed_epoch)))
-    best_phase = str(best_metrics.get("training_phase", phase_for_epoch(training_phases(settings), best_epoch).name))
+    if "training_phase" in best_metrics:
+        best_phase = str(best_metrics["training_phase"])
+    else:
+        best_phase = phase_for_epoch(phases or training_phases(settings), best_epoch).name
     return {
         "record_type": "roi_training_summary",
         "completed_epoch": completed_epoch,
@@ -1146,8 +1150,6 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
         collate_fn=collate_roi_batch,
     )
     model = make_model(settings).to(device)
-    phases = training_phases(settings)
-    total_epochs = phases[-1].end_epoch
     optimizer: torch.optim.Optimizer | None = None
     active_phase: RoiTrainingPhase | None = None
     best_presence_f1 = -1.0
@@ -1175,6 +1177,8 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
             model,
             device,
         )
+    phases = training_phases(settings, start_epoch=start_epoch)
+    total_epochs = phases[-1].end_epoch
     metrics_path = settings.output_dir / "metrics.jsonl"
     print(f"roi_presence_embedding device={device} output_dir={settings.output_dir}", flush=True)
     if resume_checkpoint_path is not None:
@@ -1672,6 +1676,7 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
         completed_epoch=total_epochs,
         total_epochs=total_epochs,
         best_metrics=best_metrics or last_metrics,
+        phases=phases,
     )
     (settings.output_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     return last_metrics
