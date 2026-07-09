@@ -139,6 +139,7 @@ class LazyOcrNegativePairPool(Sequence[EmbeddingPair]):
 
 _FRAME_PATTERN = re.compile(r"^(?P<video>.+)_f(?P<frame>\d+)$")
 _MIN_OCR_TEXT_LENGTH = 4
+_SAME_TEXT_MIN_SIMILARITY = 0.9
 
 
 def parse_video_id(value: object) -> str | None:
@@ -219,6 +220,21 @@ def _ocr_text_profile(text: str) -> tuple[frozenset[str], Counter[str]]:
     return frozenset(text), Counter(text)
 
 
+def is_same_subtitle_text(left_norm: str, right_norm: str) -> bool:
+    """True when two normalized OCR texts render the same subtitle content.
+
+    Segment markers split on time, so adjacent segments can carry identical
+    text. Such pairs are visually indistinguishable and must not be used as
+    negative supervision.
+    """
+    if not left_norm or not right_norm:
+        return False
+    if left_norm == right_norm:
+        return True
+    similarity = normalized_ocr_text_similarity(left_norm, right_norm)
+    return similarity is not None and similarity >= _SAME_TEXT_MIN_SIMILARITY
+
+
 def select_embedding_pairs(
     *,
     presence: torch.Tensor,
@@ -246,11 +262,7 @@ def select_embedding_pairs(
     ocr_candidates: list[EmbeddingPair] = []
     total_candidate_pairs = len(segment_ids) * (len(segment_ids) - 1) // 2
     positive_indices = [index for index, value in enumerate((presence.detach().cpu() > 0.5).tolist()) if value]
-    normalized_ocr_texts = (
-        {index: normalize_ocr_text(ocr_texts[index]) for index in positive_indices}
-        if ocr_negative_enabled
-        else {}
-    )
+    normalized_ocr_texts = {index: normalize_ocr_text(ocr_texts[index]) for index in positive_indices}
 
     for offset, i in enumerate(positive_indices):
         for j in positive_indices[offset + 1 :]:
@@ -271,6 +283,9 @@ def select_embedding_pairs(
                 and segment_ids[i] in adjacent_segment_ids[j]
             )
             if adjacent:
+                if is_same_subtitle_text(normalized_ocr_texts[i], normalized_ocr_texts[j]):
+                    skipped_pairs += 1
+                    continue
                 pairs.append(EmbeddingPair(i=i, j=j, same=False, source="local"))
                 seen.add((i, j))
                 local_negative_pairs += 1
@@ -425,6 +440,7 @@ def build_embedding_pair_pools(
     indices_by_root_segment: dict[tuple[str, str], list[int]] = defaultdict(list)
     indices_by_root_video_segment: dict[tuple[str, object, str], list[int]] = defaultdict(list)
     timeline_by_root_video: dict[tuple[str, object], list[tuple[int, str]]] = defaultdict(list)
+    normalized_text_by_index: dict[int, str] = {}
     ocr_groups_by_root: dict[str, dict[tuple[str, str], list[int]]] = defaultdict(
         lambda: defaultdict(list)
     )
@@ -438,12 +454,12 @@ def build_embedding_pair_pools(
         frame_index = getattr(sample, "frame_index")
         positive_indices.append(index)
         indices_by_root_segment[(root, segment_id)].append(index)
+        normalized_text_by_index[index] = normalize_ocr_text(str(getattr(sample, "ocr_text", "")))
         if video_id is not None and frame_index is not None:
             indices_by_root_video_segment[(root, video_id, segment_id)].append(index)
             timeline_by_root_video[(root, video_id)].append((int(frame_index), segment_id))
         if ocr_negative_enabled:
-            normalized_text = normalize_ocr_text(str(getattr(sample, "ocr_text", "")))
-            ocr_groups_by_root[root][(segment_id, normalized_text)].append(index)
+            ocr_groups_by_root[root][(segment_id, normalized_text_by_index[index])].append(index)
 
     positive_pairs: list[EmbeddingPair] = []
     local_negative_pairs: list[EmbeddingPair] = []
@@ -475,6 +491,8 @@ def build_embedding_pair_pools(
             segment_pair_key = (root, *tuple(sorted((left_segment, right_segment))))
             for i in left_indices:
                 for j in right_indices:
+                    if is_same_subtitle_text(normalized_text_by_index[i], normalized_text_by_index[j]):
+                        continue
                     pair_key = _ordered_pair(i, j)
                     local_negative_pairs_by_segment_pair[segment_pair_key].add(pair_key)
                     _append_pool_pair(local_negative_pairs, seen, samples, pair_key[0], pair_key[1], False, "local")

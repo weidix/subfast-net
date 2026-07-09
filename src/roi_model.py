@@ -7,45 +7,6 @@ from torch.nn import functional as F
 from .model import DepthwiseBlock
 
 
-class HybridLiteEmbeddingHead(nn.Module):
-    def __init__(self, feature_dim: int, embedding_dim: int, sequence_channels: int) -> None:
-        super().__init__()
-        if sequence_channels > 64:
-            raise ValueError("embedding_sequence_channels must be <= 64")
-        if sequence_channels <= 0:
-            raise ValueError("embedding_sequence_channels must be positive")
-        self.sequence_projection = nn.Conv1d(feature_dim, sequence_channels, 1)
-        self.sequence_block = nn.Sequential(
-            nn.Conv1d(sequence_channels, sequence_channels, 3, padding=1, groups=sequence_channels, bias=False),
-            nn.BatchNorm1d(sequence_channels),
-            nn.SiLU(inplace=True),
-            nn.Conv1d(sequence_channels, sequence_channels, 1, bias=False),
-            nn.BatchNorm1d(sequence_channels),
-            nn.SiLU(inplace=True),
-        )
-        self.attention = nn.Conv1d(sequence_channels, 1, 1)
-        self.fusion = nn.Linear(embedding_dim + sequence_channels, embedding_dim)
-        self._initialize_fusion(embedding_dim)
-
-    def _initialize_fusion(self, embedding_dim: int) -> None:
-        nn.init.zeros_(self.fusion.weight)
-        nn.init.zeros_(self.fusion.bias)
-        with torch.no_grad():
-            self.fusion.weight[:, :embedding_dim].copy_(torch.eye(embedding_dim))
-            self.fusion.weight[:, embedding_dim:].normal_(mean=0.0, std=0.01)
-
-    def forward(self, gap_feature: torch.Tensor, feature_map: torch.Tensor | None) -> torch.Tensor:
-        if feature_map is None:
-            seq_feature = gap_feature.new_zeros((gap_feature.shape[0], self.sequence_projection.out_channels))
-        else:
-            sequence = feature_map.mean(dim=2)
-            sequence = self.sequence_projection(sequence)
-            sequence = self.sequence_block(sequence)
-            weights = torch.softmax(self.attention(sequence), dim=2)
-            seq_feature = (sequence * weights).sum(dim=2)
-        return self.fusion(torch.cat([gap_feature, seq_feature], dim=1))
-
-
 class LocalContrastResidual(nn.Module):
     def __init__(self, kernel_size: int = 7, eps: float = 1e-4) -> None:
         super().__init__()
@@ -65,31 +26,37 @@ class LocalContrastResidual(nn.Module):
         return residual / scale
 
 
-class LocalContrastEmbeddingHead(nn.Module):
-    def __init__(self, feature_dim: int, embedding_dim: int, sequence_channels: int, bins: int = 8) -> None:
-        super().__init__()
-        if sequence_channels <= 0 or sequence_channels > 64:
-            raise ValueError("embedding_sequence_channels must be in [1, 64]")
-        self.contrast = LocalContrastResidual()
-        self.sequence = nn.Sequential(
-            nn.Conv1d(feature_dim, sequence_channels, 1, bias=False),
-            nn.BatchNorm1d(sequence_channels),
-            nn.SiLU(inplace=True),
-            nn.Conv1d(sequence_channels, sequence_channels, 3, padding=1, groups=sequence_channels, bias=False),
-            nn.BatchNorm1d(sequence_channels),
-            nn.SiLU(inplace=True),
-            nn.AdaptiveAvgPool1d(bins),
-            nn.Flatten(),
-        )
-        self.fusion = nn.Linear(embedding_dim + sequence_channels * bins, embedding_dim)
-        nn.init.zeros_(self.fusion.weight)
-        nn.init.zeros_(self.fusion.bias)
-        with torch.no_grad():
-            self.fusion.weight[:, :embedding_dim].copy_(torch.eye(embedding_dim))
+class MaskedAttentionEmbeddingHead(nn.Module):
+    """Pools backbone features under a subtitle-box supervised attention map.
 
-    def forward(self, gap_feature: torch.Tensor, feature_map: torch.Tensor) -> torch.Tensor:
-        sequence = self.contrast(feature_map).mean(dim=2)
-        return self.fusion(torch.cat([gap_feature, self.sequence(sequence)], dim=1))
+    Global average pooling lets background pixels dominate the descriptor, which
+    breaks same-segment pairs whose background changes. The attention map is
+    trained against the subtitle box mask so pooling stays on glyph pixels.
+    """
+
+    def __init__(self, feature_dim: int, embedding_dim: int) -> None:
+        super().__init__()
+        self.contrast = LocalContrastResidual()
+        stacked_dim = feature_dim * 2
+        self.attention = nn.Sequential(
+            nn.Conv2d(stacked_dim, feature_dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(feature_dim),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(feature_dim, 1, 1),
+        )
+        self.projection = nn.Sequential(
+            nn.Linear(stacked_dim, stacked_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(stacked_dim, embedding_dim),
+        )
+
+    def forward(self, feature_map: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        stacked = torch.cat([feature_map, self.contrast(feature_map)], dim=1)
+        attention_logits = self.attention(stacked)
+        weights = torch.sigmoid(attention_logits)
+        denominator = weights.sum(dim=(2, 3)).clamp_min(1e-4)
+        pooled = (stacked * weights).sum(dim=(2, 3)) / denominator
+        return self.projection(pooled), attention_logits
 
 
 class LocalTextnessPresenceHead(nn.Module):
@@ -143,14 +110,9 @@ class RoiPresenceEmbeddingModel(nn.Module):
         width: int = 32,
         embedding_dim: int = 128,
         *,
-        embedding_head_type: str = "gap",
-        embedding_sequence_channels: int = 16,
         presence_topk_ratio: float = 0.05,
     ) -> None:
         super().__init__()
-        if embedding_head_type not in {"gap", "hybrid_lite", "local_contrast"}:
-            raise ValueError(f"unsupported embedding_head_type: {embedding_head_type}")
-        self.embedding_head_type = embedding_head_type
         self.backbone = nn.Sequential(
             nn.Conv2d(3, width, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(width),
@@ -167,21 +129,7 @@ class RoiPresenceEmbeddingModel(nn.Module):
         self.flatten = nn.Flatten()
         self.presence_contrast = LocalContrastEnhancement()
         self.presence_head = LocalTextnessPresenceHead(feature_dim * 2, hidden_dim=feature_dim, topk_ratio=presence_topk_ratio)
-        self.embedding_head = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim),
-            nn.SiLU(inplace=True),
-            nn.Linear(feature_dim, embedding_dim),
-        )
-        self.hybrid_embedding_head = (
-            HybridLiteEmbeddingHead(feature_dim, embedding_dim, embedding_sequence_channels)
-            if embedding_head_type == "hybrid_lite"
-            else None
-        )
-        self.local_contrast_embedding_head = (
-            LocalContrastEmbeddingHead(feature_dim, embedding_dim, embedding_sequence_channels)
-            if embedding_head_type == "local_contrast"
-            else None
-        )
+        self.embedding_head = MaskedAttentionEmbeddingHead(feature_dim, embedding_dim)
 
     def encode_map(self, images: torch.Tensor) -> torch.Tensor:
         return self.backbone(images)
@@ -189,49 +137,31 @@ class RoiPresenceEmbeddingModel(nn.Module):
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         return self.flatten(self.pool(self.encode_map(images)))
 
-    def _pool_features(self, feature_map: torch.Tensor) -> torch.Tensor:
-        return self.flatten(self.pool(feature_map))
-
     def forward_presence(self, features_or_images: torch.Tensor) -> torch.Tensor:
         if features_or_images.ndim != 4:
             raise ValueError("presence head requires ROI images or a feature map")
         feature_map = self.encode_map(features_or_images) if features_or_images.shape[1] == 3 else features_or_images
         return self.presence_head(self.presence_contrast(feature_map))
 
-    def forward_embedding(self, features_or_images: torch.Tensor) -> torch.Tensor:
-        feature_map = self.encode_map(features_or_images) if features_or_images.ndim == 4 else None
-        features = self._pool_features(feature_map) if feature_map is not None else features_or_images
-        gap_feature = self.embedding_head(features)
-        if self.hybrid_embedding_head is not None:
-            gap_feature = self.hybrid_embedding_head(gap_feature, feature_map)
-        if self.local_contrast_embedding_head is not None:
-            if feature_map is None:
-                raise ValueError("local contrast embedding requires ROI images")
-            gap_feature = self.local_contrast_embedding_head(gap_feature, feature_map)
-        return F.normalize(gap_feature, p=2, dim=1)
+    def forward_embedding(self, images: torch.Tensor) -> torch.Tensor:
+        return self.forward_embedding_with_attention(images)[0]
+
+    def forward_embedding_with_attention(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        embedding, attention_logits = self.embedding_head(self.encode_map(images))
+        return F.normalize(embedding, p=2, dim=1), attention_logits
 
     def forward(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         feature_map = self.encode_map(images)
-        features = self._pool_features(feature_map)
         presence_logit = self.presence_head(self.presence_contrast(feature_map))
-        gap_feature = self.embedding_head(features)
-        if self.hybrid_embedding_head is not None:
-            gap_feature = self.hybrid_embedding_head(gap_feature, feature_map)
-        if self.local_contrast_embedding_head is not None:
-            gap_feature = self.local_contrast_embedding_head(gap_feature, feature_map)
-        return presence_logit, F.normalize(gap_feature, p=2, dim=1)
+        embedding, _ = self.embedding_head(feature_map)
+        return presence_logit, F.normalize(embedding, p=2, dim=1)
 
     def forward_with_presence_map(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         feature_map = self.encode_map(images)
-        features = self._pool_features(feature_map)
         presence_feature = self.presence_contrast(feature_map)
         textness_map = self.presence_head.textness_map(presence_feature)
         presence_logit = self.presence_head.flatten(textness_map)
         k = max(1, int(presence_logit.shape[1] * self.presence_head.topk_ratio + 0.999999))
         presence_logit = presence_logit.topk(k, dim=1).values.mean(dim=1)
-        gap_feature = self.embedding_head(features)
-        if self.hybrid_embedding_head is not None:
-            gap_feature = self.hybrid_embedding_head(gap_feature, feature_map)
-        if self.local_contrast_embedding_head is not None:
-            gap_feature = self.local_contrast_embedding_head(gap_feature, feature_map)
-        return presence_logit, F.normalize(gap_feature, p=2, dim=1), textness_map
+        embedding, _ = self.embedding_head(feature_map)
+        return presence_logit, F.normalize(embedding, p=2, dim=1), textness_map

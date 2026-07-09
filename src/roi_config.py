@@ -44,9 +44,8 @@ class RoiTrainSettings(BaseModel):
     embedding_tail_gamma_negative: float = Field(default=40.0, gt=0.0)
     embedding_tail_hard_negative_weight: float = Field(default=2.0, gt=0.0)
     embedding_similarity_threshold: float = 0.5
+    embedding_attention_mask_loss_weight: float = Field(default=1.0, ge=0.0)
     presence_topk_ratio: float = 0.05
-    embedding_head_type: str = "local_contrast"
-    embedding_sequence_channels: int = 16
     width: int = 32
     embedding_dim: int = 128
     log_interval: int = 10

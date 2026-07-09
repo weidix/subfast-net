@@ -18,9 +18,10 @@ from src.roi_loss import (
 )
 from src.roi_metrics import embedding_metrics
 from src.roi_pairs import build_embedding_pair_epoch_schedule, select_embedding_pairs
-from src.roi_model import LocalContrastEmbeddingHead, LocalContrastResidual, LocalTextnessPresenceHead, RoiPresenceEmbeddingModel
+from src.roi_model import MaskedAttentionEmbeddingHead, LocalContrastResidual, LocalTextnessPresenceHead, RoiPresenceEmbeddingModel
 from src.train_roi import (
     configure_training_phase,
+    embedding_attention_mask_loss,
     format_epoch_summary,
     parse_args,
     run_training,
@@ -543,40 +544,22 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertEqual(logit.shape, (1,))
         self.assertAlmostEqual(float(logit.item()), 6.0)
 
-    def test_hybrid_lite_model_returns_normalized_embedding(self):
-        model = RoiPresenceEmbeddingModel(
-            width=8,
-            embedding_dim=128,
-            embedding_head_type="hybrid_lite",
-            embedding_sequence_channels=16,
-        )
-        presence_logit, embedding = model(torch.randn(2, 3, 16, 32))
+    def test_masked_attention_embedding_head_returns_embedding_and_attention(self):
+        head = MaskedAttentionEmbeddingHead(feature_dim=16, embedding_dim=32)
 
-        self.assertEqual(presence_logit.shape, (2,))
+        embedding, attention_logits = head(torch.randn(2, 16, 4, 8))
+
+        self.assertEqual(embedding.shape, (2, 32))
+        self.assertEqual(attention_logits.shape, (2, 1, 4, 8))
+
+    def test_model_forward_embedding_with_attention_returns_normalized_embedding(self):
+        model = RoiPresenceEmbeddingModel(width=8, embedding_dim=128)
+
+        embedding, attention_logits = model.forward_embedding_with_attention(torch.randn(2, 3, 16, 32))
+
         self.assertEqual(embedding.shape, (2, 128))
+        self.assertEqual(attention_logits.shape[0:2], (2, 1))
         self.assertTrue(torch.allclose(embedding.norm(dim=1), torch.ones(2), atol=1e-5))
-
-    def test_local_contrast_model_returns_normalized_embedding(self):
-        model = RoiPresenceEmbeddingModel(
-            width=8,
-            embedding_dim=128,
-            embedding_head_type="local_contrast",
-            embedding_sequence_channels=16,
-        )
-
-        presence_logit, embedding = model(torch.randn(2, 3, 16, 32))
-
-        self.assertEqual(presence_logit.shape, (2,))
-        self.assertEqual(embedding.shape, (2, 128))
-        self.assertTrue(torch.allclose(embedding.norm(dim=1), torch.ones(2), atol=1e-5))
-
-    def test_local_contrast_fusion_preserves_gap_embedding_at_initialization(self):
-        head = LocalContrastEmbeddingHead(feature_dim=16, embedding_dim=32, sequence_channels=8)
-
-        self.assertEqual(head.sequence[0].in_channels, 16)
-        self.assertTrue(torch.equal(head.fusion.weight[:, :32], torch.eye(32)))
-        self.assertTrue(torch.equal(head.fusion.weight[:, 32:], torch.zeros(32, 64)))
-        self.assertTrue(torch.equal(head.fusion.bias, torch.zeros(32)))
 
     def test_embedding_loss_skips_without_two_positive_samples(self):
         presence_logit = torch.zeros(2, requires_grad=True)
@@ -641,6 +624,17 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
 
         self.assertAlmostEqual(float(loss.detach()), float(torch.log(torch.tensor(2.0)) * 2.0))
 
+    def test_embedding_attention_mask_loss_targets_only_positive_masks(self):
+        attention_logits = torch.zeros(3, 1, 2, 4, requires_grad=True)
+        masks = torch.zeros(3, 1, 8, 16)
+        masks[0, :, 2:6, 4:12] = 1.0
+        masks[2, :, 2:6, 4:12] = 1.0
+        presence = torch.tensor([1.0, 0.0, 1.0])
+
+        loss = embedding_attention_mask_loss(attention_logits, masks, presence, weight=1.5)
+
+        self.assertAlmostEqual(float(loss.detach()), float(torch.log(torch.tensor(2.0)) * 1.5))
+
     def test_parse_args_uses_roi_training_names(self):
         settings = parse_args(
             [
@@ -656,12 +650,10 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
                 "2.5",
                 "--short-positive-mask-loss-weight",
                 "1.25",
+                "--embedding-attention-mask-loss-weight",
+                "0.75",
                 "--presence-topk-ratio",
                 "0.02",
-                "--embedding-head",
-                "hybrid_lite",
-                "--embedding-sequence-channels",
-                "16",
             ]
         )
 
@@ -671,9 +663,8 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertEqual(settings.embedding_loss_weight, 0.5)
         self.assertEqual(settings.short_positive_loss_weight, 2.5)
         self.assertEqual(settings.short_positive_mask_loss_weight, 1.25)
+        self.assertEqual(settings.embedding_attention_mask_loss_weight, 0.75)
         self.assertEqual(settings.presence_topk_ratio, 0.02)
-        self.assertEqual(settings.embedding_head_type, "hybrid_lite")
-        self.assertEqual(settings.embedding_sequence_channels, 16)
 
     def test_parse_args_accepts_presence_positive_and_negative_ratio_only(self):
         positive_settings = parse_args(["--presence-positive-ratio", "0.7"])

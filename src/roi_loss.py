@@ -6,7 +6,15 @@ from dataclasses import dataclass
 import torch
 from torch.nn import functional as F
 
-from .roi_pairs import EmbeddingPair, EmbeddingPairSelection, max_ocr_negative_pairs, normalize_ocr_text, normalized_ocr_text_similarity_at_most, select_embedding_pairs
+from .roi_pairs import (
+    EmbeddingPair,
+    EmbeddingPairSelection,
+    is_same_subtitle_text,
+    max_ocr_negative_pairs,
+    normalize_ocr_text,
+    normalized_ocr_text_similarity_at_most,
+    select_embedding_pairs,
+)
 
 
 @dataclass(frozen=True)
@@ -22,7 +30,7 @@ class EmbeddingPairMemory:
         self.ocr_negative_max_similarity = ocr_negative_max_similarity
         self.ocr_negative_ratio = ocr_negative_ratio
         self._embeddings: dict[tuple[str, str], torch.Tensor] = {}
-        self._local_negative_index: dict[tuple[str, str, str], list[torch.Tensor]] = {}
+        self._local_negative_index: dict[tuple[str, str, str], list[_EmbeddingMemoryNegative]] = {}
         self._ocr_negative_bank: dict[str, list[_EmbeddingMemoryNegative]] = {}
 
     def _rebuild_local_negative_index(self, root: str) -> None:
@@ -31,7 +39,7 @@ class EmbeddingPairMemory:
         for entry in self._ocr_negative_bank.get(root, []):
             if entry.video_id is None:
                 continue
-            self._local_negative_index.setdefault((root, entry.video_id, entry.segment_id), []).append(entry.embedding)
+            self._local_negative_index.setdefault((root, entry.video_id, entry.segment_id), []).append(entry)
 
     def loss_and_update(
         self,
@@ -66,9 +74,10 @@ class EmbeddingPairMemory:
                 for adjacent_segment_id in adjacent_ids:
                     if adjacent_segment_id == segment_ids[index]:
                         continue
-                    local_negative_embeddings.extend(
-                        self._local_negative_index.get((roots[index], video_id, adjacent_segment_id), [])
-                    )
+                    for previous in self._local_negative_index.get((roots[index], video_id, adjacent_segment_id), []):
+                        if is_same_subtitle_text(normalized_ocr, previous.normalized_ocr):
+                            continue
+                        local_negative_embeddings.append(previous.embedding)
             for previous in self._ocr_negative_bank.get(roots[index], []):
                 if previous.segment_id == segment_ids[index]:
                     continue
@@ -111,7 +120,7 @@ class EmbeddingPairMemory:
                 )
                 bank.append(entry)
                 if entry.video_id is not None:
-                    self._local_negative_index.setdefault((root, entry.video_id, entry.segment_id), []).append(entry.embedding)
+                    self._local_negative_index.setdefault((root, entry.video_id, entry.segment_id), []).append(entry)
                 if len(bank) > 512:
                     del bank[:-512]
                     self._rebuild_local_negative_index(root)

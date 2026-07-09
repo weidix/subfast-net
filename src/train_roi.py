@@ -47,6 +47,8 @@ class RoiTrainBatchResult:
     total_loss: torch.Tensor
     presence_loss: torch.Tensor
     mask_loss: torch.Tensor
+    short_mask_loss: torch.Tensor
+    embedding_attention_mask_loss: torch.Tensor
     embedding_loss: torch.Tensor
     embedding_margin_loss: torch.Tensor
     memory_loss: torch.Tensor
@@ -100,7 +102,6 @@ def phase_for_epoch(phases: list[RoiTrainingPhase], epoch: int) -> RoiTrainingPh
 def configure_training_phase(model: RoiPresenceEmbeddingModel, phase_name: str) -> None:
     if phase_name not in {"presence", "embedding", "joint"}:
         raise ValueError(f"unsupported ROI training phase: {phase_name}")
-    embedding_modules = [model.embedding_head, model.hybrid_embedding_head, model.local_contrast_embedding_head]
     for parameter in model.parameters():
         parameter.requires_grad_(phase_name == "joint")
     if phase_name == "presence":
@@ -108,16 +109,12 @@ def configure_training_phase(model: RoiPresenceEmbeddingModel, phase_name: str) 
             for parameter in module.parameters():
                 parameter.requires_grad_(True)
     elif phase_name == "embedding":
-        for module in embedding_modules:
-            if module is not None:
-                for parameter in module.parameters():
-                    parameter.requires_grad_(True)
+        for parameter in model.embedding_head.parameters():
+            parameter.requires_grad_(True)
 
     model.backbone.train(phase_name in {"presence", "joint"})
     model.presence_head.train(phase_name in {"presence", "joint"})
-    for module in embedding_modules:
-        if module is not None:
-            module.train(phase_name in {"embedding", "joint"})
+    model.embedding_head.train(phase_name in {"embedding", "joint"})
 
 
 def checkpoint_score(metrics: dict[str, float], phase_name: str = "joint") -> float:
@@ -160,7 +157,7 @@ def make_dataset(settings: RoiTrainSettings, train: bool) -> RoiPresenceEmbeddin
         max_samples=settings.max_train_samples if train else settings.max_val_samples,
         empty_ratio=None if train else settings.val_negative_ratio,
         segment_aware_limit=not train,
-        load_subtitle_masks=train and settings.short_positive_mask_loss_weight > 0.0,
+        load_subtitle_masks=train,
     )
 
 
@@ -301,8 +298,6 @@ def make_model(settings: RoiTrainSettings) -> RoiPresenceEmbeddingModel:
     return RoiPresenceEmbeddingModel(
         width=settings.width,
         embedding_dim=settings.embedding_dim,
-        embedding_head_type=settings.embedding_head_type,
-        embedding_sequence_channels=settings.embedding_sequence_channels,
         presence_topk_ratio=settings.presence_topk_ratio,
     )
 
@@ -328,17 +323,18 @@ def load_resume_checkpoint(
     resume: Path,
     model: RoiPresenceEmbeddingModel,
     device: torch.device,
-    *,
-    current_embedding_head_type: str,
 ) -> tuple[Path, int, int, float, int, dict[str, float], dict[str, float], dict[str, Any] | None, str | None]:
     checkpoint_path = resolve_resume_checkpoint(resume)
     checkpoint = torch.load(checkpoint_path, map_location=device)
     if not isinstance(checkpoint, dict) or checkpoint.get("model_type") != "roi_presence_embedding":
         raise RuntimeError(f"invalid ROI Presence+Embedding checkpoint: {checkpoint_path}")
-    raw_settings = dict(checkpoint.get("settings") or {})
-    checkpoint_embedding_head_type = str(raw_settings.get("embedding_head_type", "gap"))
-    partial_model_load = checkpoint_embedding_head_type != current_embedding_head_type
-    model.load_state_dict(checkpoint["model"], strict=not partial_model_load)
+    checkpoint_state, partial_model_load = compatible_model_state(model, checkpoint["model"])
+    if partial_model_load:
+        print(
+            f"warning: checkpoint model structure differs; loading {len(checkpoint_state)}/{len(model.state_dict())} matching tensors",
+            flush=True,
+        )
+    model.load_state_dict(checkpoint_state, strict=not partial_model_load)
     metrics = dict(checkpoint.get("metrics") or {})
     completed_epoch = int(checkpoint.get("epoch", metrics.get("epoch", 0)))
     step = int(checkpoint.get("step", metrics.get("step", 0)))
@@ -362,12 +358,30 @@ def load_model_checkpoint(
     model = RoiPresenceEmbeddingModel(
         width=int(raw_settings.get("width", RoiTrainSettings().width)),
         embedding_dim=int(raw_settings.get("embedding_dim", RoiTrainSettings().embedding_dim)),
-        embedding_head_type=str(raw_settings.get("embedding_head_type", RoiTrainSettings().embedding_head_type)),
-        embedding_sequence_channels=int(raw_settings.get("embedding_sequence_channels", RoiTrainSettings().embedding_sequence_channels)),
         presence_topk_ratio=float(raw_settings.get("presence_topk_ratio", RoiTrainSettings().presence_topk_ratio)),
     ).to(device)
-    model.load_state_dict(checkpoint["model"])
+    checkpoint_state, partial_model_load = compatible_model_state(model, checkpoint["model"])
+    if partial_model_load:
+        print(
+            f"warning: checkpoint model structure differs; loading {len(checkpoint_state)}/{len(model.state_dict())} matching tensors",
+            flush=True,
+        )
+    model.load_state_dict(checkpoint_state, strict=not partial_model_load)
     return model, checkpoint
+
+
+def compatible_model_state(
+    model: RoiPresenceEmbeddingModel,
+    checkpoint_model: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], bool]:
+    model_state = model.state_dict()
+    compatible = {
+        key: value
+        for key, value in checkpoint_model.items()
+        if key in model_state and tuple(value.shape) == tuple(model_state[key].shape)
+    }
+    partial = set(compatible) != set(model_state) or set(checkpoint_model) != set(model_state)
+    return compatible, partial
 
 
 def model_parameter_count(model: torch.nn.Module) -> int:
@@ -838,6 +852,25 @@ def short_positive_presence_weights(presence: torch.Tensor, ocr_texts: list[str]
     return weights
 
 
+def embedding_attention_mask_loss(
+    attention_logits: torch.Tensor,
+    subtitle_masks: torch.Tensor,
+    presence: torch.Tensor,
+    weight: float,
+) -> torch.Tensor:
+    if weight <= 0.0:
+        return attention_logits.sum() * 0.0
+    target = F.interpolate(
+        subtitle_masks.to(device=attention_logits.device, dtype=attention_logits.dtype),
+        size=attention_logits.shape[-2:],
+        mode="area",
+    ).clamp(0.0, 1.0)
+    positive = presence > 0.5
+    if not bool(positive.any()):
+        return attention_logits.sum() * 0.0
+    return F.binary_cross_entropy_with_logits(attention_logits[positive], target[positive]) * weight
+
+
 def short_positive_mask_loss(
     textness_map: torch.Tensor,
     subtitle_masks: torch.Tensor,
@@ -924,22 +957,36 @@ def compute_train_batch_result(
     images = batch.images.to(device)
     presence = batch.presence.to(device)
     if mode == "embedding":
-        embedding = model.forward_embedding(images)
+        embedding, attention_logits = model.forward_embedding_with_attention(images)
         presence_logit = presence.new_zeros(presence.shape)
-        mask_loss = embedding.sum() * 0.0
+        if batch.subtitle_masks is not None:
+            attention_mask_loss = embedding_attention_mask_loss(
+                attention_logits,
+                batch.subtitle_masks,
+                presence,
+                settings.embedding_attention_mask_loss_weight,
+            )
+        else:
+            attention_mask_loss = embedding.sum() * 0.0
+        short_mask_loss_value = embedding.sum() * 0.0
+        mask_loss = attention_mask_loss
     elif settings.short_positive_mask_loss_weight > 0.0:
         presence_logit, embedding, textness_map = model.forward_with_presence_map(images)
         if batch.subtitle_masks is None:
             raise RuntimeError("subtitle masks are required when short positive mask loss is enabled")
-        mask_loss = short_positive_mask_loss(
+        short_mask_loss_value = short_positive_mask_loss(
             textness_map,
             batch.subtitle_masks,
             presence,
             batch.ocr_texts,
             settings.short_positive_mask_loss_weight,
         )
+        attention_mask_loss = embedding.sum() * 0.0
+        mask_loss = short_mask_loss_value
     else:
         presence_logit, embedding = model(images)
+        short_mask_loss_value = presence_logit.sum() * 0.0
+        attention_mask_loss = embedding.sum() * 0.0
         mask_loss = presence_logit.sum() * 0.0
     loss = roi_presence_embedding_loss(
         presence_logit,
@@ -991,7 +1038,7 @@ def compute_train_batch_result(
         )
     total_loss = loss.presence_loss + mask_loss
     if mode == "embedding":
-        total_loss = settings.embedding_loss_weight * (loss.embedding_loss + memory_loss)
+        total_loss = settings.embedding_loss_weight * (loss.embedding_loss + memory_loss) + mask_loss
     positive_samples = int((batch.presence > 0.5).sum())
     sample_count = len(batch.sample_ids)
     presence_positive_samples = positive_samples if mode == "presence" else 0
@@ -1024,6 +1071,8 @@ def compute_train_batch_result(
         total_loss=total_loss,
         presence_loss=loss.presence_loss,
         mask_loss=mask_loss,
+        short_mask_loss=short_mask_loss_value,
+        embedding_attention_mask_loss=attention_mask_loss,
         embedding_loss=loss.embedding_loss,
         embedding_margin_loss=loss.embedding_margin_loss,
         memory_loss=memory_loss,
@@ -1125,7 +1174,6 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
             settings.resume,
             model,
             device,
-            current_embedding_head_type=settings.embedding_head_type,
         )
     metrics_path = settings.output_dir / "metrics.jsonl"
     print(f"roi_presence_embedding device={device} output_dir={settings.output_dir}", flush=True)
@@ -1144,10 +1192,10 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
         f"joint_lr={settings.joint_learning_rate:g} "
         f"phase_epochs={','.join(f'{phase.name}:{phase.end_epoch - phase.start_epoch + 1}' for phase in phases)} "
         f"weight_decay={settings.weight_decay:g} embedding_dim={settings.embedding_dim} "
-        f"embedding_head={settings.embedding_head_type} sequence_channels={settings.embedding_sequence_channels} "
         f"presence_topk_ratio={settings.presence_topk_ratio:g} "
         f"short_positive_loss_weight={settings.short_positive_loss_weight:g} "
         f"short_positive_mask_loss_weight={settings.short_positive_mask_loss_weight:g} "
+        f"embedding_attention_mask_loss_weight={settings.embedding_attention_mask_loss_weight:g} "
         f"embedding_loss_weight={settings.embedding_loss_weight:g} resize_roi={settings.resize_roi} "
         f"embedding_loss_alpha={settings.embedding_loss_alpha:g} "
         f"embedding_ocr_negative_enabled={settings.embedding_ocr_negative_enabled} "
@@ -1276,7 +1324,9 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
             configure_training_phase(model, phase.name)
             train_loss = 0.0
             train_presence_loss = 0.0
+            train_mask_loss = 0.0
             train_short_mask_loss = 0.0
+            train_embedding_attention_mask_loss = 0.0
             train_embedding_loss = 0.0
             train_embedding_memory_loss = 0.0
             train_embedding_memory_pairs = 0
@@ -1374,6 +1424,8 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                 total_loss = batch_results[0].total_loss
                 presence_loss_tensor = batch_results[0].presence_loss
                 mask_loss_tensor = batch_results[0].mask_loss
+                short_mask_loss_tensor = batch_results[0].short_mask_loss
+                embedding_attention_mask_loss_tensor = batch_results[0].embedding_attention_mask_loss
                 embedding_loss_tensor = batch_results[0].embedding_loss
                 embedding_margin_loss_tensor = batch_results[0].embedding_margin_loss
                 memory_loss_tensor = batch_results[0].memory_loss
@@ -1383,6 +1435,10 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                     total_loss = total_loss + result.total_loss
                     presence_loss_tensor = presence_loss_tensor + result.presence_loss
                     mask_loss_tensor = mask_loss_tensor + result.mask_loss
+                    short_mask_loss_tensor = short_mask_loss_tensor + result.short_mask_loss
+                    embedding_attention_mask_loss_tensor = (
+                        embedding_attention_mask_loss_tensor + result.embedding_attention_mask_loss
+                    )
                     embedding_loss_tensor = embedding_loss_tensor + result.embedding_loss
                     embedding_margin_loss_tensor = embedding_margin_loss_tensor + result.embedding_margin_loss
                     memory_loss_tensor = memory_loss_tensor + result.memory_loss
@@ -1416,6 +1472,8 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                     memory_loss_value,
                     positive_consistency_loss_value,
                     supervised_contrastive_loss_value,
+                    short_mask_loss_value,
+                    embedding_attention_mask_loss_value,
                 ) = torch.stack(
                     (
                         total_loss,
@@ -1426,11 +1484,15 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                         memory_loss_tensor,
                         positive_consistency_loss_tensor,
                         supervised_contrastive_loss_tensor,
+                        short_mask_loss_tensor,
+                        embedding_attention_mask_loss_tensor,
                     )
                 ).detach().cpu().tolist()
                 train_loss += total_loss_value
                 train_presence_loss += presence_loss_value
-                train_short_mask_loss += mask_loss_value
+                train_mask_loss += mask_loss_value
+                train_short_mask_loss += short_mask_loss_value
+                train_embedding_attention_mask_loss += embedding_attention_mask_loss_value
                 train_embedding_loss += embedding_loss_value
                 train_embedding_memory_loss += memory_loss_value
                 train_embedding_memory_pairs += memory_pairs
@@ -1464,7 +1526,9 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                     "epoch_batches": float(total_batches),
                     "total_loss": total_loss_value,
                     "presence_loss": presence_loss_value,
-                    "short_mask_loss": mask_loss_value,
+                    "mask_loss": mask_loss_value,
+                    "short_mask_loss": short_mask_loss_value,
+                    "embedding_attention_mask_loss": embedding_attention_mask_loss_value,
                     "embedding_loss": embedding_loss_value,
                     "embedding_margin_loss": embedding_margin_loss_value,
                     "embedding_memory_loss": memory_loss_value,
@@ -1514,7 +1578,9 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                     "step": float(global_step),
                     "train_loss": train_loss / max(1, batches),
                     "train_presence_loss": train_presence_loss / max(1, batches),
+                    "train_mask_loss": train_mask_loss / max(1, batches),
                     "train_short_mask_loss": train_short_mask_loss / max(1, batches),
+                    "train_embedding_attention_mask_loss": train_embedding_attention_mask_loss / max(1, batches),
                     "train_embedding_loss": train_embedding_loss / max(1, batches),
                     "train_embedding_memory_loss": train_embedding_memory_loss / max(1, batches),
                     "train_embedding_memory_pairs": float(train_embedding_memory_pairs),
@@ -1669,9 +1735,12 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
     parser.add_argument("--embedding-tail-gamma-negative", type=float, default=RoiTrainSettings().embedding_tail_gamma_negative)
     parser.add_argument("--embedding-tail-hard-negative-weight", type=float, default=RoiTrainSettings().embedding_tail_hard_negative_weight)
     parser.add_argument("--embedding-similarity-threshold", type=float, default=RoiTrainSettings().embedding_similarity_threshold)
+    parser.add_argument(
+        "--embedding-attention-mask-loss-weight",
+        type=float,
+        default=RoiTrainSettings().embedding_attention_mask_loss_weight,
+    )
     parser.add_argument("--presence-topk-ratio", type=float, default=RoiTrainSettings().presence_topk_ratio)
-    parser.add_argument("--embedding-head", choices=("gap", "hybrid_lite", "local_contrast"), default=RoiTrainSettings().embedding_head_type)
-    parser.add_argument("--embedding-sequence-channels", type=int, default=RoiTrainSettings().embedding_sequence_channels)
     parser.add_argument("--width", type=int, default=RoiTrainSettings().width)
     parser.add_argument("--embedding-dim", type=int, default=RoiTrainSettings().embedding_dim)
     parser.add_argument("--log-interval", type=int, default=RoiTrainSettings().log_interval)
@@ -1789,9 +1858,8 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
         embedding_tail_gamma_negative=args.embedding_tail_gamma_negative,
         embedding_tail_hard_negative_weight=args.embedding_tail_hard_negative_weight,
         embedding_similarity_threshold=args.embedding_similarity_threshold,
+        embedding_attention_mask_loss_weight=args.embedding_attention_mask_loss_weight,
         presence_topk_ratio=args.presence_topk_ratio,
-        embedding_head_type=args.embedding_head,
-        embedding_sequence_channels=args.embedding_sequence_channels,
         width=args.width,
         embedding_dim=args.embedding_dim,
         log_interval=args.log_interval,
@@ -1877,8 +1945,6 @@ def run_validation(args: argparse.Namespace) -> dict[str, float]:
             raw_settings.get("embedding_tail_hard_negative_weight", RoiTrainSettings().embedding_tail_hard_negative_weight)
         ),
         embedding_similarity_threshold=args.embedding_similarity_threshold,
-        embedding_head_type=str(raw_settings.get("embedding_head_type", RoiTrainSettings().embedding_head_type)),
-        embedding_sequence_channels=int(raw_settings.get("embedding_sequence_channels", RoiTrainSettings().embedding_sequence_channels)),
         width=int(raw_settings.get("width", RoiTrainSettings().width)),
         embedding_dim=int(raw_settings.get("embedding_dim", RoiTrainSettings().embedding_dim)),
         device=args.device,
