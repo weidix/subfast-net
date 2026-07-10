@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -47,7 +48,9 @@ class RoiTrainSettings(BaseModel):
     embedding_attention_mask_loss_weight: float = Field(default=1.0, ge=0.0)
     presence_topk_ratio: float = 0.05
     width: int = 32
-    embedding_dim: int = 128
+    embedding_dim: int = Field(default=256, gt=0)
+    embedding_width_tokens: int = Field(default=32, gt=0)
+    embedding_aggregation: Literal["masked_global", "width_tokens"] = "width_tokens"
     log_interval: int = 10
     seed: int = 2026
     device: str = "auto"

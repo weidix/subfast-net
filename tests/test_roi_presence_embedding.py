@@ -229,6 +229,69 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertEqual(schedule.unique_positive_roi_count, schedule.total_positive_roi_count)
         self.assertEqual(schedule.unique_positive_roi_count, 12)
 
+    def test_embedding_pair_scheduler_includes_maximum_time_span_positive(self):
+        samples = make_scheduler_samples(segments=1, per_segment=4)
+        schedule = build_embedding_pair_epoch_schedule(
+            samples,
+            batch_size=4,
+            negative_ratio=0.0,
+            ocr_negative_enabled=False,
+            ocr_negative_max_similarity=0.2,
+            ocr_negative_ratio=0.3,
+            seed=19,
+            epoch=1,
+        )
+        global_pairs = {
+            tuple(sorted((batch.sample_indices[pair.i], batch.sample_indices[pair.j])))
+            for batch in schedule.batches
+            for pair in batch.pairs
+            if pair.same
+        }
+        self.assertIn((0, 3), global_pairs)
+
+    def test_embedding_pair_scheduler_prioritizes_ocr_overlap_for_adjacent_negatives(self):
+        samples: list[RoiSample] = []
+        texts = ("这个放在这里", "这个放在那里", "completely different")
+        for segment_index, ocr_text in enumerate(texts):
+            for offset in range(2):
+                sample_index = segment_index * 2 + offset
+                samples.append(
+                    RoiSample(
+                        image_path=Path(f"positive-{sample_index}.jpg"),
+                        label_path=Path(f"positive-{sample_index}.txt"),
+                        sample_id=f"positive-{sample_index}",
+                        root=Path("root"),
+                        has_subtitle=True,
+                        segment_id=f"segment-{segment_index}",
+                        video_id="video",
+                        frame_index=segment_index * 100 + offset,
+                        ocr_text=ocr_text,
+                        annotation={},
+                    )
+                )
+        schedule = build_embedding_pair_epoch_schedule(
+            samples,
+            batch_size=4,
+            negative_ratio=0.25,
+            ocr_negative_enabled=False,
+            ocr_negative_max_similarity=0.2,
+            ocr_negative_ratio=0.3,
+            seed=23,
+            epoch=1,
+        )
+        negative_segments = {
+            frozenset(
+                (
+                    samples[batch.sample_indices[pair.i]].segment_id,
+                    samples[batch.sample_indices[pair.j]].segment_id,
+                )
+            )
+            for batch in schedule.batches
+            for pair in batch.pairs
+            if not pair.same
+        }
+        self.assertEqual(negative_segments, {frozenset(("segment-0", "segment-1"))})
+
     def test_embedding_pair_scheduler_respects_embedding_negative_ratio(self):
         schedule = build_embedding_pair_epoch_schedule(
             make_scheduler_samples(),
@@ -545,12 +608,13 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertAlmostEqual(float(logit.item()), 6.0)
 
     def test_masked_attention_embedding_head_returns_embedding_and_attention(self):
-        head = MaskedAttentionEmbeddingHead(feature_dim=16, embedding_dim=32)
+        head = MaskedAttentionEmbeddingHead(feature_dim=16, embedding_dim=32, width_tokens=8)
 
         embedding, attention_logits = head(torch.randn(2, 16, 4, 8))
 
         self.assertEqual(embedding.shape, (2, 32))
         self.assertEqual(attention_logits.shape, (2, 1, 4, 8))
+        self.assertEqual(head.position_embedding.shape, (1, 16, 8))
 
     def test_model_forward_embedding_with_attention_returns_normalized_embedding(self):
         model = RoiPresenceEmbeddingModel(width=8, embedding_dim=128)
@@ -782,6 +846,24 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         current = dict(best, global_embedding_acc=0.83, normal_embedding_acc=0.82)
 
         self.assertTrue(should_save_roi_best_checkpoint(current, best))
+
+    def test_embedding_checkpoint_prioritizes_fp_then_fn_then_gap(self):
+        best = {
+            "embedding_false_positive_pairs": 1.0,
+            "embedding_false_negative_pairs": 0.0,
+            "embedding_gap": 0.5,
+        }
+        zero_fp = {
+            "embedding_false_positive_pairs": 0.0,
+            "embedding_false_negative_pairs": 4.0,
+            "embedding_gap": -0.3,
+        }
+        lower_fn = dict(zero_fp, embedding_false_negative_pairs=3.0, embedding_gap=-0.5)
+        better_gap = dict(lower_fn, embedding_gap=-0.2)
+
+        self.assertTrue(should_save_roi_best_checkpoint(zero_fp, best, "embedding"))
+        self.assertTrue(should_save_roi_best_checkpoint(lower_fn, zero_fp, "embedding"))
+        self.assertTrue(should_save_roi_best_checkpoint(better_gap, lower_fn, "embedding"))
 
     def test_best_checkpoint_gate_saves_when_short_presence_improves_without_core_regression(self):
         best = {

@@ -27,12 +27,59 @@ class LocalContrastResidual(nn.Module):
 
 
 class MaskedAttentionEmbeddingHead(nn.Module):
-    """Pools backbone features under a subtitle-box supervised attention map.
+    """Encodes the ordered subtitle width under a supervised attention map.
 
     Global average pooling lets background pixels dominate the descriptor, which
-    breaks same-segment pairs whose background changes. The attention map is
-    trained against the subtitle box mask so pooling stays on glyph pixels.
+    breaks same-segment pairs whose background changes and discards character
+    order. Height pooling keeps one token per horizontal region; the fixed-width
+    sequence and its learned positions are then encoded without width pooling.
     """
+
+    def __init__(self, feature_dim: int, embedding_dim: int, width_tokens: int = 32) -> None:
+        super().__init__()
+        if width_tokens <= 0:
+            raise ValueError("width_tokens must be positive")
+        self.contrast = LocalContrastResidual()
+        stacked_dim = feature_dim * 2
+        self.width_tokens = width_tokens
+        self.attention = nn.Sequential(
+            nn.Conv2d(stacked_dim, feature_dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(feature_dim),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(feature_dim, 1, 1),
+        )
+        self.token_projection = nn.Conv1d(stacked_dim, feature_dim, 1, bias=False)
+        self.position_embedding = nn.Parameter(torch.empty(1, feature_dim, width_tokens))
+        self.sequence_encoder = nn.Sequential(
+            nn.Conv1d(feature_dim, feature_dim, 3, padding=1, groups=feature_dim, bias=False),
+            nn.GroupNorm(1, feature_dim),
+            nn.SiLU(inplace=True),
+            nn.Conv1d(feature_dim, feature_dim, 1, bias=False),
+            nn.SiLU(inplace=True),
+        )
+        self.projection = nn.Sequential(
+            nn.Linear(feature_dim * width_tokens, embedding_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(embedding_dim, embedding_dim),
+        )
+        nn.init.trunc_normal_(self.position_embedding, std=0.02)
+
+    def forward(self, feature_map: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        stacked = torch.cat([feature_map, self.contrast(feature_map)], dim=1)
+        attention_logits = self.attention(stacked)
+        weights = torch.sigmoid(attention_logits)
+        height_denominator = weights.sum(dim=2).clamp_min(1e-4)
+        width_sequence = (stacked * weights).sum(dim=2) / height_denominator
+        width_sequence = width_sequence * weights.mean(dim=2)
+        width_sequence = F.adaptive_avg_pool1d(width_sequence, self.width_tokens)
+        width_sequence = self.token_projection(width_sequence) + self.position_embedding
+        width_sequence = width_sequence + self.sequence_encoder(width_sequence)
+        embedding = self.projection(width_sequence.flatten(start_dim=1))
+        return embedding, attention_logits
+
+
+class MaskedGlobalEmbeddingHead(nn.Module):
+    """Legacy masked-global head kept for old checkpoint reproduction."""
 
     def __init__(self, feature_dim: int, embedding_dim: int) -> None:
         super().__init__()
@@ -108,9 +155,11 @@ class RoiPresenceEmbeddingModel(nn.Module):
     def __init__(
         self,
         width: int = 32,
-        embedding_dim: int = 128,
+        embedding_dim: int = 256,
         *,
         presence_topk_ratio: float = 0.05,
+        embedding_width_tokens: int = 32,
+        embedding_aggregation: str = "width_tokens",
     ) -> None:
         super().__init__()
         self.backbone = nn.Sequential(
@@ -129,7 +178,16 @@ class RoiPresenceEmbeddingModel(nn.Module):
         self.flatten = nn.Flatten()
         self.presence_contrast = LocalContrastEnhancement()
         self.presence_head = LocalTextnessPresenceHead(feature_dim * 2, hidden_dim=feature_dim, topk_ratio=presence_topk_ratio)
-        self.embedding_head = MaskedAttentionEmbeddingHead(feature_dim, embedding_dim)
+        if embedding_aggregation == "width_tokens":
+            self.embedding_head = MaskedAttentionEmbeddingHead(
+                feature_dim,
+                embedding_dim,
+                width_tokens=embedding_width_tokens,
+            )
+        elif embedding_aggregation == "masked_global":
+            self.embedding_head = MaskedGlobalEmbeddingHead(feature_dim, embedding_dim)
+        else:
+            raise ValueError(f"unsupported embedding aggregation: {embedding_aggregation}")
 
     def encode_map(self, images: torch.Tensor) -> torch.Tensor:
         return self.backbone(images)

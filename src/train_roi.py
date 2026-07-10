@@ -256,6 +256,15 @@ def should_save_roi_best_checkpoint(
 ) -> bool:
     if not best:
         return True
+    if phase_name == "embedding":
+        def embedding_rank(metrics: dict[str, float]) -> tuple[float, float, float]:
+            return (
+                -_metric(metrics, "embedding_false_positive_pairs"),
+                -_metric(metrics, "embedding_false_negative_pairs"),
+                _metric(metrics, "embedding_gap"),
+            )
+
+        return embedding_rank(current) > embedding_rank(best)
     return checkpoint_score(current, phase_name) > checkpoint_score(best, phase_name)
 
 
@@ -299,6 +308,8 @@ def make_model(settings: RoiTrainSettings) -> RoiPresenceEmbeddingModel:
         width=settings.width,
         embedding_dim=settings.embedding_dim,
         presence_topk_ratio=settings.presence_topk_ratio,
+        embedding_width_tokens=settings.embedding_width_tokens,
+        embedding_aggregation=settings.embedding_aggregation,
     )
 
 
@@ -359,6 +370,10 @@ def load_model_checkpoint(
         width=int(raw_settings.get("width", RoiTrainSettings().width)),
         embedding_dim=int(raw_settings.get("embedding_dim", RoiTrainSettings().embedding_dim)),
         presence_topk_ratio=float(raw_settings.get("presence_topk_ratio", RoiTrainSettings().presence_topk_ratio)),
+        embedding_width_tokens=int(
+            raw_settings.get("embedding_width_tokens", RoiTrainSettings().embedding_width_tokens)
+        ),
+        embedding_aggregation=str(raw_settings.get("embedding_aggregation", "masked_global")),
     ).to(device)
     checkpoint_state, partial_model_load = compatible_model_state(model, checkpoint["model"])
     if partial_model_load:
@@ -1196,6 +1211,8 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
         f"joint_lr={settings.joint_learning_rate:g} "
         f"phase_epochs={','.join(f'{phase.name}:{phase.end_epoch - phase.start_epoch + 1}' for phase in phases)} "
         f"weight_decay={settings.weight_decay:g} embedding_dim={settings.embedding_dim} "
+        f"embedding_width_tokens={settings.embedding_width_tokens} "
+        f"embedding_aggregation={settings.embedding_aggregation} "
         f"presence_topk_ratio={settings.presence_topk_ratio:g} "
         f"short_positive_loss_weight={settings.short_positive_loss_weight:g} "
         f"short_positive_mask_loss_weight={settings.short_positive_mask_loss_weight:g} "
@@ -1748,6 +1765,16 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
     parser.add_argument("--presence-topk-ratio", type=float, default=RoiTrainSettings().presence_topk_ratio)
     parser.add_argument("--width", type=int, default=RoiTrainSettings().width)
     parser.add_argument("--embedding-dim", type=int, default=RoiTrainSettings().embedding_dim)
+    parser.add_argument(
+        "--embedding-width-tokens",
+        type=int,
+        default=RoiTrainSettings().embedding_width_tokens,
+    )
+    parser.add_argument(
+        "--embedding-aggregation",
+        choices=("masked_global", "width_tokens"),
+        default=RoiTrainSettings().embedding_aggregation,
+    )
     parser.add_argument("--log-interval", type=int, default=RoiTrainSettings().log_interval)
     parser.add_argument("--device", default=RoiTrainSettings().device)
     args = parser.parse_args(argv)
@@ -1867,6 +1894,8 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
         presence_topk_ratio=args.presence_topk_ratio,
         width=args.width,
         embedding_dim=args.embedding_dim,
+        embedding_width_tokens=args.embedding_width_tokens,
+        embedding_aggregation=args.embedding_aggregation,
         log_interval=args.log_interval,
         device=args.device,
     )
@@ -1952,6 +1981,10 @@ def run_validation(args: argparse.Namespace) -> dict[str, float]:
         embedding_similarity_threshold=args.embedding_similarity_threshold,
         width=int(raw_settings.get("width", RoiTrainSettings().width)),
         embedding_dim=int(raw_settings.get("embedding_dim", RoiTrainSettings().embedding_dim)),
+        embedding_width_tokens=int(
+            raw_settings.get("embedding_width_tokens", RoiTrainSettings().embedding_width_tokens)
+        ),
+        embedding_aggregation=str(raw_settings.get("embedding_aggregation", "masked_global")),
         device=args.device,
     )
     dataset = RoiPresenceEmbeddingDataset(

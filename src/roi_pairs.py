@@ -380,13 +380,19 @@ def build_embedding_pair_epoch_schedule(
         positive_pool,
         target_count=positive_budget,
         rng=rng,
+        samples=samples,
     )
     negative_budget = _negative_budget(
         len(selected_positive),
         negative_ratio,
         len(local_negative_pool) + len(ocr_negative_pool),
     )
-    selected_local_negative = _take_pairs(local_negative_pool, min(negative_budget, len(local_negative_pool)), rng)
+    selected_local_negative = _select_local_negative_pairs(
+        local_negative_pool,
+        min(negative_budget, len(local_negative_pool)),
+        rng,
+        samples,
+    )
     ocr_limit = max_ocr_negative_pairs(
         local_negative_pairs=len(selected_local_negative),
         positive_pairs=len(selected_positive),
@@ -633,19 +639,36 @@ def _select_positive_pairs_for_coverage(
     *,
     target_count: int,
     rng: random.Random,
+    samples: Sequence[object],
 ) -> list[EmbeddingPair]:
     if target_count <= 0 or not pool:
         return []
     shuffled = list(pool)
     rng.shuffle(shuffled)
+    shuffled.sort(key=lambda pair: _pair_frame_span(samples, pair), reverse=True)
     uncovered = {index for pair in shuffled for index in (pair.i, pair.j)}
     selected: list[EmbeddingPair] = []
     deferred: list[EmbeddingPair] = []
     selected_pairs: set[EmbeddingPair] = set()
 
+    widest_by_segment: dict[tuple[str, str], EmbeddingPair] = {}
+    for pair in shuffled:
+        sample = samples[pair.i]
+        key = (_sample_root(sample), str(getattr(sample, "segment_id")))
+        widest_by_segment.setdefault(key, pair)
+    for pair in widest_by_segment.values():
+        if len(selected) >= target_count:
+            break
+        selected.append(pair)
+        selected_pairs.add(pair)
+        uncovered.discard(pair.i)
+        uncovered.discard(pair.j)
+
     for pair in shuffled:
         if len(selected) >= target_count:
             break
+        if pair in selected_pairs:
+            continue
         if pair.i in uncovered and pair.j in uncovered:
             selected.append(pair)
             selected_pairs.add(pair)
@@ -675,6 +698,42 @@ def _select_positive_pairs_for_coverage(
     if len(selected) < target_count:
         selected.extend(_take_pairs(pool, target_count - len(selected), rng))
     return selected
+
+
+def _select_local_negative_pairs(
+    pool: Sequence[EmbeddingPair],
+    count: int,
+    rng: random.Random,
+    samples: Sequence[object],
+) -> list[EmbeddingPair]:
+    if count <= 0 or not pool:
+        return []
+    ranked = list(pool)
+    rng.shuffle(ranked)
+    ranked.sort(key=lambda pair: _local_negative_priority(samples, pair), reverse=True)
+    return ranked[:count]
+
+
+def _pair_frame_span(samples: Sequence[object], pair: EmbeddingPair) -> int:
+    left = getattr(samples[pair.i], "frame_index", None)
+    right = getattr(samples[pair.j], "frame_index", None)
+    if left is None or right is None:
+        return 0
+    return abs(int(left) - int(right))
+
+
+def _local_negative_priority(samples: Sequence[object], pair: EmbeddingPair) -> tuple[float, int]:
+    left = normalize_ocr_text(str(getattr(samples[pair.i], "ocr_text", "")))
+    right = normalize_ocr_text(str(getattr(samples[pair.j], "ocr_text", "")))
+    if not left or not right:
+        overlap = 0.0
+    else:
+        sequence_overlap = SequenceMatcher(None, left, right).ratio()
+        left_chars = set(left)
+        right_chars = set(right)
+        character_overlap = len(left_chars & right_chars) / max(1, len(left_chars | right_chars))
+        overlap = max(sequence_overlap, character_overlap)
+    return overlap, -_pair_frame_span(samples, pair)
 
 
 def _take_pairs(pool: Sequence[EmbeddingPair], count: int, rng: random.Random) -> list[EmbeddingPair]:
