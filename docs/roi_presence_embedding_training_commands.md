@@ -1,8 +1,10 @@
-# ROI Presence + Embedding Training Commands
+# ROI Presence + Embedding Training Commands（已弃用）
 
-This document lists the current commands for the ROI subtitle Presence + Embedding model.
+> `train-roi` 双头训练入口已弃用。新的 presence-only 训练方式见 [ROI Presence 模型训练](roi_presence_training.md)。本文仅保留旧 checkpoint 与历史实验的复现说明。
 
-This is separate from bbox detector training. Use `train-roi` and `validate-roi` for ROI Presence + Embedding checkpoints.
+This document lists the historical commands for the ROI subtitle Presence + Embedding model.
+
+This is separate from bbox detector training. The commands below use the deprecated `train-roi` entry only to reproduce old ROI Presence + Embedding checkpoints.
 
 ## Current Data Roots
 

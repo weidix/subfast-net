@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -423,7 +424,7 @@ def run_training(settings: TrainSettings) -> dict[str, float]:
 
 
 def parse_args(argv: list[str] | None = None) -> TrainSettings:
-    parser = argparse.ArgumentParser(description="Train a local PyTorch subtitle-region detector.")
+    parser = argparse.ArgumentParser(description="[DEPRECATED] Train a local PyTorch subtitle-region detector.")
     parser.add_argument("--train-root", type=Path, action="append", dest="train_roots")
     parser.add_argument("--val-root", type=Path, default=Path("data/validation_samples"))
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/pytorch_run"))
@@ -511,5 +512,6 @@ def parse_args(argv: list[str] | None = None) -> TrainSettings:
 
 
 def main(argv: list[str] | None = None) -> None:
+    print("warning: 'train' is deprecated", file=sys.stderr, flush=True)
     metrics = run_training(parse_args(argv))
     print(json.dumps(metrics, indent=2, sort_keys=True))

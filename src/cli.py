@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-from . import export_unified_model, train, train_roi
+from . import export_unified_model, train, train_presence, train_roi, train_roi_pair
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -16,11 +16,20 @@ def main(argv: list[str] | None = None) -> None:
     if args and args[0] == "train":
         train.main(args[1:])
         return
+    if args and args[0] == "train-presence":
+        train_presence.main(args[1:])
+        return
     if args and args[0] == "train-roi":
         train_roi.main(args[1:])
         return
     if args and args[0] == "validate-roi":
         train_roi.main_validate(args[1:])
+        return
+    if args and args[0] == "train-roi-pair":
+        train_roi_pair.main(args[1:])
+        return
+    if args and args[0] == "validate-roi-pair":
+        train_roi_pair.main_validate(args[1:])
         return
     train.main(args)
 

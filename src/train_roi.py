@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import html
 import json
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -1709,7 +1710,9 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
 
 
 def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
-    parser = argparse.ArgumentParser(description="Train ROI Presence + Embedding subtitle model.")
+    parser = argparse.ArgumentParser(
+        description="[DEPRECATED] Train ROI Presence + Embedding subtitle model; use train-presence for presence-only training."
+    )
     parser.add_argument("--train-root", type=Path, action="append", dest="train_roots")
     parser.add_argument("--val-root", type=Path, default=RoiTrainSettings().val_root)
     parser.add_argument("--output-dir", type=Path, default=RoiTrainSettings().output_dir)
@@ -1925,6 +1928,11 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
 
 
 def main(argv: list[str] | None = None) -> None:
+    print(
+        "warning: 'train-roi' is deprecated; use 'train-presence' for presence-only training",
+        file=sys.stderr,
+        flush=True,
+    )
     metrics = run_training(parse_args(argv))
     print(json.dumps(metrics, indent=2, sort_keys=True))
 
