@@ -16,7 +16,7 @@ from tqdm import tqdm
 from .roi_presence_config import RoiPresenceTrainSettings
 from .roi_presence_dataset import RoiPresenceDataset, collate_presence_batch
 from .roi_presence_loss import presence_loss_weights, short_positive_mask_loss
-from .roi_presence_metrics import checkpoint_score
+from .roi_presence_metrics import checkpoint_rank, checkpoint_score
 from .roi_presence_model import RoiPresenceModel
 from .roi_presence_sampler import PresenceBalancedBatchSampler
 from .roi_presence_validation import validate_presence
@@ -297,7 +297,7 @@ def run_training(settings: RoiPresenceTrainSettings) -> dict[str, float]:
                 }
             )
             last_metrics["checkpoint_score"] = checkpoint_score(last_metrics)
-            checkpoint_saved = best_metrics is None or checkpoint_score(last_metrics) > checkpoint_score(best_metrics)
+            checkpoint_saved = best_metrics is None or checkpoint_rank(last_metrics) > checkpoint_rank(best_metrics)
             if checkpoint_saved:
                 best_epoch = epoch
                 best_metrics = dict(last_metrics)
@@ -332,7 +332,14 @@ def run_training(settings: RoiPresenceTrainSettings) -> dict[str, float]:
                 f"accuracy={last_metrics['presence_accuracy']:.4f} "
                 f"tp={last_metrics['presence_tp']:.0f} fp={last_metrics['presence_fp']:.0f} "
                 f"fn={last_metrics['presence_fn']:.0f} tn={last_metrics['presence_tn']:.0f}\n"
+                f"  separation: positive_min={last_metrics['presence_min_positive_score']:.6f} "
+                f"negative_max={last_metrics['presence_max_negative_score']:.6f} "
+                f"gap={last_metrics['presence_gap']:+.6f} "
+                f"auc={last_metrics['presence_roc_auc']:.6f} "
+                f"best_threshold={last_metrics['presence_best_f1_threshold']:.6f} "
+                f"zero_error={str(bool(last_metrics['presence_zero_error_threshold_exists'])).lower()}\n"
                 f"  best: epoch={best_epoch} score={last_metrics['best_checkpoint_score']:.4f} "
+                f"gap={float((best_metrics or last_metrics).get('presence_gap', 0.0)):+.6f} "
                 f"saved={str(checkpoint_saved).lower()}",
                 flush=True,
             )
@@ -360,6 +367,21 @@ def run_training(settings: RoiPresenceTrainSettings) -> dict[str, float]:
                 "presence_fp",
                 "presence_fn",
                 "presence_tn",
+                "presence_positive_score",
+                "presence_negative_score",
+                "presence_roc_auc",
+                "presence_positive_p05",
+                "presence_positive_p10",
+                "presence_positive_p50",
+                "presence_negative_p90",
+                "presence_negative_p95",
+                "presence_negative_p99",
+                "presence_min_positive_score",
+                "presence_max_negative_score",
+                "presence_gap",
+                "presence_best_f1_threshold",
+                "presence_best_f1",
+                "presence_zero_error_threshold_exists",
                 "normal_presence_f1",
                 "short_presence_f1",
                 "val_loss",

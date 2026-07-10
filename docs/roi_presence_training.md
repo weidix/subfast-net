@@ -121,7 +121,14 @@ outputs/roi_presence_run/
 - `summary.json`：最佳轮次、checkpoint 路径及验证摘要。
 - `epoch_outputs/`：每轮完整 checkpoint 和指标。
 
-最佳 checkpoint 按全局、普通字幕和短字幕三个 presence F1 的平均值选择。正式质量结论应使用独立验证集上的指标。
+每轮验证额外输出基于 sigmoid 概率的分离度：
+
+- `presence_min_positive_score`：最难正样本分数。
+- `presence_max_negative_score`：最难负样本分数。
+- `presence_gap = min_positive - max_negative`。大于 `0` 表示验证集存在零错误阈值，小于等于 `0` 表示正负分数仍有重叠。
+- `presence_roc_auc`、正负样本尾部分位数、`presence_best_f1_threshold` 和 `presence_best_f1` 用于区分整体排序质量、尾部重叠和固定 `0.5` 阈值问题。
+
+最佳 checkpoint 仍以全局、普通字幕和短字幕三个 presence F1 的平均值为首要标准；F1 相同时选择 `presence_gap` 更大的轮次。正式质量结论应使用独立验证集上的指标。
 
 ## 主要参数
 
