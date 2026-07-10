@@ -18,6 +18,7 @@ from tqdm import tqdm
 from .roi_config import RoiTrainSettings
 from .roi_dataset import RoiPresenceEmbeddingDataset, collate_roi_batch
 from .roi_loss import EmbeddingPairMemory, roi_presence_embedding_loss
+from .roi_local_alignment import pair_similarity
 from .roi_metrics import embedding_metrics, presence_metrics, similarity_percentile
 from .roi_model import RoiPresenceEmbeddingModel
 from .roi_pairs import (
@@ -606,7 +607,7 @@ def scoped_validation_metrics(
     hard_negative_scores: list[float] = []
     hard_negative_targets: list[bool] = []
     for pair in selection.pairs:
-        score = float((embedding[pair.i] * embedding[pair.j]).sum().detach().cpu())
+        score = float(pair_similarity(embedding[pair.i : pair.i + 1], embedding[pair.j : pair.j + 1])[0].detach().cpu())
         if pair.same:
             same_scores.append(score)
         if not bool(short_positive[pair.i]) and not bool(short_positive[pair.j]):
@@ -665,7 +666,7 @@ def embedding_error_pair_records(
     )
     records: list[dict[str, Any]] = []
     for pair in selection.pairs:
-        score = float((embedding[pair.i] * embedding[pair.j]).sum().detach().cpu())
+        score = float(pair_similarity(embedding[pair.i : pair.i + 1], embedding[pair.j : pair.j + 1])[0].detach().cpu())
         prediction = score >= threshold
         if prediction == pair.same:
             continue
@@ -778,6 +779,10 @@ def validate(
             embedding_tail_gamma_positive=settings.embedding_tail_gamma_positive,
             embedding_tail_gamma_negative=settings.embedding_tail_gamma_negative,
             embedding_tail_hard_negative_weight=settings.embedding_tail_hard_negative_weight,
+            embedding_extreme_gap_weight=settings.embedding_extreme_gap_weight,
+            embedding_extreme_gap_tail_ratio=settings.embedding_extreme_gap_tail_ratio,
+            embedding_extreme_gap_temperature=settings.embedding_extreme_gap_temperature,
+            embedding_extreme_gap_margin=settings.embedding_extreme_gap_margin,
         )
         batch_losses.append(torch.stack((loss.total, loss.presence_loss, loss.embedding_loss)))
         logits_all.append(presence_logit)
@@ -1038,6 +1043,10 @@ def compute_train_batch_result(
         embedding_tail_gamma_positive=settings.embedding_tail_gamma_positive,
         embedding_tail_gamma_negative=settings.embedding_tail_gamma_negative,
         embedding_tail_hard_negative_weight=settings.embedding_tail_hard_negative_weight,
+        embedding_extreme_gap_weight=settings.embedding_extreme_gap_weight,
+        embedding_extreme_gap_tail_ratio=settings.embedding_extreme_gap_tail_ratio,
+        embedding_extreme_gap_temperature=settings.embedding_extreme_gap_temperature,
+        embedding_extreme_gap_margin=settings.embedding_extreme_gap_margin,
         presence_loss_enabled=mode == "presence",
         embedding_loss_enabled=mode == "embedding",
         explicit_embedding_pairs=explicit_embedding_pairs,
@@ -1335,7 +1344,7 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                 )
             embedding_pair_memory = (
                 None
-                if phase.name == "presence"
+                if phase.name == "presence" or settings.embedding_aggregation == "local_alignment"
                 else EmbeddingPairMemory(
                     ocr_negative_max_similarity=settings.embedding_ocr_negative_max_similarity,
                     ocr_negative_ratio=settings.embedding_ocr_negative_ratio,
@@ -1756,6 +1765,10 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
     parser.add_argument("--embedding-tail-gamma-positive", type=float, default=RoiTrainSettings().embedding_tail_gamma_positive)
     parser.add_argument("--embedding-tail-gamma-negative", type=float, default=RoiTrainSettings().embedding_tail_gamma_negative)
     parser.add_argument("--embedding-tail-hard-negative-weight", type=float, default=RoiTrainSettings().embedding_tail_hard_negative_weight)
+    parser.add_argument("--embedding-extreme-gap-weight", type=float, default=RoiTrainSettings().embedding_extreme_gap_weight)
+    parser.add_argument("--embedding-extreme-gap-tail-ratio", type=float, default=RoiTrainSettings().embedding_extreme_gap_tail_ratio)
+    parser.add_argument("--embedding-extreme-gap-temperature", type=float, default=RoiTrainSettings().embedding_extreme_gap_temperature)
+    parser.add_argument("--embedding-extreme-gap-margin", type=float, default=RoiTrainSettings().embedding_extreme_gap_margin)
     parser.add_argument("--embedding-similarity-threshold", type=float, default=RoiTrainSettings().embedding_similarity_threshold)
     parser.add_argument(
         "--embedding-attention-mask-loss-weight",
@@ -1772,7 +1785,7 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
     )
     parser.add_argument(
         "--embedding-aggregation",
-        choices=("masked_global", "width_tokens"),
+        choices=("masked_global", "width_tokens", "local_alignment"),
         default=RoiTrainSettings().embedding_aggregation,
     )
     parser.add_argument("--log-interval", type=int, default=RoiTrainSettings().log_interval)
@@ -1842,6 +1855,12 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
         parser.error("--embedding-tail-hard-negative-weight must be positive")
     if args.embedding_supcon_weight < 0.0:
         parser.error("--embedding-supcon-weight must be non-negative")
+    if args.embedding_extreme_gap_weight < 0.0:
+        parser.error("--embedding-extreme-gap-weight must be non-negative")
+    if not 0.0 < args.embedding_extreme_gap_tail_ratio <= 1.0:
+        parser.error("--embedding-extreme-gap-tail-ratio must be in (0, 1]")
+    if args.embedding_extreme_gap_temperature <= 0.0:
+        parser.error("--embedding-extreme-gap-temperature must be positive")
     if args.short_positive_loss_weight <= 0.0:
         parser.error("--short-positive-loss-weight must be positive")
     if args.short_positive_mask_loss_weight < 0.0:
@@ -1889,6 +1908,10 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
         embedding_tail_gamma_positive=args.embedding_tail_gamma_positive,
         embedding_tail_gamma_negative=args.embedding_tail_gamma_negative,
         embedding_tail_hard_negative_weight=args.embedding_tail_hard_negative_weight,
+        embedding_extreme_gap_weight=args.embedding_extreme_gap_weight,
+        embedding_extreme_gap_tail_ratio=args.embedding_extreme_gap_tail_ratio,
+        embedding_extreme_gap_temperature=args.embedding_extreme_gap_temperature,
+        embedding_extreme_gap_margin=args.embedding_extreme_gap_margin,
         embedding_similarity_threshold=args.embedding_similarity_threshold,
         embedding_attention_mask_loss_weight=args.embedding_attention_mask_loss_weight,
         presence_topk_ratio=args.presence_topk_ratio,
@@ -1977,6 +2000,18 @@ def run_validation(args: argparse.Namespace) -> dict[str, float]:
         embedding_tail_gamma_negative=float(raw_settings.get("embedding_tail_gamma_negative", RoiTrainSettings().embedding_tail_gamma_negative)),
         embedding_tail_hard_negative_weight=float(
             raw_settings.get("embedding_tail_hard_negative_weight", RoiTrainSettings().embedding_tail_hard_negative_weight)
+        ),
+        embedding_extreme_gap_weight=float(
+            raw_settings.get("embedding_extreme_gap_weight", RoiTrainSettings().embedding_extreme_gap_weight)
+        ),
+        embedding_extreme_gap_tail_ratio=float(
+            raw_settings.get("embedding_extreme_gap_tail_ratio", RoiTrainSettings().embedding_extreme_gap_tail_ratio)
+        ),
+        embedding_extreme_gap_temperature=float(
+            raw_settings.get("embedding_extreme_gap_temperature", RoiTrainSettings().embedding_extreme_gap_temperature)
+        ),
+        embedding_extreme_gap_margin=float(
+            raw_settings.get("embedding_extreme_gap_margin", RoiTrainSettings().embedding_extreme_gap_margin)
         ),
         embedding_similarity_threshold=args.embedding_similarity_threshold,
         width=int(raw_settings.get("width", RoiTrainSettings().width)),

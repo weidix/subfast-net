@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 
+from .roi_local_alignment import pair_similarity
 from .roi_pairs import select_embedding_pairs
 
 
@@ -152,7 +153,7 @@ def embedding_metrics(
     false_negative = 0
     total = 0
     for pair in selection.pairs:
-        score = float((embedding[pair.i] * embedding[pair.j]).sum().detach().cpu())
+        score = float(pair_similarity(embedding[pair.i : pair.i + 1], embedding[pair.j : pair.j + 1])[0].detach().cpu())
         prediction = score >= threshold
         if pair.same:
             same_values.append(score)

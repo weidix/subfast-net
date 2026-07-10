@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 from torch.nn import functional as F
 
+from .roi_local_alignment import extreme_gap_loss, pair_similarity
 from .roi_pairs import (
     EmbeddingPair,
     EmbeddingPairSelection,
@@ -241,6 +242,10 @@ def supervised_contrastive_embedding_loss(
         return embedding.sum() * 0.0
     index_tensor = torch.tensor(positive_indices, dtype=torch.long, device=embedding.device)
     scoped_embedding = embedding[index_tensor]
+    if scoped_embedding.ndim == 3:
+        valid = scoped_embedding.square().sum(dim=-1) > 0.0
+        scoped_embedding = scoped_embedding.sum(dim=1) / valid.sum(dim=1, keepdim=True).clamp_min(1)
+        scoped_embedding = F.normalize(scoped_embedding, p=2, dim=-1)
     labels = [(roots[index], segment_ids[index]) for index in positive_indices]
     label_equal = [
         [left == right for right in labels]
@@ -281,6 +286,10 @@ def metric_embedding_loss(
     embedding_tail_gamma_positive: float = 20.0,
     embedding_tail_gamma_negative: float = 40.0,
     embedding_tail_hard_negative_weight: float = 2.0,
+    embedding_extreme_gap_weight: float = 0.0,
+    embedding_extreme_gap_tail_ratio: float = 0.10,
+    embedding_extreme_gap_temperature: float = 0.05,
+    embedding_extreme_gap_margin: float = 0.15,
     explicit_pairs: Sequence[EmbeddingPair] | None = None,
 ) -> tuple[torch.Tensor, int, int, int, int, int, int, int, int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
     if explicit_pairs is None:
@@ -320,7 +329,7 @@ def metric_embedding_loss(
     left = torch.tensor([pair.i for pair in selection.pairs], dtype=torch.long, device=embedding.device)
     right = torch.tensor([pair.j for pair in selection.pairs], dtype=torch.long, device=embedding.device)
     targets = torch.tensor([1.0 if pair.same else 0.0 for pair in selection.pairs], dtype=embedding.dtype, device=embedding.device)
-    similarities = (embedding[left] * embedding[right]).sum(dim=1)
+    similarities = pair_similarity(embedding[left], embedding[right])
     if explicit_pairs is None:
         balanced = balance_embedding_pairs(similarities, targets, negative_ratio=embedding_negative_ratio)
         selected_similarities = similarities[balanced.indices]
@@ -362,7 +371,19 @@ def metric_embedding_loss(
             temperature=temperature,
         )
     )
-    embedding_loss = margin_loss + positive_consistency_beta * consistency_loss + embedding_supcon_weight * supcon_loss
+    gap_loss = extreme_gap_loss(
+        selected_similarities,
+        selected_targets,
+        tail_ratio=embedding_extreme_gap_tail_ratio,
+        temperature=embedding_extreme_gap_temperature,
+        margin=embedding_extreme_gap_margin,
+    )
+    embedding_loss = (
+        margin_loss
+        + positive_consistency_beta * consistency_loss
+        + embedding_supcon_weight * supcon_loss
+        + embedding_extreme_gap_weight * gap_loss
+    )
     return (
         embedding_loss,
         int(selected_similarities.numel()),
@@ -404,6 +425,10 @@ def roi_presence_embedding_loss(
     embedding_tail_gamma_positive: float = 20.0,
     embedding_tail_gamma_negative: float = 40.0,
     embedding_tail_hard_negative_weight: float = 2.0,
+    embedding_extreme_gap_weight: float = 0.0,
+    embedding_extreme_gap_tail_ratio: float = 0.10,
+    embedding_extreme_gap_temperature: float = 0.05,
+    embedding_extreme_gap_margin: float = 0.15,
     presence_loss_enabled: bool = True,
     embedding_loss_enabled: bool = True,
     explicit_embedding_pairs: Sequence[EmbeddingPair] | None = None,
@@ -448,6 +473,10 @@ def roi_presence_embedding_loss(
             embedding_tail_gamma_positive=embedding_tail_gamma_positive,
             embedding_tail_gamma_negative=embedding_tail_gamma_negative,
             embedding_tail_hard_negative_weight=embedding_tail_hard_negative_weight,
+            embedding_extreme_gap_weight=embedding_extreme_gap_weight,
+            embedding_extreme_gap_tail_ratio=embedding_extreme_gap_tail_ratio,
+            embedding_extreme_gap_temperature=embedding_extreme_gap_temperature,
+            embedding_extreme_gap_margin=embedding_extreme_gap_margin,
             explicit_pairs=explicit_embedding_pairs,
         )
     else:

@@ -186,6 +186,13 @@ class RoiPresenceEmbeddingModel(nn.Module):
             )
         elif embedding_aggregation == "masked_global":
             self.embedding_head = MaskedGlobalEmbeddingHead(feature_dim, embedding_dim)
+        elif embedding_aggregation == "local_alignment":
+            from .roi_local_alignment import LocalAlignmentEmbeddingHead
+
+            self.embedding_head = LocalAlignmentEmbeddingHead(
+                feature_dim,
+                width_tokens=embedding_width_tokens,
+            )
         else:
             raise ValueError(f"unsupported embedding aggregation: {embedding_aggregation}")
 
@@ -206,12 +213,16 @@ class RoiPresenceEmbeddingModel(nn.Module):
 
     def forward_embedding_with_attention(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         embedding, attention_logits = self.embedding_head(self.encode_map(images))
+        if embedding.ndim == 3:
+            return embedding, attention_logits
         return F.normalize(embedding, p=2, dim=1), attention_logits
 
     def forward(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         feature_map = self.encode_map(images)
         presence_logit = self.presence_head(self.presence_contrast(feature_map))
         embedding, _ = self.embedding_head(feature_map)
+        if embedding.ndim == 3:
+            return presence_logit, embedding
         return presence_logit, F.normalize(embedding, p=2, dim=1)
 
     def forward_with_presence_map(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -222,4 +233,6 @@ class RoiPresenceEmbeddingModel(nn.Module):
         k = max(1, int(presence_logit.shape[1] * self.presence_head.topk_ratio + 0.999999))
         presence_logit = presence_logit.topk(k, dim=1).values.mean(dim=1)
         embedding, _ = self.embedding_head(feature_map)
+        if embedding.ndim == 3:
+            return presence_logit, embedding, textness_map
         return presence_logit, F.normalize(embedding, p=2, dim=1), textness_map
