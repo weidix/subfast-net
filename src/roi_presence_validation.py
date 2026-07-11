@@ -26,7 +26,7 @@ from .roi_presence_metrics import (
     segment_presence_metrics,
     text_distractor_metrics,
 )
-from .roi_presence_model import RoiPresenceModel
+from .roi_presence_model import RoiPresenceModel, resize_valid_mask
 
 
 def load_previous_scores(path: Path | None) -> dict[str, float]:
@@ -174,9 +174,7 @@ def validate_presence(
             region_logits.shape[-2:],
             valid_masks,
         )
-        valid_region = (
-            F.interpolate(valid_masks, size=region_logits.shape[-2:], mode="area") > 0.5
-        ).to(region_logits.dtype)
+        valid_region = resize_valid_mask(valid_masks, region_logits.shape[-2:]).to(region_logits.dtype)
         candidates = resize_candidate_masks(subtitle_masks, region_logits.shape[-2:]) * valid_region
         logits_all.append(logits.cpu())
         presence_all.append(presence.cpu())

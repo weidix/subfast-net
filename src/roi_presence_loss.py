@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import torch
 from torch.nn import functional as F
 
+from .roi_presence_model import resize_valid_mask
+
 _SHORT_SUBTITLE_MAX_CHARS = 2
 
 
@@ -68,8 +70,7 @@ def subtitle_region_targets(
     candidates = resize_candidate_masks(subtitle_masks, size)
     target = candidates * (presence > 0.5).to(candidates.dtype).view(-1, 1, 1, 1)
     if valid_masks is not None:
-        valid = F.interpolate(valid_masks, size=size, mode="area") > 0.5
-        target = target * valid.to(target.dtype)
+        target = target * resize_valid_mask(valid_masks, size).to(target.dtype)
     return target
 
 
@@ -160,9 +161,7 @@ def subtitle_region_loss(
 ) -> RegionLoss:
     candidate_masks = resize_candidate_masks(subtitle_masks, region_logits.shape[-2:])
     valid_mask = (
-        (F.interpolate(valid_masks, size=region_logits.shape[-2:], mode="area") > 0.5).to(
-            region_logits.dtype
-        )
+        resize_valid_mask(valid_masks, region_logits.shape[-2:]).to(region_logits.dtype)
         if valid_masks is not None
         else torch.ones_like(candidate_masks)
     )

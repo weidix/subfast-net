@@ -38,6 +38,40 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
 
 
+def synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps" and hasattr(torch, "mps"):
+        torch.mps.synchronize()
+
+
+@torch.inference_mode()
+def measure_presence_latency(
+    model: RoiPresenceModel,
+    images: torch.Tensor,
+    valid_masks: torch.Tensor,
+    device: torch.device,
+    *,
+    warmup: int = 40,
+    iterations: int = 500,
+) -> tuple[float, float]:
+    """Measure warm batch-1 forward latency with inputs already on the device."""
+    model.eval()
+    image = images[:1].to(device=device, dtype=torch.float32)
+    valid_mask = valid_masks[:1].to(device=device, dtype=torch.float32)
+    for _ in range(warmup):
+        model(image, valid_mask)
+    synchronize_device(device)
+    timings: list[float] = []
+    for _ in range(iterations):
+        start = time.perf_counter_ns()
+        model(image, valid_mask)
+        synchronize_device(device)
+        timings.append((time.perf_counter_ns() - start) / 1_000_000.0)
+    timings.sort()
+    return timings[len(timings) // 2], timings[min(len(timings) - 1, int(len(timings) * 0.90))]
+
+
 def parse_roi_size(value: str) -> tuple[int, int]:
     parts = value.lower().split("x")
     if len(parts) != 2:
@@ -123,6 +157,37 @@ def resolve_resume_checkpoint(path: Path) -> Path:
     raise FileNotFoundError(f"resume checkpoint not found: {path}")
 
 
+def load_presence_inference_checkpoint(
+    path: Path,
+    device: torch.device,
+) -> tuple[RoiPresenceModel, dict[str, Any]]:
+    if path.is_dir():
+        inference_path = path / "best_inference.pt"
+        path = inference_path if inference_path.is_file() else resolve_resume_checkpoint(path)
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    if not isinstance(checkpoint, dict) or checkpoint.get("model_type") != "roi_presence":
+        raise RuntimeError(f"invalid ROI Presence checkpoint: {path}")
+    defaults = RoiPresenceTrainSettings()
+    raw_settings = dict(checkpoint.get("settings") or {})
+    version = int(checkpoint.get("architecture_version", 1))
+    if version != RoiPresenceModel.architecture_version:
+        raise RuntimeError(
+            f"ROI Presence architecture mismatch: checkpoint=v{version} "
+            f"runtime=v{RoiPresenceModel.architecture_version}"
+        )
+    model = RoiPresenceModel(
+        width=int(checkpoint.get("width", raw_settings.get("width", defaults.width))),
+        evidence_kernel_size=int(
+            checkpoint.get(
+                "evidence_kernel_size",
+                raw_settings.get("evidence_kernel_size", defaults.evidence_kernel_size),
+            )
+        ),
+    ).to(device)
+    model.load_state_dict(checkpoint["model"])
+    return model.eval(), checkpoint
+
+
 def checkpoint_payload(
     settings: RoiPresenceTrainSettings,
     model: RoiPresenceModel,
@@ -179,7 +244,6 @@ def inference_payload(
         "resize_mode": settings.resize_mode,
         "width": settings.width,
         "evidence_kernel_size": settings.evidence_kernel_size,
-        "evidence_temperature": settings.evidence_temperature,
         "decision_threshold": settings.decision_threshold,
         "epoch": epoch,
         "metrics": metrics,
@@ -230,7 +294,6 @@ def run_training(settings: RoiPresenceTrainSettings) -> dict[str, float]:
     model = RoiPresenceModel(
         width=settings.width,
         evidence_kernel_size=settings.evidence_kernel_size,
-        evidence_temperature=settings.evidence_temperature,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -251,10 +314,10 @@ def run_training(settings: RoiPresenceTrainSettings) -> dict[str, float]:
         if checkpoint_version != model.architecture_version:
             raise RuntimeError(
                 f"ROI Presence architecture mismatch: checkpoint=v{checkpoint_version} "
-                f"trainer=v{model.architecture_version}; V1 BatchNorm/top-k checkpoints cannot resume V2 training"
+                f"trainer=v{model.architecture_version}; checkpoints from older architectures cannot resume V3 training"
             )
         checkpoint_settings = checkpoint.get("settings") or {}
-        for name in ("resize_roi", "resize_mode", "evidence_kernel_size", "evidence_temperature", "width"):
+        for name in ("resize_roi", "resize_mode", "evidence_kernel_size", "width"):
             current = settings.model_dump(mode="json").get(name)
             previous = checkpoint_settings.get(name)
             if previous != current:
@@ -287,13 +350,13 @@ def run_training(settings: RoiPresenceTrainSettings) -> dict[str, float]:
     print(format_dataset_summary("val", val_dataset), flush=True)
     if train_dataset.positive_without_region or val_dataset.positive_without_region:
         raise RuntimeError(
-            "V2 dense supervision requires a region label for every positive sample: "
+            "V3 dense supervision requires a region label for every positive sample: "
             f"train_missing={train_dataset.positive_without_region} "
             f"val_missing={val_dataset.positive_without_region}"
         )
     if train_dataset.positive_without_donor or val_dataset.positive_without_donor:
         raise RuntimeError(
-            "V2 counterfactual supervision requires at least one empty ROI donor: "
+            "V3 counterfactual supervision requires at least one empty ROI donor: "
             f"train_missing={train_dataset.positive_without_donor} "
             f"val_missing={val_dataset.positive_without_donor}"
         )
@@ -351,7 +414,7 @@ def run_training(settings: RoiPresenceTrainSettings) -> dict[str, float]:
                 valid_masks = batch.valid_masks.to(device)
                 donor_available = batch.donor_available.to(device)
                 if batch.subtitle_masks is None:
-                    raise RuntimeError("ROI Presence V2 training requires subtitle masks")
+                    raise RuntimeError("ROI Presence V3 training requires subtitle masks")
                 subtitle_masks = batch.subtitle_masks.to(device)
                 optimizer.zero_grad(set_to_none=True)
                 logits, region_logits = model.forward_with_presence_map(images, valid_masks)
@@ -560,7 +623,54 @@ def run_training(settings: RoiPresenceTrainSettings) -> dict[str, float]:
                 f"seconds={last_metrics['epoch_seconds']:.2f} best_epoch={best_epoch}",
                 flush=True,
             )
-    best = best_metrics or last_metrics
+    latency_batch = next(iter(val_loader))
+    best_latency_model, _ = load_presence_inference_checkpoint(
+        settings.output_dir / "best_inference.pt",
+        device,
+    )
+    latency_median, latency_p90 = measure_presence_latency(
+        best_latency_model,
+        latency_batch.images,
+        latency_batch.valid_masks,
+        device,
+    )
+    latency_metrics = {
+        "presence_forward_median_ms": latency_median,
+        "presence_forward_p90_ms": latency_p90,
+        "presence_forward_target_ms": 0.5,
+        "presence_forward_target_met": float(latency_median <= 0.5),
+    }
+    last_metrics.update(latency_metrics)
+    for checkpoint_name in ("best.pt", "best_inference.pt", "last.pt"):
+        checkpoint_path = settings.output_dir / checkpoint_name
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        checkpoint["metrics"] = {**dict(checkpoint.get("metrics") or {}), **latency_metrics}
+        if checkpoint.get("best_metrics") is not None:
+            checkpoint["best_metrics"] = {
+                **dict(checkpoint.get("best_metrics") or {}),
+                **latency_metrics,
+            }
+        torch.save(checkpoint, checkpoint_path)
+    with metrics_path.open("a", encoding="utf-8") as metrics_file:
+        metrics_file.write(
+            json.dumps(
+                {
+                    "record_type": "presence_inference_benchmark",
+                    **latency_metrics,
+                    "device": str(device),
+                    "torch_version": str(torch.__version__),
+                    "dtype": "float32",
+                    "batch_size": 1,
+                    "input_height": int(latency_batch.images.shape[-2]),
+                    "input_width": int(latency_batch.images.shape[-1]),
+                    "warmup": 40,
+                    "iterations": 500,
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+    best = {**(best_metrics or last_metrics), **latency_metrics}
     summary = {
         "record_type": "presence_training_summary",
         "completed_epoch": end_epoch,
@@ -638,7 +748,23 @@ def run_training(settings: RoiPresenceTrainSettings) -> dict[str, float]:
                 "text_distractor_fpr",
                 "subtitle_specificity_evaluable",
                 "val_loss",
+                "presence_forward_median_ms",
+                "presence_forward_p90_ms",
+                "presence_forward_target_ms",
+                "presence_forward_target_met",
             )
+        },
+        "inference_benchmark": {
+            "scope": "forward_only_explicit_valid_mask",
+            "device": str(device),
+            "torch_version": str(torch.__version__),
+            "dtype": "float32",
+            "batch_size": 1,
+            "input_height": int(latency_batch.images.shape[-2]),
+            "input_width": int(latency_batch.images.shape[-1]),
+            "warmup": 40,
+            "iterations": 500,
+            "target_median_ms": 0.5,
         },
         "data": {
             "train_samples": float(best.get("train_samples", 0.0)),
@@ -722,7 +848,6 @@ def parse_args(argv: list[str] | None = None) -> RoiPresenceTrainSettings:
     )
     parser.add_argument("--counterfactual-margin", type=float, default=defaults.counterfactual_margin)
     parser.add_argument("--evidence-kernel-size", type=int, default=defaults.evidence_kernel_size)
-    parser.add_argument("--evidence-temperature", type=float, default=defaults.evidence_temperature)
     parser.add_argument("--decision-threshold", type=float, default=defaults.decision_threshold)
     parser.add_argument("--require-text-distractor-negatives", action="store_true")
     parser.add_argument("--width", type=int, default=defaults.width)
@@ -772,8 +897,6 @@ def parse_args(argv: list[str] | None = None) -> RoiPresenceTrainSettings:
             parser.error(f"{name} must be non-negative")
     if args.evidence_kernel_size <= 1 or args.evidence_kernel_size % 2 == 0:
         parser.error("--evidence-kernel-size must be an odd integer greater than 1")
-    if args.evidence_temperature <= 0.0:
-        parser.error("--evidence-temperature must be positive")
     if args.score_positive_prior is not None and not 0.0 < args.score_positive_prior < 1.0:
         parser.error("--score-positive-prior must be in (0, 1)")
     if not 0.0 < args.decision_threshold < 1.0:
@@ -808,7 +931,6 @@ def parse_args(argv: list[str] | None = None) -> RoiPresenceTrainSettings:
         counterfactual_loss_weight=args.counterfactual_loss_weight,
         counterfactual_margin=args.counterfactual_margin,
         evidence_kernel_size=args.evidence_kernel_size,
-        evidence_temperature=args.evidence_temperature,
         decision_threshold=args.decision_threshold,
         require_text_distractor_negatives=args.require_text_distractor_negatives,
         width=args.width,
@@ -818,6 +940,74 @@ def parse_args(argv: list[str] | None = None) -> RoiPresenceTrainSettings:
     )
 
 
+def parse_benchmark_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Benchmark ROI Presence batch-1 forward latency.")
+    parser.add_argument("checkpoint", type=Path, nargs="?")
+    parser.add_argument("--resize-roi", type=parse_roi_size)
+    parser.add_argument("--warmup", type=int, default=40)
+    parser.add_argument("--iterations", type=int, default=500)
+    parser.add_argument("--device", default="mps")
+    args = parser.parse_args(argv)
+    if args.warmup < 0:
+        parser.error("--warmup must be non-negative")
+    if args.iterations <= 0:
+        parser.error("--iterations must be positive")
+    return args
+
+
+def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+    device = choose_device(args.device)
+    checkpoint: dict[str, Any] = {}
+    if args.checkpoint is None:
+        model = RoiPresenceModel().to(device).eval()
+    else:
+        model, checkpoint = load_presence_inference_checkpoint(args.checkpoint, device)
+    raw_settings = dict(checkpoint.get("settings") or {})
+    resize_roi = tuple(
+        args.resize_roi
+        or checkpoint.get("resize_roi")
+        or raw_settings.get("resize_roi")
+        or (512, 64)
+    )
+    width, height = int(resize_roi[0]), int(resize_roi[1])
+    generator = torch.Generator().manual_seed(2026)
+    images = torch.randn((1, 3, height, width), generator=generator)
+    valid_masks = torch.ones((1, 1, height, width), dtype=torch.float32)
+    median_ms, p90_ms = measure_presence_latency(
+        model,
+        images,
+        valid_masks,
+        device,
+        warmup=args.warmup,
+        iterations=args.iterations,
+    )
+    metrics: dict[str, Any] = {
+        "record_type": "presence_inference_benchmark",
+        "checkpoint": str(args.checkpoint) if args.checkpoint is not None else None,
+        "architecture_version": model.architecture_version,
+        "model_parameters": sum(parameter.numel() for parameter in model.parameters()),
+        "presence_forward_median_ms": median_ms,
+        "presence_forward_p90_ms": p90_ms,
+        "target_median_ms": 0.5,
+        "target_met": median_ms <= 0.5,
+        "scope": "forward_only_explicit_valid_mask",
+        "device": str(device),
+        "torch_version": str(torch.__version__),
+        "dtype": "float32",
+        "batch_size": 1,
+        "input_height": height,
+        "input_width": width,
+        "warmup": args.warmup,
+        "iterations": args.iterations,
+    }
+    print(json.dumps(metrics, indent=2, ensure_ascii=False, sort_keys=True))
+    return metrics
+
+
 def main(argv: list[str] | None = None) -> None:
     metrics = run_training(parse_args(argv))
     print(json.dumps(metrics, indent=2, sort_keys=True))
+
+
+def main_benchmark(argv: list[str] | None = None) -> None:
+    run_benchmark(parse_benchmark_args(argv))

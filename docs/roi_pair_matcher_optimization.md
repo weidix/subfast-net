@@ -5,7 +5,7 @@
 - 历史基线：`outputs/roi_embedding_full_batch128_mask_loss` epoch 150，`fp=12`、`fn=2`、`embedding_gap=-0.491129`。
 - 历史 width-token：`outputs/roi_embedding_width_tokens_trial_dim256_run2` epoch 34，`fp=4`、`fn=0`、`embedding_gap=-0.128940`。
 - 新主线：独立 `RoiPairMatcher`，直接输入两个 ROI 并输出同字幕概率，不再生成全局 embedding。
-- 当前最佳：`outputs/roi_pair_matcher_seed2028` epoch 3，固定阈值 `0.5` 下 `fp=0`、`fn=0`、`pair_gap=+0.952548`。
+- 当前仓库 checkpoint：`outputs/roi_pair_matcher` epoch 3，固定阈值 `0.5` 下 `fp=0`、`fn=0`、`pair_gap=+0.956748`。
 - 目标已经在当前 `roi_validation_samples` 上达到；额外 leave-one-video-out 检查仍有 9 个 FN，因此跨视频零错误门槛尚未达到。
 
 ## 当前推荐方案：Direct Pair Matcher
@@ -24,7 +24,7 @@ flowchart LR
     C2 --> D
     C3 --> D
     D --> E["字幕区域 mask 辅助监督"]
-    E --> F["mean + peak + width-tail pooling"]
+    E --> F["mean + peak + width-peak pooling"]
     F --> G["same-subtitle logit"]
 ```
 
@@ -32,10 +32,23 @@ flowchart LR
 
 - `score(A, B) == score(B, A)` 由输入算子保证，不依赖交换增强近似实现。
 - 原始差异保留单字变化；局部高频差异抑制平滑背景变化；共同外观让网络定位字幕而不是只看变化强度。
-- 宽度方向只下采样到 64，使用 width-tail pooling 保留单个字符的局部最坏证据。
+- 宽度方向只下采样到 64，使用 width-peak pooling 保留单个字符的局部最坏证据。
 - 全模型端到端训练，不再冻结随机初始化 backbone。
 - 主损失为 balanced `BCEWithLogits`，加 batch 内最难 10% 正负对的 tail-gap loss，以及字幕区域 mask 辅助损失。
-- 模型只输出一个概率，不输出 128/256 维向量或 `[32,64]` token，因此没有 descriptor 存储和二次 MaxSim 成本。
+- 优化后的部署 runtime 只输出一个 same-subtitle logit，不输出辅助 mask、128/256 维向量或 `[32,64]` token，因此没有 descriptor 存储和二次 MaxSim 成本。
+
+### MPS 推理优化
+
+部署路径不修改训练 checkpoint：先把 8 组 Conv-BatchNorm 数学等价地融合到卷积权重，再用实际 batch-1 输入建立 TorchScript trace。width 证据从 Top-K 均值改为最大响应，移除了 MPS 上最慢的排序算子。
+
+固定口径为 Apple M4、PyTorch 2.12.1、FP32、batch 1、两个 `256×64` tensor 已在 MPS、40 次 warmup、每次 forward 后同步。5 轮各 500 次结果为：
+
+| 指标 | 优化前 | 优化后 |
+|---|---:|---:|
+| MPS median | `1.16 ms` | `0.561–0.572 ms` |
+| MPS P90 | `1.79 ms` | `0.669–0.701 ms` |
+
+当前产物刷新时的独立复测为 median `0.560 ms`、P90 `0.661 ms`。计时仅包含 forward，输入和输出均留在 MPS；不包含 I/O、resize、设备传输、sigmoid、阈值或 CPU 读取。现有 checkpoint 在改用 width-peak 后完整验证仍为 `2,724/2,724` 正确，`min positive=0.986498`、`max negative=0.029750`。
 
 设计依据来自直接 patch comparison、轻量变化检测和真实设备延迟原则：
 
@@ -168,20 +181,19 @@ masked-global 能够区分“不要”与“不是”：上述 4 个负对的 co
 
 ## 工程成本对比
 
-### 当前同条件复测
+### 历史运行时参考（条件不完全相同）
 
 真实 checkpoint、预加载并归一化的两个 `256×64` ROI、Apple Silicon、PyTorch 2.12.1。Direct Pair
-数字是在将两个等价背景池线性合并为一个之后重新写入 `summary.json` 的复测值：
+表中的 Direct Pair MPS 数字使用 width-peak、Conv-BN 融合和 traced 部署图；其他列及 CPU 数字保留历史普通 eval 路径，因此只作量级参考，不用于纯架构同比：
 
-| 完整判断 | width-token epoch 34 | local-alignment epoch 11 | Direct Pair seed 2028 |
+| forward-only | width-token epoch 34 | local-alignment epoch 11 | Direct Pair seed 2028 |
 |---|---:|---:|---:|
-| MPS median | 1.609 ms | 3.390 ms | **1.209 ms** |
-| MPS P90 | 2.877 ms | 5.129 ms | **1.332 ms** |
+| MPS median | 1.609 ms | 3.390 ms | **0.560 ms** |
+| MPS P90 | 2.877 ms | 5.129 ms | **0.661 ms** |
 | CPU median | 5.756 ms | 5.804 ms | **1.132 ms** |
 | full-data epoch median / best epoch | 81.75 s | 97.43 s | **49.52 s** |
 
-Direct Pair 比 width-token 的 MPS 中位延迟低约 25%，比 local-alignment 低约 64%；CPU 比两者低约 80%。
-它直接完成一对 ROI 的判断，因此没有“先保存 descriptor、再运行比较器”的额外阶段。
+Direct Pair 的部署路径直接完成一对 ROI 的 forward，因此没有“先保存 descriptor、再运行比较器”的额外阶段。
 
 ### 历史 Width-token 与 Local-alignment 推理耗时
 
@@ -348,7 +360,7 @@ flowchart TD
 
 | 级别 | 问题 | 性质 | 当前结论 |
 |---|---|---|---|
-| P0 | global pooling 消除横向位置关系 | 事实 | Direct Pair 保留 64 个宽度位置，并使用局部 width-tail 证据。 |
+| P0 | global pooling 消除横向位置关系 | 事实 | Direct Pair 保留 64 个宽度位置，并使用局部 width-peak 证据。 |
 | P0 | attention 只用区域 mask 监督，不监督字符身份 | 事实 | Direct Pair 的 mask 只是辅助项，主 BCE/tail-gap 直接监督两个 ROI 是否同字幕。 |
 | P0 | 最终只对单向量 cosine similarity 施加 margin | 事实 | Direct Pair 删除独立单向量和固定 cosine，直接学习 pair logit。 |
 | P0 | best checkpoint 按平均 embedding accuracy 选择 | 事实 | Direct Pair 按实际部署的固定阈值错误总数、FP 和 gap 排序；local epoch 15 的历史问题在文档中单独保留。 |
@@ -372,6 +384,6 @@ Direct Pair 的结果说明“独立 descriptor + 固定相似度”是主要结
 ## 验收与停止规则
 
 - checkpoint 排序：先最小化固定 `0.5` 阈值的 `FP+FN`，错误数相同时优先更少 FP，再优先 `pair_gap>0`，最后最大化 gap；排序与导出的固定阈值一致。
-- 当前验证硬门槛：固定 `0.5` 下 `FP=0、FN=0`、`pair_gap>0`、MPS median `<2 ms`、模型 `<200k` 参数。
-- 稳定性门槛：至少三个 seed 通过；当前 2026、2027、2028 均已通过。
+- 当前验证硬门槛：固定 `0.5` 下 `FP=0、FN=0`、`pair_gap>0`、MPS median `<=0.8 ms`、模型 `<200k` 参数。
+- 质量稳定性门槛：2026、2027、2028 三个 seed 均已通过固定阈值质量门槛；新的 `<=0.8 ms` 部署延迟目前只对当前仓库 checkpoint 完成复测，不能用表中的历史普通 eval 数字声称三个 seed 都已通过延迟门槛。
 - 泛化门槛：额外 leave-one-video-out 的 `roi_samples2` 仍有 9 FN，尚未通过。本文“最佳”只表示当前仓库正式 held-out 数据上的已验证 Pareto 最优，不能外推成所有视频的零错误保证。

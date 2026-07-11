@@ -15,7 +15,7 @@ from tqdm import tqdm
 from .roi_dataset import RoiPresenceEmbeddingDataset, collate_roi_batch
 from .roi_pair_config import RoiPairTrainSettings
 from .roi_pair_metrics import pair_score_metrics
-from .roi_pair_model import RoiPairMatcher
+from .roi_pair_model import RoiPairMatcher, trace_pair_matcher_for_inference
 from .roi_pairs import (
     EmbeddingPairSelection,
     ScheduledEmbeddingBatch,
@@ -247,6 +247,7 @@ def checkpoint_payload(
 ) -> dict[str, Any]:
     return {
         "model_type": "roi_pair_matcher",
+        "pooling_version": model.pooling_version,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "settings": settings.model_dump(mode="json"),
@@ -267,6 +268,7 @@ def inference_payload(
 ) -> dict[str, Any]:
     return {
         "model_type": "roi_pair_matcher",
+        "pooling_version": model.pooling_version,
         "model": model.state_dict(),
         "resize_roi": list(settings.resize_roi),
         "threshold": settings.threshold,
@@ -330,6 +332,18 @@ def write_summary(
         "model_parameters": model_parameter_count(model),
         "best_checkpoint_bytes": best_path.stat().st_size if best_path.exists() else 0,
         "best_inference_checkpoint_bytes": inference_path.stat().st_size if inference_path.exists() else 0,
+        "inference_benchmark": {
+            "scope": "conv_bn_fused_traced_forward_only",
+            "device": str(next(model.parameters()).device),
+            "torch_version": str(torch.__version__),
+            "dtype": "float32",
+            "batch_size": 1,
+            "input_height": settings.resize_roi[1],
+            "input_width": settings.resize_roi[0],
+            "warmup": 40,
+            "iterations": 500,
+            "target_median_ms": 0.8,
+        },
         "validation": best_metrics,
     }
     (settings.output_dir / "summary.json").write_text(
@@ -357,6 +371,24 @@ def load_pair_checkpoint(
     return model, checkpoint
 
 
+def load_pair_inference_checkpoint(
+    path: Path,
+    device: torch.device,
+) -> tuple[torch.jit.ScriptModule, dict[str, Any]]:
+    """Load the portable weights and prepare the optimized runtime on the target device."""
+    model, checkpoint = load_pair_checkpoint(path, device)
+    raw_settings = dict(checkpoint.get("settings") or {})
+    resize_roi = tuple(
+        checkpoint.get("resize_roi")
+        or raw_settings.get("resize_roi")
+        or RoiPairTrainSettings().resize_roi
+    )
+    width, height = int(resize_roi[0]), int(resize_roi[1])
+    left = torch.zeros((1, 3, height, width), dtype=torch.float32, device=device)
+    right = torch.zeros_like(left)
+    return trace_pair_matcher_for_inference(model, left, right), checkpoint
+
+
 @torch.inference_mode()
 def measure_pair_latency(
     model: RoiPairMatcher,
@@ -364,19 +396,20 @@ def measure_pair_latency(
     right: torch.Tensor,
     device: torch.device,
     *,
-    warmup: int = 20,
-    iterations: int = 100,
+    warmup: int = 40,
+    iterations: int = 500,
 ) -> tuple[float, float]:
     model.eval()
     left = left[:1].to(device=device, dtype=torch.float32)
     right = right[:1].to(device=device, dtype=torch.float32)
+    inference_model = trace_pair_matcher_for_inference(model, left, right)
     for _ in range(warmup):
-        model(left, right)
+        inference_model(left, right)
     synchronize_device(device)
     timings: list[float] = []
     for _ in range(iterations):
         start = time.perf_counter()
-        model(left, right)
+        inference_model(left, right)
         synchronize_device(device)
         timings.append((time.perf_counter() - start) * 1000.0)
     timings.sort()
@@ -438,6 +471,7 @@ def run_training(settings: RoiPairTrainSettings) -> dict[str, float]:
     step = 0
     best_epoch = 0
     best_metrics: dict[str, float] = {}
+    resume_requires_rerank = False
     if settings.resume is not None:
         loaded_model, checkpoint = load_pair_checkpoint(settings.resume, device)
         model.load_state_dict(loaded_model.state_dict())
@@ -445,32 +479,61 @@ def run_training(settings: RoiPairTrainSettings) -> dict[str, float]:
         step = int(checkpoint.get("step", 0))
         best_epoch = int(checkpoint.get("best_epoch", checkpoint.get("epoch", 0)))
         best_metrics = dict(checkpoint.get("best_metrics") or checkpoint.get("metrics") or {})
+        resume_requires_rerank = int(checkpoint.get("pooling_version", 1)) != model.pooling_version
+        if resume_requires_rerank:
+            best_metrics = {}
         if checkpoint.get("optimizer") is not None:
             optimizer.load_state_dict(checkpoint["optimizer"])
         print(f"resumed={settings.resume} start_epoch={start_epoch}", flush=True)
     best_rank = checkpoint_rank(best_metrics) if best_metrics else None
     metrics_path = settings.output_dir / "metrics.jsonl"
-    if settings.resume is not None and not (settings.output_dir / "best.pt").exists():
-        current_validation, current_scores = validate_pair_model(model, val_images, val_selection, device, settings)
-        current_metrics = {**dict(checkpoint.get("metrics") or {}), **current_validation}
-        best_epoch = int(checkpoint.get("epoch", start_epoch - 1))
+    local_best_path = settings.output_dir / "best.pt"
+    if settings.resume is not None and (resume_requires_rerank or not local_best_path.exists()):
+        if local_best_path.exists():
+            candidate_model, candidate_checkpoint = load_pair_checkpoint(local_best_path, device)
+        else:
+            candidate_model, candidate_checkpoint = model, checkpoint
+        current_validation, current_scores = validate_pair_model(
+            candidate_model,
+            val_images,
+            val_selection,
+            device,
+            settings,
+        )
+        current_metrics = {
+            **dict(candidate_checkpoint.get("metrics") or {}),
+            **current_validation,
+        }
+        best_epoch = int(candidate_checkpoint.get("epoch", start_epoch - 1))
         best_metrics = current_metrics
         best_rank = checkpoint_rank(best_metrics)
+        if local_best_path.exists():
+            refreshed_checkpoint = dict(candidate_checkpoint)
+            refreshed_checkpoint.update(
+                {
+                    "pooling_version": candidate_model.pooling_version,
+                    "metrics": best_metrics,
+                    "best_epoch": best_epoch,
+                    "best_metrics": best_metrics,
+                }
+            )
+            torch.save(refreshed_checkpoint, local_best_path)
+        else:
+            torch.save(
+                checkpoint_payload(
+                    settings,
+                    candidate_model,
+                    optimizer,
+                    epoch=best_epoch,
+                    step=step,
+                    metrics=best_metrics,
+                    best_epoch=best_epoch,
+                    best_metrics=best_metrics,
+                ),
+                local_best_path,
+            )
         torch.save(
-            checkpoint_payload(
-                settings,
-                model,
-                optimizer,
-                epoch=best_epoch,
-                step=step,
-                metrics=best_metrics,
-                best_epoch=best_epoch,
-                best_metrics=best_metrics,
-            ),
-            settings.output_dir / "best.pt",
-        )
-        torch.save(
-            inference_payload(settings, model, epoch=best_epoch, metrics=best_metrics),
+            inference_payload(settings, candidate_model, epoch=best_epoch, metrics=best_metrics),
             settings.output_dir / "best_inference.pt",
         )
         save_pair_scores(
@@ -480,6 +543,8 @@ def run_training(settings: RoiPairTrainSettings) -> dict[str, float]:
             current_scores,
             settings.threshold,
         )
+        if resume_requires_rerank:
+            print("reranked existing best checkpoint with width-peak pooling", flush=True)
 
     for epoch in range(start_epoch, settings.epochs + 1):
         if settings.epochs == 1:
@@ -658,6 +723,8 @@ def run_training(settings: RoiPairTrainSettings) -> dict[str, float]:
     best_metrics = dict(best_metrics)
     best_metrics["pair_forward_median_ms"] = latency_median
     best_metrics["pair_forward_p90_ms"] = latency_p90
+    best_metrics["pair_forward_target_ms"] = 0.8
+    best_metrics["pair_forward_target_met"] = float(latency_median <= 0.8)
     write_summary(
         settings,
         completed_epoch=settings.epochs,
@@ -793,6 +860,8 @@ def run_validation(args: argparse.Namespace) -> dict[str, float]:
             "model_parameters": float(model_parameter_count(model)),
             "pair_forward_median_ms": median_ms,
             "pair_forward_p90_ms": p90_ms,
+            "pair_forward_target_ms": 0.8,
+            "pair_forward_target_met": float(median_ms <= 0.8),
         }
     )
     print(format_dataset_summary("validate", dataset), flush=True)

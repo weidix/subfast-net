@@ -19,6 +19,9 @@ def main(argv: list[str] | None = None) -> None:
     if args and args[0] == "train-presence":
         train_presence.main(args[1:])
         return
+    if args and args[0] == "benchmark-presence":
+        train_presence.main_benchmark(args[1:])
+        return
     if args and args[0] == "train-roi":
         train_roi.main(args[1:])
         return

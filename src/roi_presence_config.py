@@ -28,11 +28,10 @@ class RoiPresenceTrainSettings(BaseModel):
     text_distractor_weight: float = Field(default=4.0, ge=0.0)
     counterfactual_loss_weight: float = Field(default=0.5, ge=0.0)
     counterfactual_margin: float = Field(default=2.0, ge=0.0)
-    evidence_kernel_size: int = Field(default=3, gt=1)
-    evidence_temperature: float = Field(default=0.5, gt=0.0)
+    evidence_kernel_size: int = Field(default=5, gt=1)
     decision_threshold: float = Field(default=0.5, gt=0.0, lt=1.0)
     require_text_distractor_negatives: bool = False
-    width: int = Field(default=32, gt=0)
+    width: int = Field(default=16, gt=0)
     log_interval: int = Field(default=10, gt=0)
     seed: int = 2026
     device: str = "auto"

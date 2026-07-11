@@ -4,6 +4,7 @@ import unittest
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from src.roi_presence_config import RoiPresenceTrainSettings
 from src.roi_presence_dataset import RoiPresenceDataset
@@ -147,7 +148,7 @@ class RoiPresenceOperatorTest(unittest.TestCase):
         torch.testing.assert_close(alone, evaluated, atol=1e-6, rtol=1e-6)
 
     def test_coherent_pooling_rejects_an_isolated_peak(self) -> None:
-        pooling = CoherentEvidencePooling(kernel_size=3, temperature=0.5)
+        pooling = CoherentEvidencePooling(kernel_size=3)
         isolated = torch.full((1, 1, 9, 9), -5.0)
         coherent = isolated.clone()
         isolated[:, :, 4, 4] = 9.0
@@ -157,6 +158,36 @@ class RoiPresenceOperatorTest(unittest.TestCase):
             float(pooling(coherent).detach()),
             float(pooling(isolated).detach()) + 3.0,
         )
+
+    def test_coherent_pooling_keeps_all_invalid_inputs_finite(self) -> None:
+        pooling = CoherentEvidencePooling(kernel_size=5)
+        logit = pooling(torch.randn(1, 1, 4, 8), torch.zeros(1, 1, 4, 8))
+
+        self.assertTrue(bool(torch.isfinite(logit).all()))
+        self.assertTrue(bool(torch.isfinite(F.binary_cross_entropy_with_logits(logit, torch.zeros(1)))))
+
+    def test_coherent_pooling_uses_partial_support_for_thin_valid_regions(self) -> None:
+        pooling = CoherentEvidencePooling(kernel_size=5)
+        valid = torch.zeros(1, 1, 16, 32)
+        valid[:, :, 6:10] = 1.0
+        low = torch.zeros(1, 1, 16, 32)
+        high = low.clone()
+        high[:, :, 6:10] = 2.0
+
+        self.assertGreater(
+            float(pooling(high, valid).detach()),
+            float(pooling(low, valid).detach()) + 1.0,
+        )
+
+    def test_model_valid_mask_matches_dense_area_coordinates(self) -> None:
+        model = RoiPresenceModel(width=8)
+        input_mask = torch.zeros(1, 1, 64, 512)
+        input_mask[:, :, 18:46] = 1.0
+        region_logits = torch.zeros(1, 1, 16, 128)
+
+        actual = model.downsample_valid_mask(input_mask, region_logits)
+        expected = (F.interpolate(input_mask, size=(16, 128), mode="area") > 0.5).to(actual.dtype)
+        torch.testing.assert_close(actual, expected)
 
     def test_dense_region_loss_supervises_positive_extent_and_text_distractors(self) -> None:
         logits = torch.zeros(2, 1, 4, 8, requires_grad=True)

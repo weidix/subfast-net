@@ -139,6 +139,20 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(calls, [["--presence-epochs", "3", "--embedding-epochs", "0", "--joint-epochs", "0"]])
 
+    def test_benchmark_presence_subcommand_dispatches(self):
+        from src import train_presence
+        from src.cli import main
+
+        calls = []
+        original = train_presence.main_benchmark
+        train_presence.main_benchmark = lambda argv: calls.append(argv)
+        try:
+            main(["benchmark-presence", "--device", "mps"])
+        finally:
+            train_presence.main_benchmark = original
+
+        self.assertEqual(calls, [["--device", "mps"]])
+
 
 if __name__ == "__main__":
     unittest.main()
