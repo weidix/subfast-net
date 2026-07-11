@@ -14,7 +14,7 @@ uv run subfast-net train-roi-pair \
   --train-root data/roi_samples5 \
   --train-root data/roi_samples6 \
   --val-root data/roi_validation_samples \
-  --output-dir outputs/roi_pair_matcher_run \
+  --output-dir outputs/roi_pair_matcher \
   --resize-roi 256x64 \
   --batch-size 128 \
   --validation-batch-size 256 \

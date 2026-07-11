@@ -1,21 +1,46 @@
-# ROI Presence 模型训练
+# ROI Presence V2 训练
 
-`train-presence` 是独立的 ROI 字幕存在性训练入口。模型只判断 ROI 中是否存在字幕，checkpoint 仅包含 backbone 与 presence head，不包含 embedding head、embedding loss 或同字幕配对逻辑。
+`train-presence` 是独立的 ROI 字幕存在性训练入口。V2 checkpoint 只包含 presence 专属 backbone、字幕区域 head 与连续区域证据聚合器。
 
-旧的 `train-roi` 双头训练入口已弃用。`train` 检测器训练入口也已标记为弃用。
+## V2 的任务定义
 
-## 基本命令
+V2 不再把单个最高响应字块直接当作整张 ROI 的 presence 证据：
 
-```bash
-uv run subfast-net train-presence \
-  --train-root data/roi_samples6 \
-  --val-root data/roi_validation_samples \
-  --output-dir outputs/roi_presence_run \
-  --epochs 10 \
-  --batch-size 16
+- backbone 使用 GroupNorm，不保存随 batch/epoch 变化的运行均值和方差；同一样本不受同批其他来源样本影响。
+- 局部对比被限制在有界范围，避免低方差区域产生异常放大。
+- head 输出 dense subtitle-region logits，并使用局部平均后的连续区域 log-mean-exp 聚合；已删除 Top-K 算子。
+- 所有正样本、空样本和带文字干扰负样本都参与区域 BCE；正样本另有 Dice 与横纵投影覆盖损失。
+- 训练会为每个正样本按稳定 key 选择同来源的两个固定无字幕 donor：擦除标注字幕区域并要求 presence 降低，把完整字幕区域换到 donor 背景并要求证据保持，同时用第二个负 donor 检查拼接接缝不会触发 presence。该过程不依赖当前 batch 的正负组成。
+
+总损失为：
+
+```text
+presence BCE
++ region_loss_weight × (balanced region BCE + Dice + projection extent)
++ counterfactual_loss_weight × (erased BCE + necessity margin + transplant consistency)
 ```
 
-多个训练集通过重复传入 `--train-root` 合并：
+## 数据语义边界
+
+现有 `roi_samples1..6` 和 `roi_validation_samples` 中，正样本全部有文字框，负样本全部没有文字框；当前标签因此只能监督“标注文字区域/空区域”。数据中还存在被标成正例的网址水印。
+
+所以 V2 会单独统计：
+
+- `text_distractor_count`
+- `text_distractor_fpr`
+- `subtitle_specificity_evaluable`
+
+只有验证集中存在“有文字框但 `has_subtitle=false`”的水印、UI、场景字或广告样本时，`subtitle_specificity_evaluable` 才会为 `1`。否则即使 `fp=0/fn=0`，也不能解释成模型已经学会区分字幕与其他文字。
+
+可在 `segment_review.json` 中把非字幕文字设为 `has_subtitle=false`，同时保留对应 label box，使其成为 text-distractor negative。严格训练可增加：
+
+```bash
+--require-text-distractor-negatives
+```
+
+缺少这类训练或验证样本时，该参数会直接终止训练。
+
+## 基本命令
 
 ```bash
 uv run subfast-net train-presence \
@@ -26,109 +51,83 @@ uv run subfast-net train-presence \
   --train-root data/roi_samples5 \
   --train-root data/roi_samples6 \
   --val-root data/roi_validation_samples \
-  --output-dir outputs/roi_presence_full \
+  --output-dir outputs/roi_presence_v2 \
+  --resize-roi 512x64 \
   --epochs 30 \
-  --batch-size 16 \
-  --train-negative-ratio 0.35
+  --batch-size 16
 ```
 
-训练集与验证集应分离。若 `--val-root` 与任一训练根目录相同，CLI 会提示该结果不能作为 held-out 质量依据。
+默认验证根目录是独立的 `data/roi_validation_samples`。若验证根目录与训练根目录重合，结果会被标记为非 held-out 证据。
 
-## 数据与尺寸
+## 尺寸与有效坐标
 
-输入使用 `tools/prepare_roi_samples.py` 生成的 ROI 数据目录。每个目录需要包含：
-
-- `summary.json`
-- `annotations.jsonl`
-- ROI 图片
-- `labels/` 下对应的标签文件
-
-多个数据目录的 ROI 尺寸不同时，必须显式统一尺寸：
+不同来源的 ROI 宽高比差异很大。V2 在指定 `--resize-roi` 时默认等比例缩放并居中 padding：
 
 ```bash
---resize-roi 256x64
+--resize-roi 512x64 --resize-mode letterbox
 ```
 
-尺寸格式为 `WIDTHxHEIGHT`。图片和可选的字幕 mask 会使用同一输出坐标空间。
+图像、字幕 mask 和 valid mask 使用同一输出坐标空间；区域损失和 presence 聚合都忽略 padding。训练时显式传入 valid mask，单输入推理时模型也可从 V2 预处理产生的精确零 padding 自动恢复它。仅在明确需要旧式非等比拉伸时使用：
 
-## 类别采样
+```bash
+--resize-mode stretch
+```
 
-默认训练 batch 中无字幕样本比例为 `0.35`。可以使用正样本比例或负样本比例配置，但同一作用域只能指定一种：
+## 采样先验与 score
+
+默认不再强制 batch 正负比例，而是每个 epoch 按数据原始分布遍历样本。若显式设置平衡采样：
 
 ```bash
 --train-negative-ratio 0.35
---val-negative-ratio 0.50
 ```
 
-或：
+presence BCE 会按采样先验和目标先验做 importance correction，避免 35% 负样本 batch 把 sigmoid 截距误当成真实数据先验。目标先验默认使用训练数据正样本比例，也可显式指定：
 
 ```bash
---train-positive-ratio 0.65
---val-positive-ratio 0.50
+--score-positive-prior 0.30
 ```
 
-验证比例只有在同时设置 `--max-val-samples`、需要裁剪验证集时才会改变样本组成。
+checkpoint 会保存 `score_contract`，包括目标先验、固定决策阈值和字幕特异性是否可评估。`presence_score` 仍应理解为该先验下的 evidence score；只有在独立 calibration split 上做 affine calibration，并在未参与拟合的测试集报告 NLL/Brier 后，才应称为概率置信度。
 
-## 短字幕监督
-
-可提高 OCR 归一化后长度不超过两个字符的正样本权重：
+固定阈值可通过以下参数设置，训练期间不会用每轮验证集的最佳阈值替换它：
 
 ```bash
---short-positive-loss-weight 2.0
+--decision-threshold 0.5
 ```
 
-也可以启用短字幕 textness map 的辅助 mask loss：
+## 验证证据
 
-```bash
---short-positive-mask-loss-weight 0.1
-```
+每轮同时报告：
 
-辅助 mask loss 只用于 presence 模型的局部 textness 监督，不会创建额外的推理输出头。
+- 固定阈值下的 F1、FP、FN 与 segment 级 recall。
+- 正负最差 1% 均值、tail gap，以及逐样本跨 epoch 最大漂移和最差 1% 漂移。
+- Brier、NLL、ECE。
+- region IoU、Dice、框内外响应差和最大响应落框率。
+- 擦除字幕后的 score drop/翻转率、换背景后的 recall，以及负图接缝 control FPR。
+- 同一样本单独推理与混批推理的最大 logit 差；V2 正常应接近数值误差。
+- text-distractor 专项 FPR；无此类样本时明确标记不可评估。
 
-## 断点续训
+最佳 checkpoint 先比较固定阈值下全局、普通字幕和短字幕的最弱 F1，再比较 text-distractor、区域定位、反事实必要性、尾部间隔和 Brier。不会再用 sigmoid 的单点 `presence_gap` 奖励饱和过置信。
 
-`--resume` 可以指向 checkpoint 文件、单个 epoch 输出目录或完整训练输出目录：
-
-```bash
-uv run subfast-net train-presence \
-  --train-root data/roi_samples6 \
-  --val-root data/roi_validation_samples \
-  --output-dir outputs/roi_presence_run \
-  --resume outputs/roi_presence_run \
-  --epochs 10
-```
-
-续训时 `--epochs` 表示本次继续执行的 epoch 数。例如已有 10 个 epoch，再传入 `--epochs 10`，本次会训练 epoch 11 至 20。
-
-Presence CLI 只接受 `model_type=roi_presence` 的 checkpoint，不加载旧双头 checkpoint。
-
-## 输出文件
+每轮保存逐样本诊断：
 
 ```text
-outputs/roi_presence_run/
+outputs/roi_presence_v2/
 ├── best.pt
-├── best_presence.pt
+├── best_inference.pt
+├── last.pt
 ├── metrics.jsonl
-├── summary.json
-└── epoch_outputs/
-    └── epoch_0001/
-        ├── model.pt
-        └── metrics.json
+├── best_presence_scores.jsonl
+└── summary.json
 ```
 
-- `best.pt` 与 `best_presence.pt`：当前最佳 presence checkpoint。
-- `metrics.jsonl`：训练 step 和每轮验证指标。
-- `summary.json`：最佳轮次、checkpoint 路径及验证摘要。
-- `epoch_outputs/`：每轮完整 checkpoint 和指标。
+主产物与 `pair_matcher` 一致：`best.pt` 用于续训，`best_inference.pt` 仅包含推理所需权重与预处理契约，`last.pt` 是最后一轮续训点，`best_presence_scores.jsonl` 对应 `best_pair_scores.jsonl`。
 
-每轮验证额外输出基于 sigmoid 概率的分离度：
+`validation_samples.jsonl` 包含稳定 sample key、segment、target、sample kind、原始 score、前一轮 score、漂移、区域定位、擦除 score 和换背景 score，可直接定位类似“那个”四帧的尾部异常。
 
-- `presence_min_positive_score`：最难正样本分数。
-- `presence_max_negative_score`：最难负样本分数。
-- `presence_gap = min_positive - max_negative`。大于 `0` 表示验证集存在零错误阈值，小于等于 `0` 表示正负分数仍有重叠。
-- `presence_roc_auc`、正负样本尾部分位数、`presence_best_f1_threshold` 和 `presence_best_f1` 用于区分整体排序质量、尾部重叠和固定 `0.5` 阈值问题。
+## V1 checkpoint
 
-最佳 checkpoint 仍以全局、普通字幕和短字幕三个 presence F1 的平均值为首要标准；F1 相同时选择 `presence_gap` 更大的轮次。正式质量结论应使用独立验证集上的指标。
+V2 的算子和目标均已改变，不能从 BatchNorm + Top-K 的 V1 checkpoint 续训。`--resume` 会严格检查 `architecture_version`、输入尺寸模式、证据聚合参数和模型宽度；不匹配时直接报错。
 
 ## 主要参数
 
@@ -137,15 +136,19 @@ outputs/roi_presence_run/
 | `--batch-size` | `16` | 训练与验证 batch size |
 | `--epochs` | `1` | 本次执行的 epoch 数 |
 | `--lr` | `3e-4` | AdamW 学习率 |
-| `--weight-decay` | `1e-4` | AdamW weight decay |
-| `--train-negative-ratio` | `0.35` | 每个训练 batch 的目标负样本比例 |
-| `--val-negative-ratio` | 不限制 | 验证集裁剪时的目标负样本比例 |
-| `--presence-topk-ratio` | `0.05` | textness map 中用于聚合 presence logit 的最高响应比例 |
+| `--train-negative-ratio` | 不强制 | 可选的 batch 负样本比例 |
+| `--score-positive-prior` | 训练集先验 | score 对应的目标正样本先验 |
+| `--region-loss-weight` | `1.0` | dense region 总损失权重 |
+| `--region-dice-weight` | `1.0` | 正样本区域 Dice 权重 |
+| `--region-projection-weight` | `0.25` | 字幕横纵覆盖权重 |
+| `--text-distractor-weight` | `4.0` | 非字幕文字框负区域权重 |
+| `--counterfactual-loss-weight` | `0.5` | 擦除/换背景约束权重 |
+| `--counterfactual-margin` | `2.0` | 原图与擦除图的 logit margin |
+| `--evidence-kernel-size` | `3` | 连续区域支持核，必须为大于 1 的奇数 |
+| `--evidence-temperature` | `0.5` | log-mean-exp 证据温度 |
+| `--decision-threshold` | `0.5` | 固定验证/部署阈值 |
+| `--resize-mode` | `letterbox` | `letterbox` 或 `stretch` |
 | `--width` | `32` | 模型基础通道数 |
-| `--num-workers` | `0` | DataLoader worker 数量 |
-| `--device` | `auto` | `auto`、`cpu`、`mps` 或 `cuda` |
-| `--max-train-samples` | 不限制 | 限制训练样本数量，适合冒烟验证 |
-| `--max-val-samples` | 不限制 | 限制验证样本数量 |
 
 查看全部参数：
 

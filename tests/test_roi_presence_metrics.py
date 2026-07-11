@@ -3,8 +3,12 @@ from __future__ import annotations
 import unittest
 
 import torch
+from torch import nn
 
-from src.roi_presence_metrics import checkpoint_rank, presence_metrics
+from src.roi_presence_dataset import RoiPresenceDataset
+from src.roi_presence_loss import subtitle_region_loss
+from src.roi_presence_metrics import checkpoint_rank, presence_metrics, text_distractor_metrics
+from src.roi_presence_model import CoherentEvidencePooling, RoiPresenceModel
 
 
 class RoiPresenceMetricsTest(unittest.TestCase):
@@ -21,19 +25,122 @@ class RoiPresenceMetricsTest(unittest.TestCase):
         self.assertEqual(metrics["presence_roc_auc"], 1.0)
         self.assertEqual(metrics["presence_best_f1"], 1.0)
 
-    def test_checkpoint_rank_uses_gap_only_after_presence_f1(self) -> None:
+    def test_checkpoint_rank_prefers_localized_causal_evidence_after_presence_f1(self) -> None:
         base = {
             "global_presence_f1": 0.9,
             "normal_presence_f1": 0.9,
             "short_presence_f1": 0.9,
-            "presence_gap": -0.2,
+            "region_pointing_accuracy": 0.5,
+            "counterfactual_score_drop_lower_tail_1pct": 0.1,
+            "presence_tail_gap_1pct": 0.2,
+            "presence_brier": 0.1,
         }
 
-        self.assertGreater(checkpoint_rank(dict(base, presence_gap=0.1)), checkpoint_rank(base))
         self.assertGreater(
-            checkpoint_rank(dict(base, global_presence_f1=0.91, presence_gap=-0.5)),
+            checkpoint_rank(dict(base, region_pointing_accuracy=0.9)),
             checkpoint_rank(base),
         )
+        self.assertGreater(
+            checkpoint_rank(dict(base, global_presence_f1=0.91, region_pointing_accuracy=0.0)),
+            checkpoint_rank(base),
+        )
+
+    def test_auc_does_not_hide_fixed_threshold_false_negatives(self) -> None:
+        metrics = presence_metrics(
+            torch.logit(torch.tensor([0.49, 0.48, 0.20, 0.10])),
+            torch.tensor([1.0, 1.0, 0.0, 0.0]),
+        )
+
+        self.assertEqual(metrics["presence_roc_auc"], 1.0)
+        self.assertEqual(metrics["presence_fn"], 2.0)
+        self.assertLess(metrics["presence_positive_lower_tail_mean_1pct"], 0.5)
+
+    def test_text_distractor_slice_is_not_reported_as_empty_background(self) -> None:
+        logits = torch.logit(torch.tensor([0.9, 0.8, 0.1]))
+        presence = torch.tensor([1.0, 0.0, 0.0])
+        candidate_masks = torch.zeros(3, 1, 2, 2)
+        candidate_masks[:2, :, 0, 0] = 1.0
+
+        metrics, selected = text_distractor_metrics(logits, presence, candidate_masks)
+
+        self.assertEqual(selected.tolist(), [False, True, False])
+        self.assertEqual(metrics["text_distractor_fpr"], 1.0)
+        self.assertEqual(metrics["subtitle_specificity_evaluable"], 1.0)
+
+
+class RoiPresenceOperatorTest(unittest.TestCase):
+    def test_letterbox_resize_keeps_image_mask_and_valid_coordinates_aligned(self) -> None:
+        dataset = object.__new__(RoiPresenceDataset)
+        dataset.resize_roi = (40, 40)
+        dataset.resize_mode = "letterbox"
+        image = torch.zeros(3, 10, 20)
+        mask = torch.zeros(1, 10, 20)
+        mask[:, 2:8, 5:15] = 1.0
+        valid = torch.ones(1, 10, 20)
+
+        resized_image, resized_mask, resized_valid = dataset._resize_tensors(image, mask, valid)
+
+        self.assertEqual(resized_image.shape, (3, 40, 40))
+        self.assertEqual(resized_mask.shape, (1, 40, 40))
+        self.assertTrue(bool((resized_valid[:, :10] == 0.0).all()))
+        self.assertTrue(bool((resized_valid[:, 10:30] == 1.0).all()))
+        self.assertTrue(bool((resized_valid[:, 30:] == 0.0).all()))
+        self.assertTrue(bool((resized_mask * (1.0 - resized_valid) == 0.0).all()))
+
+        model = RoiPresenceModel(width=8).eval()
+        resized_image[:, 10:30] = torch.randn_like(resized_image[:, 10:30])
+        torch.testing.assert_close(
+            model(resized_image.unsqueeze(0)),
+            model(resized_image.unsqueeze(0), resized_valid.unsqueeze(0)),
+        )
+
+    def test_model_is_batch_context_and_train_eval_invariant(self) -> None:
+        torch.manual_seed(7)
+        model = RoiPresenceModel(width=8)
+        sample = torch.randn(1, 3, 32, 64)
+        companions = torch.randn(3, 3, 32, 64) * 8.0 + 20.0
+
+        model.train()
+        alone = model(sample)
+        mixed = model(torch.cat([sample, companions]))[:1]
+        model.eval()
+        evaluated = model(sample)
+
+        self.assertFalse(any(isinstance(module, nn.modules.batchnorm._BatchNorm) for module in model.modules()))
+        torch.testing.assert_close(alone, mixed, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(alone, evaluated, atol=1e-6, rtol=1e-6)
+
+    def test_coherent_pooling_rejects_an_isolated_peak(self) -> None:
+        pooling = CoherentEvidencePooling(kernel_size=3, temperature=0.5)
+        isolated = torch.full((1, 1, 9, 9), -5.0)
+        coherent = isolated.clone()
+        isolated[:, :, 4, 4] = 9.0
+        coherent[:, :, 3:6, 3:6] = 9.0
+
+        self.assertGreater(
+            float(pooling(coherent).detach()),
+            float(pooling(isolated).detach()) + 3.0,
+        )
+
+    def test_dense_region_loss_supervises_positive_extent_and_text_distractors(self) -> None:
+        logits = torch.zeros(2, 1, 4, 8, requires_grad=True)
+        masks = torch.zeros(2, 1, 4, 8)
+        masks[:, :, 1:3, 2:6] = 1.0
+        presence = torch.tensor([1.0, 0.0])
+
+        loss = subtitle_region_loss(
+            logits,
+            masks,
+            presence,
+            dice_weight=0.0,
+            projection_weight=0.0,
+            text_distractor_weight=4.0,
+        )
+        loss.total.backward()
+
+        self.assertLess(float(logits.grad[0, 0, 1, 2]), 0.0)
+        self.assertGreater(float(logits.grad[0, 0, 0, 0]), 0.0)
+        self.assertGreater(float(logits.grad[1, 0, 1, 2]), 0.0)
 
 
 if __name__ == "__main__":

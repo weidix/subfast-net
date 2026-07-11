@@ -39,12 +39,7 @@ class PresenceBalancedBatchSampler(Sampler[list[int]]):
         else:
             self.negative_slots = 0
             self.positive_slots = batch_size
-        counts: list[int] = []
-        if self.positive_indices and self.positive_slots:
-            counts.append((len(self.positive_indices) + self.positive_slots - 1) // self.positive_slots)
-        if self.negative_indices and self.negative_slots:
-            counts.append((len(self.negative_indices) + self.negative_slots - 1) // self.negative_slots)
-        self.batch_count = max(counts, default=0)
+        self.batch_count = (len(samples) + batch_size - 1) // batch_size
 
     def __len__(self) -> int:
         return self.batch_count
