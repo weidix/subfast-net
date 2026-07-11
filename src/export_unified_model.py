@@ -11,6 +11,8 @@ import torch
 from torch.fx import Node
 
 from .model import SubtitleDetector
+from .roi_pair_model import RoiPairInference, RoiPairMatcher, fuse_pair_matcher_for_inference
+from .roi_presence_model import RoiPresenceModel
 
 
 FORMAT_NAME = "subfast-net.unified-model"
@@ -18,11 +20,28 @@ FORMAT_VERSION = 1
 WEIGHTS_FILE = "weights.bin"
 COREML_OUTPUT_SUFFIXES = {".mlmodel", ".mlpackage"}
 SUPPORTED_OPERATORS = {
+    "aten.abs.default",
     "aten.add.Tensor",
+    "aten.amax.default",
+    "aten.avg_pool2d.default",
     "aten.batch_norm.default",
+    "aten.bitwise_not.default",
+    "aten.cat.default",
+    "aten.clamp_min.default",
     "aten.conv2d.default",
+    "aten.div.Tensor",
+    "aten.gt.Scalar",
+    "aten.linear.default",
+    "aten.masked_fill.Scalar",
+    "aten.mean.dim",
+    "aten.mul.Tensor",
+    "aten.sigmoid.default",
     "aten.silu.default",
     "aten.silu_.default",
+    "aten.softplus.default",
+    "aten.squeeze.dim",
+    "aten.sub.Tensor",
+    "aten.to.dtype",
     "aten.upsample_bilinear2d.vec",
 }
 
@@ -307,6 +326,63 @@ def load_training_checkpoint_model(checkpoint_path: Path) -> tuple[SubtitleDetec
     return model, image_size
 
 
+def checkpoint_resize_roi(checkpoint: dict[str, Any], checkpoint_path: Path) -> tuple[int, int]:
+    settings = checkpoint.get("settings") or {}
+    resize_roi = checkpoint.get("resize_roi")
+    if resize_roi is None and isinstance(settings, dict):
+        resize_roi = settings.get("resize_roi")
+    if not isinstance(resize_roi, (list, tuple)) or len(resize_roi) != 2:
+        raise RuntimeError(f"checkpoint does not define resize_roi: {checkpoint_path}")
+    width, height = (int(value) for value in resize_roi)
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"invalid resize_roi in checkpoint {checkpoint_path}: {resize_roi}")
+    return width, height
+
+
+def load_checkpoint_export_model(
+    checkpoint_path: Path,
+    batch_size: int,
+) -> tuple[torch.nn.Module, tuple[torch.Tensor, ...]]:
+    checkpoint_path = Path(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if not isinstance(checkpoint, dict) or "model" not in checkpoint:
+        raise RuntimeError(f"invalid training checkpoint: {checkpoint_path}")
+
+    model_type = checkpoint.get("model_type")
+    if model_type == "roi_presence":
+        width, height = checkpoint_resize_roi(checkpoint, checkpoint_path)
+        settings = checkpoint.get("settings") or {}
+        model = RoiPresenceModel(
+            width=int(checkpoint.get("width", settings.get("width", 16))),
+            evidence_kernel_size=int(
+                checkpoint.get("evidence_kernel_size", settings.get("evidence_kernel_size", 5))
+            ),
+        ).eval()
+        version = int(checkpoint.get("architecture_version", 1))
+        if version != model.architecture_version:
+            raise RuntimeError(
+                f"unsupported roi_presence architecture_version={version}; runtime=v{model.architecture_version}"
+            )
+        model.load_state_dict(checkpoint["model"])
+        return model, (torch.randn(batch_size, 3, height, width),)
+
+    if model_type == "roi_pair_matcher":
+        width, height = checkpoint_resize_roi(checkpoint, checkpoint_path)
+        pair_model = RoiPairMatcher().eval()
+        pooling_version = int(checkpoint.get("pooling_version", 1))
+        if pooling_version != pair_model.pooling_version:
+            raise RuntimeError(
+                f"unsupported roi_pair_matcher pooling_version={pooling_version}; runtime=v{pair_model.pooling_version}"
+            )
+        pair_model.load_state_dict(checkpoint["model"])
+        model = RoiPairInference(fuse_pair_matcher_for_inference(pair_model)).eval()
+        shape = (batch_size, 3, height, width)
+        return model, (torch.randn(shape), torch.randn(shape))
+
+    model, image_size = load_training_checkpoint_model(checkpoint_path)
+    return model, (torch.randn(batch_size, 3, image_size, image_size),)
+
+
 def export_pt2_to_unified_model(pt2_path: Path, output_dir: Path) -> Path:
     pt2_path = Path(pt2_path)
     output_dir = Path(output_dir)
@@ -358,6 +434,8 @@ def export_pt2_to_unified_model(pt2_path: Path, output_dir: Path) -> Path:
                 continue
 
             if node.op == "call_function":
+                if op_name(node.target) == "aten._assert_tensor_metadata.default":
+                    continue
                 if node.name in folded_names and node.name not in conv_batch_norm_pairs:
                     continue
                 operator = op_name(node.target)
@@ -451,9 +529,8 @@ def export_checkpoint_to_pt2(checkpoint_path: Path, pt2_path: Path, batch_size: 
     pt2_path = Path(pt2_path)
     if batch_size <= 0:
         raise RuntimeError(f"batch_size must be positive, got {batch_size}")
-    model, image_size = load_training_checkpoint_model(checkpoint_path)
-    example = torch.randn(batch_size, 3, image_size, image_size)
-    exported = torch.export.export(model, (example,))
+    model, example_inputs = load_checkpoint_export_model(checkpoint_path, batch_size)
+    exported = torch.export.export(model, example_inputs)
     pt2_path.parent.mkdir(parents=True, exist_ok=True)
     torch.export.save(exported, pt2_path)
     return pt2_path
