@@ -594,21 +594,38 @@ def export_model_to_coreml_model(
         converted_input, input_shape = first_user_input_shape(exported_program)
         model_for_conversion = exported_program.run_decompositions({})
     else:
-        model, image_size = load_training_checkpoint_model(model_path)
-        input_shape = (batch_size, 3, image_size, image_size)
-        converted_input = "x"
-        example = torch.randn(input_shape)
-        coreml_model_wrapper = CoreMLSubtitleDetector(model, image_size).eval()
+        checkpoint = torch.load(model_path, map_location="cpu")
+        model, example_inputs = load_checkpoint_export_model(model_path, batch_size)
+        model_type = checkpoint.get("model_type") if isinstance(checkpoint, dict) else None
+        if model_type is None:
+            image_size = int(example_inputs[0].shape[-1])
+            model = CoreMLSubtitleDetector(model, image_size).eval()
+            converted_inputs = [ct.TensorType(name="x", shape=tuple(example_inputs[0].shape))]
+        elif model_type == "roi_presence":
+            converted_inputs = [ct.TensorType(name="images", shape=tuple(example_inputs[0].shape))]
+        elif model_type == "roi_pair_matcher":
+            converted_inputs = [
+                ct.TensorType(name="left", shape=tuple(example_inputs[0].shape)),
+                ct.TensorType(name="right", shape=tuple(example_inputs[1].shape)),
+            ]
+        else:
+            raise RuntimeError(f"unsupported checkpoint model_type for CoreML export: {model_type}")
         with torch.no_grad(), warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=DeprecationWarning, module="torch.jit")
-            model_for_conversion = torch.jit.trace(coreml_model_wrapper, example)
+            model_for_conversion = torch.jit.trace(model, example_inputs)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    coreml_model = ct.convert(
-        model_for_conversion,
-        inputs=[ct.TensorType(name=converted_input, shape=input_shape)],
-        source="pytorch",
-    )
+    conversion_options: dict[str, Any] = {
+        "inputs": (
+            [ct.TensorType(name=converted_input, shape=input_shape)]
+            if model_path.suffix == ".pt2"
+            else converted_inputs
+        ),
+        "source": "pytorch",
+    }
+    if model_path.suffix != ".pt2" and model_type in {"roi_presence", "roi_pair_matcher"}:
+        conversion_options["compute_precision"] = ct.precision.FLOAT32
+    coreml_model = ct.convert(model_for_conversion, **conversion_options)
     coreml_model.save(output_path)
     return output_path
 
