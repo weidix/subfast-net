@@ -72,6 +72,10 @@ def make_training_loader(
                 dataset,
                 batch_size=settings.batch_size,
                 shuffle=True,
+                # A tiny shuffled remainder must not receive a full AdamW step.
+                # It otherwise makes the final update (and therefore the
+                # immediately-following validation) depend on only 1-2 images.
+                drop_last=len(dataset) > settings.batch_size,
                 num_workers=settings.num_workers,
                 collate_fn=collate_presence_batch,
             ),
@@ -319,7 +323,9 @@ def run_training(settings: RoiPresenceTrainSettings) -> dict[str, float]:
         flush=True,
     )
     metrics_path = settings.output_dir / "metrics.jsonl"
-    previous_samples_path = settings.output_dir / ".previous_presence_samples.jsonl"
+    previous_samples_path = settings.output_dir / "last_presence_scores.jsonl"
+    if settings.resume is None:
+        previous_samples_path.unlink(missing_ok=True)
     metrics_mode = "a" if settings.resume is not None else "w"
     with metrics_path.open(metrics_mode, encoding="utf-8") as metrics_file:
         for epoch in range(start_epoch, end_epoch + 1):
@@ -413,7 +419,13 @@ def run_training(settings: RoiPresenceTrainSettings) -> dict[str, float]:
                         seam_control_logits,
                         margin=settings.counterfactual_margin,
                     )
-                    counterfactual_loss = counterfactual.total
+                    # The auxiliary variants exist only for selected positives.
+                    # Normalize them over the full batch so a batch containing
+                    # one positive cannot receive the same aggregate weight as
+                    # a batch containing many positives.
+                    counterfactual_loss = counterfactual.total * (
+                        valid_counterfactual.sum().to(logits.dtype) / presence.numel()
+                    )
                 else:
                     counterfactual_loss = logits.sum() * 0.0
                 loss = (
@@ -495,6 +507,11 @@ def run_training(settings: RoiPresenceTrainSettings) -> dict[str, float]:
                     "train_positive_samples": float(positive_samples),
                     "train_negative_samples": float(negative_samples),
                     "train_negative_ratio": negative_samples / max(1, positive_samples + negative_samples),
+                    "train_dropped_samples": float(
+                        len(train_dataset) - positive_samples - negative_samples
+                        if sampler is None
+                        else 0
+                    ),
                     "train_samples": float(len(train_dataset)),
                     "val_samples": float(len(val_dataset)),
                     "train_data_positive_prior": train_dataset.summary.positive_ratio,
@@ -554,6 +571,7 @@ def run_training(settings: RoiPresenceTrainSettings) -> dict[str, float]:
         "best_inference_checkpoint": str(settings.output_dir / "best_inference.pt"),
         "metrics_log": str(metrics_path),
         "presence_scores": str(settings.output_dir / "best_presence_scores.jsonl"),
+        "last_presence_scores": str(previous_samples_path),
         "model_parameters": sum(parameter.numel() for parameter in model.parameters()),
         "best_checkpoint_bytes": (settings.output_dir / "best.pt").stat().st_size,
         "best_inference_checkpoint_bytes": (settings.output_dir / "best_inference.pt").stat().st_size,
@@ -589,7 +607,11 @@ def run_training(settings: RoiPresenceTrainSettings) -> dict[str, float]:
                 "presence_nll",
                 "presence_ece",
                 "presence_score_drift_max",
+                "presence_score_drift_evaluable_count",
                 "presence_score_drift_upper_tail_mean_1pct",
+                "presence_adverse_score_drift_upper_tail_mean_1pct",
+                "presence_positive_score_drop_upper_tail_mean_1pct",
+                "presence_negative_score_rise_upper_tail_mean_1pct",
                 "presence_threshold_flip_count",
                 "short_presence_score_drift_upper_tail_mean_1pct",
                 "short_presence_threshold_flip_count",
@@ -642,7 +664,6 @@ def run_training(settings: RoiPresenceTrainSettings) -> dict[str, float]:
         json.dumps(summary, indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    previous_samples_path.unlink(missing_ok=True)
     return last_metrics
 
 

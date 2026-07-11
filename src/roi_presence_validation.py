@@ -209,7 +209,10 @@ def validate_presence(
     metrics = {
         "val_presence_loss": presence_loss_sum / max(1, sample_count),
         "val_region_loss": float(validation_region.total),
-        "val_counterfactual_loss": counterfactual_loss_sum / max(1, counterfactual_count),
+        "val_counterfactual_loss": counterfactual_loss_sum / max(1, sample_count),
+        "val_counterfactual_loss_on_positive": (
+            counterfactual_loss_sum / max(1, counterfactual_count)
+        ),
         "presence_batch_context_max_abs_logit_delta": batch_context_delta,
     }
     metrics["val_loss"] = (
@@ -330,6 +333,9 @@ def validate_presence(
     short_mask = short_positive_mask(presence, ocr_texts).cpu()
     drift_values: list[float] = []
     short_drift_values: list[float] = []
+    positive_drop_values: list[float] = []
+    negative_rise_values: list[float] = []
+    adverse_drift_values: list[float] = []
     threshold_flips = 0
     short_threshold_flips = 0
     records: list[dict[str, object]] = []
@@ -337,9 +343,18 @@ def validate_presence(
         sample_key = f"{roots[index]}::{sample_id}"
         score = float(scores[index])
         previous_score = previous_scores.get(sample_key)
-        drift = abs(score - previous_score) if previous_score is not None else None
-        if drift is not None:
+        score_delta = score - previous_score if previous_score is not None else None
+        drift = None
+        if score_delta is not None:
+            drift = abs(score_delta)
             drift_values.append(drift)
+            if bool(presence[index] > 0.5):
+                adverse_drift = max(0.0, -score_delta)
+                positive_drop_values.append(adverse_drift)
+            else:
+                adverse_drift = max(0.0, score_delta)
+                negative_rise_values.append(adverse_drift)
+            adverse_drift_values.append(adverse_drift)
             flipped = int((score >= decision_threshold) != (previous_score >= decision_threshold))
             threshold_flips += flipped
             if bool(short_mask[index]):
@@ -368,6 +383,7 @@ def validate_presence(
             "score": score,
             "predicted": int(score >= decision_threshold),
             "previous_score": previous_score,
+            "score_delta": score_delta,
             "score_drift": drift,
             **region_records[index],
         }
@@ -384,8 +400,24 @@ def validate_presence(
     metrics.update(
         {
             "presence_score_drift_max": max(drift_values) if drift_values else 0.0,
+            "presence_score_drift_evaluable_count": float(len(drift_values)),
             "presence_score_drift_upper_tail_mean_1pct": _tail_mean(
                 drift_values,
+                0.01,
+                largest=True,
+            ),
+            "presence_adverse_score_drift_upper_tail_mean_1pct": _tail_mean(
+                adverse_drift_values,
+                0.01,
+                largest=True,
+            ),
+            "presence_positive_score_drop_upper_tail_mean_1pct": _tail_mean(
+                positive_drop_values,
+                0.01,
+                largest=True,
+            ),
+            "presence_negative_score_rise_upper_tail_mean_1pct": _tail_mean(
+                negative_rise_values,
                 0.01,
                 largest=True,
             ),

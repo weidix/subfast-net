@@ -5,10 +5,12 @@ import unittest
 import torch
 from torch import nn
 
+from src.roi_presence_config import RoiPresenceTrainSettings
 from src.roi_presence_dataset import RoiPresenceDataset
-from src.roi_presence_loss import subtitle_region_loss
+from src.roi_presence_loss import counterfactual_presence_loss, subtitle_region_loss
 from src.roi_presence_metrics import checkpoint_rank, presence_metrics, text_distractor_metrics
 from src.roi_presence_model import CoherentEvidencePooling, RoiPresenceModel
+from src.train_presence import make_training_loader
 
 
 class RoiPresenceMetricsTest(unittest.TestCase):
@@ -69,6 +71,40 @@ class RoiPresenceMetricsTest(unittest.TestCase):
 
 
 class RoiPresenceOperatorTest(unittest.TestCase):
+    def test_counterfactual_transplant_is_supervised_as_a_fixed_positive_target(self) -> None:
+        original = torch.tensor([20.0], requires_grad=True)
+        erased = torch.tensor([-20.0], requires_grad=True)
+        transplanted = torch.tensor([-2.0], requires_grad=True)
+        seam = torch.tensor([-20.0], requires_grad=True)
+
+        loss = counterfactual_presence_loss(
+            original,
+            erased,
+            transplanted,
+            seam,
+            margin=2.0,
+        )
+        loss.total.backward()
+
+        self.assertGreater(float(loss.sufficiency.detach()), 2.0)
+        self.assertLess(float(transplanted.grad.detach()), 0.0)
+        self.assertEqual(float(original.grad.detach()), 0.0)
+
+    def test_training_loader_drops_a_tiny_shuffled_remainder(self) -> None:
+        class SizedDataset:
+            samples: list[object] = []
+
+            def __len__(self) -> int:
+                return 18
+
+        settings = RoiPresenceTrainSettings(batch_size=16)
+
+        loader, sampler = make_training_loader(SizedDataset(), settings)  # type: ignore[arg-type]
+
+        self.assertIsNone(sampler)
+        self.assertTrue(loader.drop_last)
+        self.assertEqual(len(loader), 1)
+
     def test_letterbox_resize_keeps_image_mask_and_valid_coordinates_aligned(self) -> None:
         dataset = object.__new__(RoiPresenceDataset)
         dataset.resize_roi = (40, 40)

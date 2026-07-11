@@ -267,8 +267,14 @@ def counterfactual_presence_loss(
         return CounterfactualLoss(zero, zero, zero, zero, zero)
     erased_bce = F.binary_cross_entropy_with_logits(erased_logits, torch.zeros_like(erased_logits))
     necessity = F.relu(margin - (original_logits - erased_logits)).mean()
+    # A transplanted subtitle is a positive example in its own right.  Matching
+    # the original raw logit made a live model chase its own unbounded target;
+    # the detached target also left a spurious gradient on shared bias/scale.
     sufficiency = (
-        F.smooth_l1_loss(transplanted_logits, original_logits.detach())
+        F.binary_cross_entropy_with_logits(
+            transplanted_logits,
+            torch.ones_like(transplanted_logits),
+        )
         if transplanted_logits is not None
         else original_logits.sum() * 0.0
     )
