@@ -247,6 +247,7 @@ def checkpoint_payload(
 ) -> dict[str, Any]:
     return {
         "model_type": "roi_pair_matcher",
+        "architecture_version": model.architecture_version,
         "pooling_version": model.pooling_version,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -268,6 +269,7 @@ def inference_payload(
 ) -> dict[str, Any]:
     return {
         "model_type": "roi_pair_matcher",
+        "architecture_version": model.architecture_version,
         "pooling_version": model.pooling_version,
         "model": model.state_dict(),
         "resize_roi": list(settings.resize_roi),
@@ -329,11 +331,12 @@ def write_summary(
         "best_inference_checkpoint": str(inference_path),
         "metrics_log": str(settings.output_dir / "metrics.jsonl"),
         "pair_scores": str(settings.output_dir / "best_pair_scores.jsonl"),
+        "architecture_version": model.architecture_version,
         "model_parameters": model_parameter_count(model),
         "best_checkpoint_bytes": best_path.stat().st_size if best_path.exists() else 0,
         "best_inference_checkpoint_bytes": inference_path.stat().st_size if inference_path.exists() else 0,
         "inference_benchmark": {
-            "scope": "conv_bn_fused_traced_forward_only",
+            "scope": "conv_bn_fused_traced_optimized_forward_only",
             "device": str(next(model.parameters()).device),
             "torch_version": str(torch.__version__),
             "dtype": "float32",
@@ -367,6 +370,12 @@ def load_pair_checkpoint(
     if not isinstance(checkpoint, dict) or checkpoint.get("model_type") != "roi_pair_matcher":
         raise RuntimeError(f"invalid ROI pair matcher checkpoint: {path}")
     model = RoiPairMatcher().to(device)
+    architecture_version = int(checkpoint.get("architecture_version", 1))
+    if architecture_version != model.architecture_version:
+        raise RuntimeError(
+            f"unsupported ROI pair matcher architecture_version={architecture_version}; "
+            f"runtime=v{model.architecture_version}; retrain instead of resuming RGB pair features"
+        )
     model.load_state_dict(checkpoint["model"])
     return model, checkpoint
 
@@ -436,11 +445,15 @@ def run_training(settings: RoiPairTrainSettings) -> dict[str, float]:
         train_dataset.samples,
         ocr_negative_enabled=settings.ocr_negative_enabled,
         ocr_negative_max_similarity=settings.ocr_negative_max_similarity,
-        skip_ocr_if_local_negative_ratio_satisfied=settings.negative_ratio,
     )
     if not train_pair_pools.positive_pairs:
         raise ValueError("training dataset has no positive same-subtitle pairs")
-    if train_pair_pools.negative_pair_count <= 0:
+    usable_ocr_negatives = (
+        len(train_pair_pools.ocr_negative_pairs)
+        if settings.ocr_negative_enabled and settings.ocr_negative_ratio > 0.0
+        else 0
+    )
+    if len(train_pair_pools.local_negative_pairs) + usable_ocr_negatives <= 0:
         raise ValueError("training dataset has no negative different-subtitle pairs")
     val_selection = pair_selection_for_dataset(val_dataset, settings)
     require_pair_classes(val_selection, name="validation dataset")
@@ -511,6 +524,7 @@ def run_training(settings: RoiPairTrainSettings) -> dict[str, float]:
             refreshed_checkpoint = dict(candidate_checkpoint)
             refreshed_checkpoint.update(
                 {
+                    "architecture_version": candidate_model.architecture_version,
                     "pooling_version": candidate_model.pooling_version,
                     "metrics": best_metrics,
                     "best_epoch": best_epoch,

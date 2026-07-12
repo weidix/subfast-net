@@ -17,7 +17,12 @@ from src.roi_loss import (
     supervised_contrastive_embedding_loss,
 )
 from src.roi_metrics import embedding_metrics
-from src.roi_pairs import build_embedding_pair_epoch_schedule, select_embedding_pairs
+from src.roi_pairs import (
+    EmbeddingPair,
+    EmbeddingPairPools,
+    build_embedding_pair_epoch_schedule,
+    select_embedding_pairs,
+)
 from src.roi_model import MaskedAttentionEmbeddingHead, LocalContrastResidual, LocalTextnessPresenceHead, RoiPresenceEmbeddingModel
 from src.train_roi import (
     configure_training_phase,
@@ -307,6 +312,45 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         actual_ratio = schedule.negative_pair_count / schedule.pair_count
         self.assertAlmostEqual(actual_ratio, 0.5, places=6)
         self.assertTrue(all(len(batch.sample_indices) <= 4 for batch in schedule.batches))
+
+    def test_embedding_pair_scheduler_reserves_ocr_negative_budget(self):
+        samples = make_scheduler_samples()
+        pools = EmbeddingPairPools(
+            positive_pairs=tuple(
+                EmbeddingPair(i=index, j=index + 1, same=True, source="local")
+                for index in range(0, 12, 2)
+            ),
+            local_negative_pairs=tuple(
+                EmbeddingPair(i=index, j=(index + 2) % 12, same=False, source="local")
+                for index in range(6)
+            ),
+            ocr_negative_pairs=tuple(
+                EmbeddingPair(i=index, j=index + 6, same=False, source="ocr")
+                for index in range(6)
+            ),
+            total_positive_roi_count=12,
+        )
+
+        schedule = build_embedding_pair_epoch_schedule(
+            samples,
+            batch_size=4,
+            negative_ratio=0.5,
+            ocr_negative_enabled=True,
+            ocr_negative_max_similarity=0.2,
+            ocr_negative_ratio=0.5,
+            seed=29,
+            epoch=1,
+            pair_pools=pools,
+        )
+        negative_sources = [
+            pair.source
+            for batch in schedule.batches
+            for pair in batch.pairs
+            if not pair.same
+        ]
+
+        self.assertEqual(negative_sources.count("local"), 3)
+        self.assertEqual(negative_sources.count("ocr"), 3)
 
     def test_balance_embedding_pairs_keeps_all_positives_and_hardest_negatives(self):
         similarities = torch.tensor([0.8, 0.7, 0.9, 0.6, 0.2, -0.1])

@@ -382,30 +382,37 @@ def build_embedding_pair_epoch_schedule(
         rng=rng,
         samples=samples,
     )
+    available_ocr_negatives = (
+        len(ocr_negative_pool)
+        if ocr_negative_enabled and ocr_negative_ratio > 0.0
+        else 0
+    )
     negative_budget = _negative_budget(
         len(selected_positive),
         negative_ratio,
-        len(local_negative_pool) + len(ocr_negative_pool),
+        len(local_negative_pool) + available_ocr_negatives,
     )
+    preferred_ocr_budget = min(
+        available_ocr_negatives,
+        round(negative_budget * ocr_negative_ratio),
+    )
+    local_negative_budget = negative_budget - preferred_ocr_budget
     selected_local_negative = _select_local_negative_pairs(
         local_negative_pool,
-        min(negative_budget, len(local_negative_pool)),
+        min(local_negative_budget, len(local_negative_pool)),
         rng,
         samples,
     )
-    ocr_limit = max_ocr_negative_pairs(
-        local_negative_pairs=len(selected_local_negative),
-        positive_pairs=len(selected_positive),
-        ocr_negative_ratio=ocr_negative_ratio,
+    ocr_negative_budget = min(
+        negative_budget - len(selected_local_negative),
+        available_ocr_negatives,
     )
     selected_ocr_negative = _take_pairs(
         ocr_negative_pool,
-        min(max(0, negative_budget - len(selected_local_negative)), ocr_limit),
+        ocr_negative_budget,
         rng,
     )
     selected_negative = selected_local_negative + selected_ocr_negative
-    if len(selected_negative) < negative_budget and local_negative_pool:
-        selected_negative.extend(_take_pairs(local_negative_pool, negative_budget - len(selected_negative), rng))
 
     selected_positive = [_with_pair_id(pair, samples) for pair in selected_positive]
     selected_negative = [_with_pair_id(pair, samples) for pair in selected_negative]

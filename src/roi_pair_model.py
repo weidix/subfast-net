@@ -8,6 +8,12 @@ from torch.nn import functional as F
 from torch.nn.utils.fusion import fuse_conv_bn_eval
 
 
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
+_VALUE_MEAN = sum(_IMAGENET_MEAN) / len(_IMAGENET_MEAN)
+_VALUE_STD = sum(_IMAGENET_STD) / len(_IMAGENET_STD)
+
+
 class ConvNormAct(nn.Sequential):
     def __init__(
         self,
@@ -52,17 +58,17 @@ class DepthwiseSeparableBlock(nn.Sequential):
 class RoiPairMatcher(nn.Module):
     """Directly predicts whether two aligned subtitle ROIs contain the same subtitle.
 
-    The pair representation is symmetric by construction. It keeps the shared
-    appearance, the raw change, and the local high-frequency change as separate
-    signals, so the network can ignore changing video backgrounds without losing a
-    one-character subtitle difference.
+    The pair representation is symmetric and discards chroma before comparison.
+    It keeps the shared value, the raw change, and the local high-frequency change
+    as separate signals, so hue and saturation cannot become subtitle identity cues.
     """
 
+    architecture_version = 2
     pooling_version = 2
 
     def __init__(self) -> None:
         super().__init__()
-        self.stem = ConvNormAct(9, 16, stride=2)
+        self.stem = ConvNormAct(3, 16, stride=2)
         self.downsample = ConvNormAct(16, 32, stride=2)
         self.detail = DepthwiseSeparableBlock(32, 32)
         self.vertical_downsample = DepthwiseSeparableBlock(32, 48, stride=(2, 1))
@@ -75,7 +81,17 @@ class RoiPairMatcher(nn.Module):
         )
 
     @staticmethod
-    def _pair_features_impl(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    def _value_channel(image: torch.Tensor) -> torch.Tensor:
+        red = image[:, 0:1] * _IMAGENET_STD[0] + _IMAGENET_MEAN[0]
+        green = image[:, 1:2] * _IMAGENET_STD[1] + _IMAGENET_MEAN[1]
+        blue = image[:, 2:3] * _IMAGENET_STD[2] + _IMAGENET_MEAN[2]
+        value = torch.maximum(torch.maximum(red, green), blue)
+        return (value - _VALUE_MEAN) / _VALUE_STD
+
+    @classmethod
+    def _pair_features_impl(cls, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        left = cls._value_channel(left)
+        right = cls._value_channel(right)
         delta = left - right
         delta_background = F.avg_pool2d(delta, 5, stride=1, padding=2, count_include_pad=False)
         shared_appearance = 0.5 * (left + right)
@@ -157,9 +173,10 @@ def trace_pair_matcher_for_inference(
     if left.ndim != 4 or left.shape != right.shape or left.shape[1] != 3:
         raise ValueError("ROI pair inputs must have matching [batch, 3, height, width] shapes")
     optimized = RoiPairInference(fuse_pair_matcher_for_inference(model)).eval()
-    return torch.jit.trace(
+    traced = torch.jit.trace(
         optimized,
         (left, right),
         strict=False,
         check_trace=False,
     )
+    return torch.jit.optimize_for_inference(traced)

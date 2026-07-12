@@ -17,8 +17,10 @@ from .roi_presence_model import RoiPresenceModel
 
 FORMAT_NAME = "subfast-net.unified-model"
 FORMAT_VERSION = 1
+EXTENDED_FORMAT_VERSION = 2
 WEIGHTS_FILE = "weights.bin"
 COREML_OUTPUT_SUFFIXES = {".mlmodel", ".mlpackage"}
+FORMAT_V2_OPERATORS = {"aten.maximum.default", "aten.slice.Tensor"}
 SUPPORTED_OPERATORS = {
     "aten.abs.default",
     "aten.add.Tensor",
@@ -33,11 +35,13 @@ SUPPORTED_OPERATORS = {
     "aten.gt.Scalar",
     "aten.linear.default",
     "aten.masked_fill.Scalar",
+    "aten.maximum.default",
     "aten.mean.dim",
     "aten.mul.Tensor",
     "aten.sigmoid.default",
     "aten.silu.default",
     "aten.silu_.default",
+    "aten.slice.Tensor",
     "aten.softplus.default",
     "aten.squeeze.dim",
     "aten.sub.Tensor",
@@ -369,6 +373,12 @@ def load_checkpoint_export_model(
     if model_type == "roi_pair_matcher":
         width, height = checkpoint_resize_roi(checkpoint, checkpoint_path)
         pair_model = RoiPairMatcher().eval()
+        architecture_version = int(checkpoint.get("architecture_version", 1))
+        if architecture_version != pair_model.architecture_version:
+            raise RuntimeError(
+                f"unsupported roi_pair_matcher architecture_version={architecture_version}; "
+                f"runtime=v{pair_model.architecture_version}"
+            )
         pooling_version = int(checkpoint.get("pooling_version", 1))
         if pooling_version != pair_model.pooling_version:
             raise RuntimeError(
@@ -503,9 +513,14 @@ def export_pt2_to_unified_model(pt2_path: Path, output_dir: Path) -> Path:
             }
         )
 
+    format_version = (
+        EXTENDED_FORMAT_VERSION
+        if any(node["op"] in FORMAT_V2_OPERATORS for node in nodes)
+        else FORMAT_VERSION
+    )
     manifest = {
         "format": FORMAT_NAME,
-        "format_version": FORMAT_VERSION,
+        "format_version": format_version,
         "producer": {
             "name": "subfast-net.export_unified_model",
             "torch_version": torch.__version__,

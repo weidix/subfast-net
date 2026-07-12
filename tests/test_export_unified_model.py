@@ -26,6 +26,11 @@ class UnsupportedExportModel(nn.Module):
         return torch.relu(x)
 
 
+class ExtendedOperatorExportModel(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.maximum(x[:, 0:1], x[:, 1:2])
+
+
 class ConvBatchNormExportModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -101,6 +106,21 @@ class UnifiedModelExportTests(unittest.TestCase):
             manifest = json.loads((output_dir / "model.json").read_text())
             self.assertEqual(manifest["format"], "subfast-net.unified-model")
             self.assertTrue((output_dir / "weights.bin").is_file())
+
+    def test_extended_operators_use_format_version_two(self):
+        model = ExtendedOperatorExportModel().eval()
+        exported = torch.export.export(model, (torch.randn(1, 3, 8, 8),))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pt2_path = Path(tmp) / "extended.pt2"
+            output_dir = Path(tmp) / "unified"
+            torch.export.save(exported, pt2_path)
+
+            manifest_path = export_pt2_to_unified_model(pt2_path, output_dir)
+            manifest = json.loads(manifest_path.read_text())
+
+            self.assertEqual(manifest["format_version"], 2)
+            self.assertIn("aten.maximum.default", {node["op"] for node in manifest["nodes"]})
 
     def test_export_rejects_unsupported_operator_with_node_name(self):
         exported = torch.export.export(UnsupportedExportModel().eval(), (torch.randn(1, 3, 8, 8),))
