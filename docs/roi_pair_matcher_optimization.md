@@ -5,7 +5,7 @@
 - 历史基线：`outputs/roi_embedding_full_batch128_mask_loss` epoch 150，`fp=12`、`fn=2`、`embedding_gap=-0.491129`。
 - 历史 width-token：`outputs/roi_embedding_width_tokens_trial_dim256_run2` epoch 34，`fp=4`、`fn=0`、`embedding_gap=-0.128940`。
 - 新主线：独立 `RoiPairMatcher`，直接输入两个 ROI 并输出同字幕概率，不再生成全局 embedding。
-- 当前仓库 checkpoint：颜色不变架构 v2，`outputs/roi_pair_matcher` epoch 5，固定阈值 `0.5` 下 `fp=0`、`fn=0`、`pair_gap=+0.961725`。
+- 当前仓库 checkpoint：颜色不变架构 v2，`outputs/roi_pair_matcher` epoch 9，输入 `256×32`，固定阈值 `0.5` 下 `fp=0`、`fn=0`、`pair_gap=+0.717576`。
 - 目标已经在当前 `roi_validation_samples` 上达到；历史 RGB 架构的 leave-one-video-out 检查仍有 9 个 FN，新架构尚未重做该实验。
 
 ## 当前推荐方案：Direct Pair Matcher

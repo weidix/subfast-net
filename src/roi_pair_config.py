@@ -10,7 +10,7 @@ class RoiPairTrainSettings(BaseModel):
     val_root: Path = Path("data/roi_validation_samples")
     output_dir: Path = Path("outputs/roi_pair_matcher")
     resume: Path | None = None
-    resize_roi: tuple[int, int] = (256, 64)
+    resize_roi: tuple[int, int] = (256, 32)
     batch_size: int = Field(default=128, ge=2)
     validation_batch_size: int = Field(default=256, gt=0)
     epochs: int = Field(default=3, gt=0)
