@@ -8,6 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
+.env
+.env.*
+!.env.example
+.envrc
 
 # Local data and generated artifacts
 data/

@@ -125,6 +125,43 @@ class CliTests(unittest.TestCase):
             else:
                 sys.modules["coremltools"] = previous_coremltools
 
+    def test_export_safetensors_subcommand_writes_loadable_bundle(self):
+        from safetensors import safe_open
+        from safetensors.torch import load_file
+
+        from src.cli import main
+
+        model = SubtitleDetector().eval()
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint_path = Path(tmp) / "best.pt"
+            output_dir = Path(tmp) / "safetensors"
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "settings": {
+                        "image_size": 96,
+                        "stride": 32,
+                        "region_threshold": 0.6,
+                        "kernel_threshold": 0.4,
+                    },
+                },
+                checkpoint_path,
+            )
+
+            main(["export-safetensors", str(checkpoint_path), str(output_dir)])
+
+            weights_path = output_dir / "model.safetensors"
+            config = json.loads((output_dir / "config.json").read_text())
+            loaded = load_file(weights_path)
+            self.assertEqual(set(loaded), set(model.state_dict()))
+            torch.testing.assert_close(loaded["stem.0.weight"], model.state_dict()["stem.0.weight"])
+            self.assertEqual(config["format"], "subfast-net.safetensors")
+            self.assertEqual(config["model_type"], "subtitle_detector")
+            self.assertEqual(config["model"]["kwargs"]["width"], 32)
+            self.assertEqual(config["postprocessing"]["region_threshold"], 0.6)
+            with safe_open(weights_path, framework="pt", device="cpu") as archive:
+                self.assertEqual(archive.metadata()["model_type"], "subtitle_detector")
+
     def test_train_roi_subcommand_dispatches_to_roi_trainer(self):
         from src import train_roi
         from src.cli import main

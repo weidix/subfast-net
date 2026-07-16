@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-from . import export_unified_model, train, train_presence, train_roi, train_roi_pair
+from . import export_safetensors, export_unified_model, train, train_presence, train_roi, train_roi_pair
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -12,6 +12,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args and args[0] == "export-coreml":
         export_unified_model.main_coreml(args[1:])
+        return
+    if args and args[0] == "export-safetensors":
+        export_safetensors.main(args[1:])
         return
     if args and args[0] == "train":
         train.main(args[1:])

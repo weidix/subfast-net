@@ -124,6 +124,18 @@ For details about `--batch-size 16` and `--head-output`, see:
 docs/inference_optimization.md
 ```
 
+## Export Safetensors Bundle
+
+Export deployable PyTorch weights without the optimizer or training state:
+
+```bash
+uv run subfast-net export-safetensors \
+  outputs/full_512/best.pt \
+  outputs/full_512/safetensors
+```
+
+The output directory contains `model.safetensors` and `config.json`. The config records the model constructor, input preprocessing, output semantics, and deployment thresholds.
+
 ## Output Files
 
 Each training run writes these files under `--output-dir`:
