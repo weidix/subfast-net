@@ -12,7 +12,12 @@ import torch
 from . import FEATURE_VERSION, STREAM_CHECKPOINT_FORMAT, STREAM_CHECKPOINT_VERSION
 from .postprocess import SegmentPrediction
 from .stream_model import StreamingH264SubtitleModel, StreamingModelConfig
-from .stream_postprocess import StreamingDecoderConfig, StreamingSegmentDecoder
+from .stream_postprocess import (
+    StreamingAnchorDecoder,
+    StreamingDecoderConfig,
+    StreamingEventPairDecoder,
+    StreamingSegmentDecoder,
+)
 
 
 @dataclass(frozen=True)
@@ -63,7 +68,12 @@ class StreamingSegmentDetector:
             feature_count=self._model.config.feature_count,
         )
         self._decoder_config = decoder_config
-        self._decoder = StreamingSegmentDecoder(decoder_config)
+        if model.config.use_segment_head:
+            self._decoder = StreamingAnchorDecoder(decoder_config)
+        elif decoder_config.causal_event_pairing:
+            self._decoder = StreamingEventPairDecoder(decoder_config)
+        else:
+            self._decoder = StreamingSegmentDecoder(decoder_config)
         self._model_state: Any | None = None
         self._last_timestamp_seconds: float | None = None
         self._closed = False
@@ -86,10 +96,10 @@ class StreamingSegmentDetector:
             or checkpoint.get("feature_version") != FEATURE_VERSION
         ):
             raise ValueError(f"unsupported streaming checkpoint: {path}")
-        if (
-            checkpoint.get("model_output_contract")
-            != "causal_streaming_presence_events"
-        ):
+        if checkpoint.get("model_output_contract") not in {
+            "causal_streaming_presence_events",
+            "causal_streaming_presence_events_anchor",
+        }:
             raise ValueError(
                 f"checkpoint does not contain causal streaming output: {path}"
             )
@@ -108,7 +118,14 @@ class StreamingSegmentDetector:
                 "streaming checkpoint is missing required fields: " + ", ".join(missing)
             )
         try:
-            model_config = StreamingModelConfig(**checkpoint["model_config"])
+            model_config_values = dict(checkpoint["model_config"])
+            # Version-one checkpoints predate the optional anchor heads.
+            if not any(
+                key.startswith("segment_anchor_head")
+                for key in checkpoint["model"]
+            ):
+                model_config_values["use_segment_head"] = False
+            model_config = StreamingModelConfig(**model_config_values)
             decoder_config = StreamingDecoderConfig(
                 **checkpoint["streaming_decoder_config"]
             )
@@ -212,34 +229,86 @@ class StreamingSegmentDetector:
                     "streaming model boundary output must have shape "
                     f"{expected_boundary_shape}"
                 )
+            if self._model.config.use_segment_head:
+                expected_anchor_shape = (1, len(chunk))
+                if (
+                    output.segment_anchor_logits.shape != expected_anchor_shape
+                    or output.segment_start_offsets_seconds.shape != expected_anchor_shape
+                    or output.segment_end_offsets_seconds.shape != expected_anchor_shape
+                ):
+                    raise RuntimeError(
+                        "streaming model segment-anchor outputs must have shape "
+                        f"{expected_anchor_shape}"
+                    )
             if not torch.isfinite(output.presence_logits).all().item() or not (
                 torch.isfinite(output.boundary_event_logits).all().item()
             ):
                 raise RuntimeError("streaming model output must be finite")
+            if self._model.config.use_segment_head and not (
+                torch.isfinite(output.segment_anchor_logits).all().item()
+                and torch.isfinite(output.segment_start_offsets_seconds).all().item()
+                and torch.isfinite(output.segment_end_offsets_seconds).all().item()
+            ):
+                raise RuntimeError("streaming model segment-anchor output must be finite")
             presence_probabilities = (
                 torch.sigmoid(output.presence_logits[0]).detach().cpu().tolist()
             )
             boundary_probabilities = (
                 torch.sigmoid(output.boundary_event_logits[0]).detach().cpu().tolist()
             )
+            if self._model.config.use_segment_head:
+                anchor_probabilities = (
+                    torch.sigmoid(output.segment_anchor_logits[0])
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                start_offsets = (
+                    output.segment_start_offsets_seconds[0].detach().cpu().tolist()
+                )
+                end_offsets = (
+                    output.segment_end_offsets_seconds[0].detach().cpu().tolist()
+                )
 
         finalized: list[SegmentPrediction] = []
-        for timestamp, duration, presence, boundaries in zip(
-            timestamps,
-            durations,
-            presence_probabilities,
-            boundary_probabilities,
-            strict=True,
-        ):
-            finalized.extend(
-                self._decoder.push(
-                    timestamp,
-                    duration,
-                    float(presence),
-                    float(boundaries[0]),
-                    float(boundaries[1]),
+        if self._model.config.use_segment_head:
+            for timestamp, duration, anchor, start_offset, end_offset, boundaries in zip(
+                timestamps,
+                durations,
+                anchor_probabilities,
+                start_offsets,
+                end_offsets,
+                boundary_probabilities,
+                strict=True,
+            ):
+                finalized.extend(
+                    self._decoder.push(
+                        timestamp,
+                        duration,
+                        float(anchor),
+                        float(start_offset),
+                        float(end_offset),
+                        float(boundaries[1]),
+                        float(boundaries[0]),
+                    )
                 )
-            )
+        else:
+            for timestamp, duration, presence, boundaries in zip(
+                timestamps,
+                durations,
+                presence_probabilities,
+                boundary_probabilities,
+                strict=True,
+            ):
+                finalized.extend(
+                    self._decoder.push(
+                        timestamp,
+                        duration,
+                        float(presence),
+                        float(boundaries[0]),
+                        float(boundaries[1]),
+                    )
+                )
         self._model_state = next_state
         self._last_timestamp_seconds = timestamps[-1]
         return tuple(finalized)
@@ -268,7 +337,12 @@ def _select_device(requested: str | torch.device) -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
-        return torch.device("mps")
+        try:
+            torch.empty(1, device="mps")
+        except RuntimeError:
+            pass
+        else:
+            return torch.device("mps")
     return torch.device("cpu")
 
 

@@ -10,6 +10,7 @@ from .dataset import FeatureCache, LoadedRecord, ManifestRecord, load_records
 from .labels import SubtitleInterval
 from .stream_labels import (
     causal_boundary_event_targets_from_intervals,
+    causal_segment_anchor_targets_from_intervals,
     presence_targets_from_intervals,
 )
 
@@ -21,6 +22,7 @@ class StreamingLoadedRecord:
     intervals: list[SubtitleInterval]
     presence_targets: np.ndarray
     boundary_event_targets: np.ndarray
+    segment_anchor_targets: np.ndarray
 
 
 def load_streaming_records(
@@ -32,6 +34,7 @@ def load_streaming_records(
     validated: list[LoadedRecord] = load_records(
         records,
         boundary_event_sigma_seconds=boundary_event_sigma_seconds,
+        materialize=True,
     )
     loaded: list[StreamingLoadedRecord] = []
     for item in validated:
@@ -51,6 +54,11 @@ def load_streaming_records(
                         sigma_seconds=boundary_event_sigma_seconds,
                     )
                 ),
+                segment_anchor_targets=causal_segment_anchor_targets_from_intervals(
+                    timestamps,
+                    item.intervals,
+                    sigma_seconds=boundary_event_sigma_seconds,
+                ),
             )
         )
     return loaded
@@ -68,6 +76,8 @@ class StreamingTimingWindowDataset(Dataset):
         window_frames: int,
         stride_frames: int,
         max_windows: int | None = None,
+        clean_negative_weight: float = 1.0,
+        short_segment_weight: float = 1.0,
     ) -> None:
         if window_frames <= 0 or stride_frames <= 0:
             raise ValueError("window and stride must be positive")
@@ -75,12 +85,21 @@ class StreamingTimingWindowDataset(Dataset):
             raise ValueError("stride must not exceed window length")
         if max_windows is not None and max_windows <= 0:
             raise ValueError("max_windows must be positive when provided")
+        if not np.isfinite(clean_negative_weight) or clean_negative_weight < 1.0:
+            raise ValueError("clean_negative_weight must be finite and at least one")
+        if not np.isfinite(short_segment_weight) or short_segment_weight < 1.0:
+            raise ValueError("short_segment_weight must be finite and at least one")
         self.records = records
         self.feature_mean = feature_mean
         self.feature_std = feature_std
         self.window_frames = window_frames
         self.stride_frames = stride_frames
         self.history_frames = window_frames - stride_frames
+        self.clean_negative_weight = float(clean_negative_weight)
+        self.short_segment_weight = float(short_segment_weight)
+        self._record_frame_weights = [
+            self._frame_weights(record.presence_targets) for record in records
+        ]
         self.items = [
             (record_index, core_start)
             for record_index, record in enumerate(records)
@@ -112,7 +131,11 @@ class StreamingTimingWindowDataset(Dataset):
         tokens = np.zeros((self.window_frames, token_count), dtype=np.int64)
         presence_targets = np.zeros((self.window_frames,), dtype=np.float32)
         boundary_targets = np.zeros((self.window_frames, 2), dtype=np.float32)
+        segment_anchor_targets = np.zeros(
+            (self.window_frames, 3), dtype=np.float32
+        )
         mask = np.zeros((self.window_frames,), dtype=np.float32)
+        loss_weights = np.zeros((self.window_frames,), dtype=np.float32)
 
         features[left_padding:destination_stop] = (
             np.asarray(
@@ -129,11 +152,39 @@ class StreamingTimingWindowDataset(Dataset):
         boundary_targets[left_padding:destination_stop] = record.boundary_event_targets[
             source_start:source_stop
         ]
+        segment_anchor_targets[left_padding:destination_stop] = (
+            record.segment_anchor_targets[source_start:source_stop]
+        )
         mask[self.history_frames : core_stop_in_window] = 1.0
+        loss_weights[left_padding:destination_stop] = 1.0
+        loss_weights[left_padding:destination_stop] *= self._record_frame_weights[
+            record_index
+        ][source_start:source_stop]
+        if record.record.signal_validation_role == "clean_control":
+            loss_weights[left_padding:destination_stop] *= self.clean_negative_weight
         return {
             "features": torch.from_numpy(features),
             "tokens": torch.from_numpy(tokens),
             "presence_targets": torch.from_numpy(presence_targets),
             "boundary_event_targets": torch.from_numpy(boundary_targets),
+            "segment_anchor_targets": torch.from_numpy(segment_anchor_targets),
             "mask": torch.from_numpy(mask),
+            "loss_weights": torch.from_numpy(loss_weights),
         }
+
+    def _frame_weights(self, targets: np.ndarray) -> np.ndarray:
+        weights = np.ones((len(targets),), dtype=np.float32)
+        if self.short_segment_weight <= 1.0:
+            return weights
+        positive = targets > 0.5
+        changes = np.diff(np.r_[False, positive, False].astype(np.int8))
+        starts = np.flatnonzero(changes == 1)
+        stops = np.flatnonzero(changes == -1)
+        lengths = stops - starts
+        if not len(lengths):
+            return weights
+        reference = float(np.median(lengths))
+        for start, stop, length in zip(starts, stops, lengths, strict=True):
+            scale = min(self.short_segment_weight, reference / max(float(length), 1.0))
+            weights[start:stop] = max(1.0, float(scale))
+        return weights

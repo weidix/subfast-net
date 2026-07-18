@@ -153,6 +153,32 @@ class FeatureCache:
     def source_id(self) -> str:
         return str(self.meta["source_id"])
 
+    def release(self) -> None:
+        """Release mmap-backed arrays while retaining metadata needed by audits."""
+        self.timestamps = np.asarray(self.timestamps).copy()
+        self.durations = np.asarray(self.durations).copy()
+        arrays: list[np.ndarray] = [self.tokens, *self.features.arrays]
+        self._close_mmaps(arrays)
+
+    def materialize(self) -> None:
+        """Copy all cache arrays into process memory and close mmap handles."""
+        arrays = tuple(np.asarray(array).copy() for array in self.features.arrays)
+        tokens = np.asarray(self.tokens).copy()
+        timestamps = np.asarray(self.timestamps).copy()
+        durations = np.asarray(self.durations).copy()
+        self._close_mmaps([self.tokens, *self.features.arrays])
+        self.features = CombinedFeatureArray(arrays)
+        self.tokens = tokens
+        self.timestamps = timestamps
+        self.durations = durations
+
+    @staticmethod
+    def _close_mmaps(arrays: list[np.ndarray]) -> None:
+        for array in arrays:
+            mmap = getattr(array, "_mmap", None)
+            if mmap is not None:
+                mmap.close()
+
     @property
     def coverage_range_seconds(self) -> tuple[float, float]:
         if len(self.timestamps) == 0:
@@ -277,7 +303,10 @@ def read_manifest(path: Path, *, split: str | None = None) -> list[ManifestRecor
 
 
 def load_records(
-    records: list[ManifestRecord], *, boundary_event_sigma_seconds: float = 0.05
+    records: list[ManifestRecord],
+    *,
+    boundary_event_sigma_seconds: float = 0.05,
+    materialize: bool = False,
 ) -> list[LoadedRecord]:
     loaded: list[LoadedRecord] = []
     expected_names: list[str] | None = None
@@ -317,6 +346,8 @@ def load_records(
                 boundary_event_targets,
             )
         )
+        if materialize:
+            cache.materialize()
     return loaded
 
 

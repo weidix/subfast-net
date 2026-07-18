@@ -281,6 +281,8 @@ def extract_visual_feature_cache(
             raise ValueError(f"decoded more than {frame_count} visual frames: {source}")
         error = process.stderr.read().decode("utf-8", errors="replace").strip()
         return_code = process.wait()
+        process.stdout.close()
+        process.stderr.close()
         if return_code != 0:
             raise RuntimeError(error or f"FFmpeg exited with status {return_code}")
         output.flush()
@@ -289,6 +291,8 @@ def extract_visual_feature_cache(
     except BaseException:
         process.kill()
         process.wait()
+        process.stdout.close()
+        process.stderr.close()
         del output
         if partial_path.exists():
             partial_path.unlink()

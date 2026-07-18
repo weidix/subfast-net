@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import shutil
 import tempfile
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -450,11 +451,43 @@ def _ensure_synthesis(
             )
         )
     elif existing_paths:
-        if not settings.resume or existing_paths != expected_paths:
+        if not settings.resume:
             missing = sorted(str(path) for path in expected_paths - existing_paths)
             raise FileExistsError(
                 f"incomplete or non-resumable synthesis outputs for {video_path}; "
                 f"missing={missing}; use --overwrite"
+            )
+        if existing_paths != expected_paths:
+            # A killed FFmpeg run can leave only a video or an assets directory.
+            # These generated paths are safe to discard and rebuild on resume.
+            partial_path = video_path.with_name(
+                f"{video_path.stem}.partial{video_path.suffix}"
+            )
+            for path in (*expected_paths, partial_path):
+                if path.is_dir():
+                    shutil.rmtree(path)
+                elif path.exists():
+                    path.unlink()
+            synthesize_segment(
+                SynthesisSettings(
+                    source_video=settings.source_video,
+                    source_srt=settings.source_srt,
+                    output_video=video_path,
+                    output_labels=labels_path,
+                    start_seconds=plan.start_seconds,
+                    end_seconds=plan.end_seconds,
+                    ffmpeg=settings.ffmpeg,
+                    ffprobe=settings.ffprobe,
+                    font_path=settings.font_path,
+                    font_size=settings.font_size,
+                    minimum_font_size=settings.minimum_font_size,
+                    encoder="libx264",
+                    cue_schedule=schedule,
+                    signal_validation_role=(
+                        "subtitle_signal" if role == "subtitle_signal" else "clean_control"
+                    ),
+                    pair_id=plan.clip_id,
+                )
             )
     else:
         synthesize_segment(
@@ -843,10 +876,19 @@ def prepare_dataset(settings: PrepareSettings) -> dict[str, object]:
     for plan in plans:
         signal = _prepare_variant(settings, plan, "subtitle_signal")
         variants.append(signal)
-        if settings.paired_clean_controls:
-            clean = _prepare_variant(settings, plan, "clean_control")
-            variants.append(clean)
-            pair_audits.append(_validate_pair(signal, clean))
+        clean: PreparedVariant | None = None
+        try:
+            if settings.paired_clean_controls:
+                clean = _prepare_variant(settings, plan, "clean_control")
+                variants.append(clean)
+                pair_audits.append(_validate_pair(signal, clean))
+        finally:
+            # Feature caches use several mmap handles per variant.  Preparation
+            # keeps only cache metadata after pair validation, so release those
+            # handles before moving to the next clip.
+            signal.cache.release()
+            if clean is not None:
+                clean.cache.release()
     split_statistics = _split_statistics(variants, pair_audits, settings)
     payload_split_isolation = _validate_payload_split_isolation(variants, settings)
     manifest_path = settings.output_root / "manifest.jsonl"

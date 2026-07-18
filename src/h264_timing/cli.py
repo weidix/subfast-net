@@ -211,9 +211,25 @@ def build_parser(prog: str = "h264-timing") -> argparse.ArgumentParser:
     stream_training.add_argument("--recurrent-layers", type=int, default=1)
     stream_training.add_argument("--dropout", type=float, default=0.10)
     stream_training.add_argument("--use-byte-branch", action="store_true")
+    stream_training.add_argument(
+        "--no-segment-head",
+        action="store_true",
+        help="disable the causal end-anchor segment head",
+    )
+    stream_training.add_argument(
+        "--segment-boundary-weight", type=float, default=2.0
+    )
+    stream_training.add_argument("--segment-loss-weight", type=float, default=0.25)
+    stream_training.add_argument("--negative-weight", type=float, default=1.0)
+    stream_training.add_argument(
+        "--boundary-event-loss-weight", type=float, default=1.0
+    )
+    stream_training.add_argument("--clean-negative-weight", type=float, default=1.0)
+    stream_training.add_argument("--short-segment-weight", type=float, default=1.0)
     stream_training.add_argument("--max-train-windows", type=int)
     stream_training.add_argument("--max-val-windows", type=int)
     stream_training.add_argument("--inference-chunk-frames", type=int, default=128)
+    stream_training.add_argument("--initial-checkpoint", type=Path)
     stream_training.add_argument("--seed", type=int, default=2026)
     stream_training.add_argument("--device", default="auto")
     stream_training.add_argument(
@@ -609,9 +625,17 @@ def main(argv: list[str] | None = None, *, prog: str = "h264-timing") -> None:
                 recurrent_layers=args.recurrent_layers,
                 dropout=args.dropout,
                 use_byte_branch=args.use_byte_branch,
+                use_segment_head=not args.no_segment_head,
+                segment_boundary_weight=args.segment_boundary_weight,
+                segment_loss_weight=args.segment_loss_weight,
+                negative_weight=args.negative_weight,
+                boundary_event_loss_weight=args.boundary_event_loss_weight,
+                clean_negative_weight=args.clean_negative_weight,
+                short_segment_weight=args.short_segment_weight,
                 max_train_windows=args.max_train_windows,
                 max_val_windows=args.max_val_windows,
                 inference_chunk_frames=args.inference_chunk_frames,
+                initial_checkpoint=args.initial_checkpoint,
                 seed=args.seed,
                 device=args.device,
                 validation_mode=args.validation_mode,

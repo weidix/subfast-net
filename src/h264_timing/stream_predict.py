@@ -16,6 +16,7 @@ def predict_stream_cache(
     feature_std: np.ndarray,
     chunk_frames: int,
     device: torch.device,
+    include_segments: bool = False,
 ) -> np.ndarray:
     """Evaluate a cache causally; chunk boundaries do not change the result."""
     if chunk_frames <= 0:
@@ -42,7 +43,8 @@ def predict_stream_cache(
     if not np.isfinite(timestamps).all() or np.any(np.diff(timestamps) <= 0.0):
         raise ValueError("cache timestamps must be finite and strictly increasing")
     frame_count = len(timestamps)
-    predictions = np.empty((frame_count, 3), dtype=np.float32)
+    prediction_width = 6 if include_segments and model.config.use_segment_head else 3
+    predictions = np.empty((frame_count, prediction_width), dtype=np.float32)
     state: StreamingModelState | None = None
     model.eval()
     for start in range(0, frame_count, chunk_frames):
@@ -67,7 +69,17 @@ def predict_stream_cache(
         predictions[start:stop, 0] = (
             torch.sigmoid(output.presence_logits[0]).cpu().numpy()
         )
-        predictions[start:stop, 1:] = (
+        predictions[start:stop, 1:3] = (
             torch.sigmoid(output.boundary_event_logits[0]).cpu().numpy()
         )
+        if prediction_width == 6:
+            predictions[start:stop, 3] = (
+                torch.sigmoid(output.segment_anchor_logits[0]).cpu().numpy()
+            )
+            predictions[start:stop, 4] = (
+                output.segment_start_offsets_seconds[0].cpu().numpy()
+            )
+            predictions[start:stop, 5] = (
+                output.segment_end_offsets_seconds[0].cpu().numpy()
+            )
     return predictions

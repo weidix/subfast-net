@@ -55,6 +55,7 @@ from h264_timing.stream_model import (
 )
 from h264_timing.stream_postprocess import (
     StreamingDecoderConfig,
+    StreamingEventPairDecoder,
     StreamingSegmentDecoder,
 )
 from h264_timing.streaming import StreamSample, StreamingSegmentDetector
@@ -589,6 +590,59 @@ class H264TimingTests(unittest.TestCase):
         self.assertEqual(tail.close(), ())
         with self.assertRaisesRegex(RuntimeError, "closed"):
             tail.push(1.2, 0.1, 0.0, 0.0, 0.0)
+
+    def test_streaming_event_pair_decoder_confirms_and_refines_weak_end(self):
+        config = StreamingDecoderConfig(
+            score_threshold=0.0,
+            presence_on_threshold=0.5,
+            presence_off_threshold=0.3,
+            minimum_duration_seconds=0.2,
+            maximum_duration_seconds=2.0,
+            causal_event_pairing=True,
+            start_event_threshold=0.8,
+            end_event_threshold=0.2,
+            event_confirmation_samples=4,
+            event_recovery_threshold=0.6,
+            event_recovery_samples=2,
+            strong_end_event_threshold=0.5,
+            minimum_start_gap_seconds=0.3,
+            end_refinement_frames=1,
+            end_refinement_event_threshold=0.5,
+        )
+        decoder = StreamingEventPairDecoder(config)
+        samples = (
+            (0.0, 0.9, 0.9, 0.0),
+            (0.1, 0.9, 0.0, 0.0),
+            (0.2, 0.9, 0.0, 0.0),
+            (0.3, 0.9, 0.0, 0.3),
+            (0.4, 0.9, 0.0, 0.0),
+            (0.5, 0.9, 0.0, 0.0),
+            (0.6, 0.9, 0.0, 0.0),
+            (0.7, 0.9, 0.9, 0.0),
+            (0.8, 0.9, 0.0, 0.0),
+            (0.9, 0.1, 0.0, 0.9),
+            (1.0, 0.1, 0.0, 0.0),
+            (1.1, 0.1, 0.0, 0.0),
+            (1.2, 0.1, 0.0, 0.0),
+        )
+        emitted = []
+        for timestamp, presence, start_event, end_event in samples:
+            emitted.extend(
+                decoder.push(
+                    timestamp,
+                    0.1,
+                    presence,
+                    start_event,
+                    end_event,
+                )
+            )
+        emitted.extend(decoder.close())
+
+        self.assertEqual(len(emitted), 2)
+        self.assertAlmostEqual(emitted[0].start_seconds, 0.0)
+        self.assertAlmostEqual(emitted[0].end_seconds, 0.2)
+        self.assertAlmostEqual(emitted[1].start_seconds, 0.7)
+        self.assertAlmostEqual(emitted[1].end_seconds, 0.9)
 
     def test_streaming_detector_discards_samples_and_keeps_bounded_state(self):
         model = StreamingH264SubtitleModel(

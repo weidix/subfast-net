@@ -18,6 +18,7 @@ class StreamingModelConfig:
     recurrent_layers: int = 1
     dropout: float = 0.10
     use_byte_branch: bool = False
+    use_segment_head: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -28,6 +29,9 @@ class StreamingSegmentModelOutput(NamedTuple):
 
     presence_logits: torch.Tensor
     boundary_event_logits: torch.Tensor
+    segment_anchor_logits: torch.Tensor
+    segment_start_offsets_seconds: torch.Tensor
+    segment_end_offsets_seconds: torch.Tensor
 
 
 class StreamingTemporalBlockState(NamedTuple):
@@ -170,8 +174,21 @@ class StreamingH264SubtitleModel(nn.Module):
         self.temporal_norm = nn.LayerNorm(config.width)
         self.presence_head = nn.Linear(config.width, 1)
         self.boundary_event_head = nn.Linear(config.width, 2)
+        if config.use_segment_head:
+            self.segment_anchor_head: nn.Linear | None = nn.Linear(config.width, 1)
+            self.segment_boundary_head: nn.Linear | None = nn.Linear(config.width, 2)
+        else:
+            self.segment_anchor_head = None
+            self.segment_boundary_head = None
         nn.init.constant_(self.presence_head.bias, -2.0)
         nn.init.constant_(self.boundary_event_head.bias, -2.0)
+        if self.segment_anchor_head is not None:
+            nn.init.constant_(self.segment_anchor_head.bias, -4.5)
+        if self.segment_boundary_head is not None:
+            # Start offsets are negative and usually span a few seconds; end
+            # offsets are close to zero at the first observed end frame.
+            nn.init.constant_(self.segment_boundary_head.bias[0], 2.0)
+            nn.init.constant_(self.segment_boundary_head.bias[1], -2.0)
 
     def forward(
         self, features: torch.Tensor, tokens: torch.Tensor
@@ -215,6 +232,21 @@ class StreamingH264SubtitleModel(nn.Module):
         output = StreamingSegmentModelOutput(
             presence_logits=self.presence_head(encoded).squeeze(-1),
             boundary_event_logits=self.boundary_event_head(encoded),
+            segment_anchor_logits=(
+                self.segment_anchor_head(encoded).squeeze(-1)
+                if self.segment_anchor_head is not None
+                else encoded.new_zeros((batch, frames))
+            ),
+            segment_start_offsets_seconds=(
+                -F.softplus(self.segment_boundary_head(encoded)[..., 0])
+                if self.segment_boundary_head is not None
+                else encoded.new_zeros((batch, frames))
+            ),
+            segment_end_offsets_seconds=(
+                F.softplus(self.segment_boundary_head(encoded)[..., 1])
+                if self.segment_boundary_head is not None
+                else encoded.new_zeros((batch, frames))
+            ),
         )
         next_state = StreamingModelState(
             temporal_blocks=tuple(block_states),

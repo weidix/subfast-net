@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import asdict, dataclass
 from numbers import Integral, Real
 
@@ -40,18 +41,73 @@ class StreamingDecoderConfig:
     minimum_duration_seconds: float = 0.20
     maximum_duration_seconds: float = 8.00
     confirmation_samples: int = 2
+    anchor_score_threshold: float = 0.50
+    anchor_nms_iou_threshold: float = 0.70
+    anchor_peak_radius_frames: int = 1
+    anchor_end_event_threshold: float = 0.0
+    minimum_anchor_gap_seconds: float = 0.0
+    anchor_start_event_threshold: float = 0.0
+    anchor_start_refinement_seconds: float = 0.0
+    anchor_end_refinement_seconds: float = 0.0
+    anchor_pair_start_events: bool = False
+    # The event-pairing decoder is opt-in so checkpoints written before the
+    # causal peak/recovery state was introduced retain their old behavior.
+    causal_event_pairing: bool = False
+    start_event_threshold: float = 0.86
+    end_event_threshold: float = 0.20
+    event_confirmation_samples: int = 5
+    event_recovery_threshold: float = 0.60
+    event_recovery_samples: int = 3
+    strong_end_event_threshold: float = 0.50
+    minimum_start_gap_seconds: float = 0.30
+    end_refinement_frames: int = 1
+    end_refinement_event_threshold: float = 0.50
 
     def __post_init__(self) -> None:
         _validate_probability("score_threshold", self.score_threshold)
         _validate_probability("presence_on_threshold", self.presence_on_threshold)
         _validate_probability("presence_off_threshold", self.presence_off_threshold)
         _validate_probability("boundary_event_threshold", self.boundary_event_threshold)
+        _validate_probability("anchor_score_threshold", self.anchor_score_threshold)
+        _validate_probability(
+            "anchor_nms_iou_threshold", self.anchor_nms_iou_threshold
+        )
+        _validate_probability(
+            "anchor_end_event_threshold", self.anchor_end_event_threshold
+        )
         if self.presence_off_threshold >= self.presence_on_threshold:
             raise ValueError(
                 "presence_off_threshold must be less than presence_on_threshold"
             )
         _validate_non_negative(
             "minimum_duration_seconds", self.minimum_duration_seconds
+        )
+        _validate_non_negative(
+            "minimum_anchor_gap_seconds", self.minimum_anchor_gap_seconds
+        )
+        _validate_probability(
+            "anchor_start_event_threshold", self.anchor_start_event_threshold
+        )
+        _validate_probability("start_event_threshold", self.start_event_threshold)
+        _validate_probability("end_event_threshold", self.end_event_threshold)
+        _validate_probability(
+            "event_recovery_threshold", self.event_recovery_threshold
+        )
+        _validate_probability(
+            "strong_end_event_threshold", self.strong_end_event_threshold
+        )
+        _validate_probability(
+            "end_refinement_event_threshold", self.end_refinement_event_threshold
+        )
+        _validate_non_negative(
+            "anchor_start_refinement_seconds",
+            self.anchor_start_refinement_seconds,
+        )
+        _validate_non_negative(
+            "anchor_end_refinement_seconds", self.anchor_end_refinement_seconds
+        )
+        _validate_non_negative(
+            "minimum_start_gap_seconds", self.minimum_start_gap_seconds
         )
         if (
             isinstance(self.maximum_duration_seconds, bool)
@@ -68,6 +124,30 @@ class StreamingDecoderConfig:
             or self.confirmation_samples <= 0
         ):
             raise ValueError("confirmation_samples must be a positive integer")
+        if (
+            isinstance(self.event_confirmation_samples, bool)
+            or not isinstance(self.event_confirmation_samples, Integral)
+            or self.event_confirmation_samples <= 0
+        ):
+            raise ValueError("event_confirmation_samples must be a positive integer")
+        if (
+            isinstance(self.event_recovery_samples, bool)
+            or not isinstance(self.event_recovery_samples, Integral)
+            or self.event_recovery_samples <= 0
+        ):
+            raise ValueError("event_recovery_samples must be a positive integer")
+        if (
+            isinstance(self.anchor_peak_radius_frames, bool)
+            or not isinstance(self.anchor_peak_radius_frames, Integral)
+            or self.anchor_peak_radius_frames < 0
+        ):
+            raise ValueError("anchor_peak_radius_frames must be a non-negative integer")
+        if (
+            isinstance(self.end_refinement_frames, bool)
+            or not isinstance(self.end_refinement_frames, Integral)
+            or self.end_refinement_frames < 0
+        ):
+            raise ValueError("end_refinement_frames must be a non-negative integer")
 
     def to_dict(self) -> dict[str, float | int]:
         return asdict(self)
@@ -345,6 +425,595 @@ class StreamingSegmentDecoder:
         self._reset_pending_off()
 
 
+@dataclass(frozen=True)
+class _CausalEventPeak:
+    index: int
+    timestamp: float
+    probability: float
+    presence: float
+    previous_timestamp: float | None = None
+
+
+class _CausalEventPeakTracker:
+    """Hold a thresholded event run until its causal peak is known."""
+
+    def __init__(self, threshold: float) -> None:
+        self.threshold = float(threshold)
+        self._candidate: _CausalEventPeak | None = None
+        self._last_timestamp: float | None = None
+
+    def push(
+        self,
+        index: int,
+        timestamp: float,
+        probability: float,
+        presence: float,
+    ) -> _CausalEventPeak | None:
+        if probability >= self.threshold:
+            candidate = _CausalEventPeak(
+                index=index,
+                timestamp=timestamp,
+                probability=probability,
+                presence=presence,
+                previous_timestamp=self._last_timestamp,
+            )
+            if self._candidate is None or probability > self._candidate.probability:
+                self._candidate = candidate
+            self._last_timestamp = timestamp
+            return None
+        peak = self._candidate
+        self._candidate = None
+        self._last_timestamp = timestamp
+        return peak
+
+    def close(self) -> _CausalEventPeak | None:
+        peak = self._candidate
+        self._candidate = None
+        self._last_timestamp = None
+        return peak
+
+
+class StreamingEventPairDecoder:
+    """Decode causal start/end event peaks with delayed confirmation.
+
+    A peak is emitted only after its following sample arrives, so the selected
+    boundary remains causal while avoiding repeated threshold crossings. End
+    events are held briefly: a sustained presence recovery cancels a transient
+    end, while a subsequent start can still use the held end as a split point.
+    """
+
+    def __init__(self, config: StreamingDecoderConfig) -> None:
+        if not isinstance(config, StreamingDecoderConfig):
+            raise TypeError("config must be a StreamingDecoderConfig")
+        self.config = config
+        self._closed = False
+        self._sample_index = 0
+        self._last_timestamp: float | None = None
+        self._last_duration = 0.0
+        history_size = max(
+            8,
+            config.end_refinement_frames
+            + config.event_confirmation_samples
+            + config.event_recovery_samples
+            + 4,
+        )
+        self._recent_timestamps: deque[tuple[int, float]] = deque(
+            maxlen=history_size
+        )
+        self._start_peaks = _CausalEventPeakTracker(config.start_event_threshold)
+        self._end_peaks = _CausalEventPeakTracker(config.end_event_threshold)
+
+        self._active_start: _CausalEventPeak | None = None
+        self._active_presence_sum = 0.0
+        self._active_presence_count = 0
+        self._active_start_evidence = 0.0
+
+        self._pending_end: _CausalEventPeak | None = None
+        self._last_end_candidate: _CausalEventPeak | None = None
+        self._pending_age = 0
+        self._recovery_count = 0
+        self._last_strong_end_timestamp = -math.inf
+
+    def push(
+        self,
+        timestamp_seconds: float,
+        duration_seconds: float,
+        presence_probability: float,
+        start_event_probability: float,
+        end_event_probability: float,
+    ) -> tuple[SegmentPrediction, ...]:
+        if self._closed:
+            raise RuntimeError("cannot push samples after the decoder is closed")
+        timestamp = self._validate_sample(
+            timestamp_seconds,
+            duration_seconds,
+            presence_probability,
+            start_event_probability,
+            end_event_probability,
+        )
+        duration = float(duration_seconds)
+        presence = float(presence_probability)
+        index = self._sample_index
+        self._sample_index += 1
+        self._last_timestamp = timestamp
+        self._last_duration = duration
+        self._recent_timestamps.append((index, timestamp))
+
+        pending_before = self._pending_end is not None
+        end_peak = self._end_peaks.push(
+            index, timestamp, float(end_event_probability), presence
+        )
+        start_peak = self._start_peaks.push(
+            index, timestamp, float(start_event_probability), presence
+        )
+        emitted: list[SegmentPrediction] = []
+
+        # End evidence is processed first so a close/start transition at the
+        # same observed sample can split the old segment cleanly.
+        self._consume_end_peak(end_peak)
+        self._consume_start_peak(start_peak, emitted)
+
+        if self._active_start is not None:
+            if pending_before and self._pending_end is not None:
+                self._pending_age += 1
+                if presence >= self.config.event_recovery_threshold:
+                    self._recovery_count += 1
+                else:
+                    self._recovery_count = 0
+                if self._recovery_count >= self.config.event_recovery_samples:
+                    self._last_end_candidate = self._pending_end
+                    self._pending_end = None
+                    self._pending_age = 0
+                    self._recovery_count = 0
+                elif (
+                    self._pending_age >= self.config.event_confirmation_samples
+                ):
+                    prediction = self._finish_active(self._pending_end)
+                    if prediction is not None:
+                        emitted.append(prediction)
+            elif self._pending_end is None:
+                self._active_presence_sum += presence
+                self._active_presence_count += 1
+
+            if self._active_start is not None:
+                maximum_end = (
+                    self._active_start.timestamp
+                    + self.config.maximum_duration_seconds
+                )
+                if timestamp >= maximum_end:
+                    prediction = self._finish_active_at(maximum_end, 0.0)
+                    if prediction is not None:
+                        emitted.append(prediction)
+        return tuple(emitted)
+
+    def close(self) -> tuple[SegmentPrediction, ...]:
+        if self._closed:
+            return ()
+        emitted: list[SegmentPrediction] = []
+        # Flush any event run that was still above threshold at end of input.
+        self._consume_end_peak(self._end_peaks.close())
+        self._consume_start_peak(self._start_peaks.close(), emitted)
+        if self._active_start is not None and self._last_timestamp is not None:
+            if self._pending_end is not None:
+                prediction = self._finish_active(self._pending_end)
+            elif self._last_end_candidate is not None:
+                prediction = self._finish_active(self._last_end_candidate)
+            else:
+                tail_end = min(
+                    self._last_timestamp + self._last_duration,
+                    self._active_start.timestamp
+                    + self.config.maximum_duration_seconds,
+                )
+                prediction = self._finish_active_at(tail_end, 0.0)
+            if prediction is not None:
+                emitted.append(prediction)
+        self._clear_state()
+        self._closed = True
+        return tuple(emitted)
+
+    def _validate_sample(
+        self,
+        timestamp_seconds: float,
+        duration_seconds: float,
+        presence_probability: float,
+        start_event_probability: float,
+        end_event_probability: float,
+    ) -> float:
+        _validate_non_negative("timestamp_seconds", timestamp_seconds)
+        timestamp = float(timestamp_seconds)
+        if self._last_timestamp is not None and timestamp <= self._last_timestamp:
+            raise ValueError("sample timestamps must be strictly increasing")
+        _validate_non_negative("duration_seconds", duration_seconds)
+        _validate_probability("presence_probability", presence_probability)
+        _validate_probability("start_event_probability", start_event_probability)
+        _validate_probability("end_event_probability", end_event_probability)
+        return timestamp
+
+    def _consume_end_peak(self, peak: _CausalEventPeak | None) -> None:
+        if peak is None:
+            return
+        if peak.probability >= self.config.strong_end_event_threshold:
+            self._last_strong_end_timestamp = peak.timestamp
+        if self._active_start is None or peak.timestamp <= self._active_start.timestamp:
+            return
+        self._pending_end = peak
+        self._pending_age = 0
+        self._recovery_count = 0
+
+    def _consume_start_peak(
+        self,
+        peak: _CausalEventPeak | None,
+        emitted: list[SegmentPrediction],
+    ) -> None:
+        if peak is None or peak.presence < self.config.presence_on_threshold:
+            return
+        if (
+            peak.timestamp - self._last_strong_end_timestamp
+            < self.config.minimum_start_gap_seconds
+        ):
+            return
+        if self._active_start is None:
+            self._begin_active(peak)
+            return
+        if peak.timestamp <= self._active_start.timestamp:
+            return
+        candidate = self._pending_end or self._last_end_candidate
+        if candidate is None:
+            previous_timestamp = self._timestamp_for_index(peak.index - 1)
+            if previous_timestamp is None:
+                return
+            candidate = _CausalEventPeak(
+                index=peak.index - 1,
+                timestamp=previous_timestamp,
+                probability=0.0,
+                presence=0.0,
+                previous_timestamp=self._timestamp_for_index(peak.index - 2),
+            )
+        prediction = self._finish_active(candidate)
+        if prediction is not None:
+            emitted.append(prediction)
+        self._begin_active(peak)
+
+    def _begin_active(self, peak: _CausalEventPeak) -> None:
+        self._active_start = peak
+        self._active_presence_sum = peak.presence
+        self._active_presence_count = 1
+        self._active_start_evidence = peak.probability
+        self._pending_end = None
+        self._last_end_candidate = None
+        self._pending_age = 0
+        self._recovery_count = 0
+
+    def _finish_active(self, candidate: _CausalEventPeak) -> SegmentPrediction | None:
+        end_timestamp = candidate.timestamp
+        if (
+            candidate.probability < self.config.end_refinement_event_threshold
+            and self.config.end_refinement_frames > 0
+        ):
+            refined = (
+                candidate.previous_timestamp
+                if self.config.end_refinement_frames == 1
+                else self._timestamp_for_index(
+                    candidate.index - self.config.end_refinement_frames
+                )
+            )
+            if refined is not None:
+                end_timestamp = refined
+        return self._finish_active_at(end_timestamp, candidate.probability)
+
+    def _finish_active_at(
+        self,
+        end_timestamp: float,
+        end_evidence: float,
+    ) -> SegmentPrediction | None:
+        if self._active_start is None:
+            return None
+        start_timestamp = self._active_start.timestamp
+        duration = end_timestamp - start_timestamp
+        prediction: SegmentPrediction | None = None
+        if (
+            self.config.minimum_duration_seconds
+            <= duration
+            <= self.config.maximum_duration_seconds
+            and self._active_presence_count > 0
+        ):
+            mean_presence = self._active_presence_sum / self._active_presence_count
+            confidence = (
+                mean_presence + self._active_start_evidence + end_evidence
+            ) / 3.0
+            confidence = min(1.0, max(0.0, confidence))
+            if confidence >= self.config.score_threshold:
+                prediction = SegmentPrediction(
+                    start_seconds=start_timestamp,
+                    end_seconds=end_timestamp,
+                    confidence=confidence,
+                )
+        self._active_start = None
+        self._active_presence_sum = 0.0
+        self._active_presence_count = 0
+        self._active_start_evidence = 0.0
+        self._pending_end = None
+        self._last_end_candidate = None
+        self._pending_age = 0
+        self._recovery_count = 0
+        return prediction
+
+    def _timestamp_for_index(self, index: int) -> float | None:
+        for sample_index, timestamp in reversed(self._recent_timestamps):
+            if sample_index == index:
+                return timestamp
+            if sample_index < index:
+                break
+        return None
+
+    def _clear_state(self) -> None:
+        self._last_timestamp = None
+        self._last_duration = 0.0
+        self._recent_timestamps.clear()
+        self._active_start = None
+        self._active_presence_sum = 0.0
+        self._active_presence_count = 0
+        self._active_start_evidence = 0.0
+        self._pending_end = None
+        self._last_end_candidate = None
+        self._pending_age = 0
+        self._recovery_count = 0
+        self._last_strong_end_timestamp = -math.inf
+
+
+class StreamingAnchorDecoder:
+    """Decode causal end-anchor proposals with a fixed local peak buffer."""
+
+    def __init__(self, config: StreamingDecoderConfig) -> None:
+        if not isinstance(config, StreamingDecoderConfig):
+            raise TypeError("config must be a StreamingDecoderConfig")
+        self.config = config
+        self._closed = False
+        self._pending: tuple[float, float, float, float, float, float] | None = None
+        self._pending_age = 0
+        self._last_timestamp: float | None = None
+        self._last_duration = 0.0
+        self._last_prediction: SegmentPrediction | None = None
+        self._last_anchor_timestamp: float | None = None
+        self._start_event_history: deque[tuple[float, float]] = deque()
+        self._end_event_history: deque[tuple[float, float]] = deque()
+
+    def push(
+        self,
+        timestamp_seconds: float,
+        duration_seconds: float,
+        anchor_probability: float,
+        start_offset_seconds: float,
+        end_offset_seconds: float,
+        end_event_probability: float = 0.0,
+        start_event_probability: float = 0.0,
+    ) -> tuple[SegmentPrediction, ...]:
+        if self._closed:
+            raise RuntimeError("cannot push samples after the decoder is closed")
+        _validate_non_negative("timestamp_seconds", timestamp_seconds)
+        _validate_non_negative("duration_seconds", duration_seconds)
+        _validate_probability("anchor_probability", anchor_probability)
+        _validate_probability("end_event_probability", end_event_probability)
+        _validate_probability("start_event_probability", start_event_probability)
+        for name, value in (
+            ("start_offset_seconds", start_offset_seconds),
+            ("end_offset_seconds", end_offset_seconds),
+        ):
+            if not isinstance(value, Real) or not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+        timestamp = float(timestamp_seconds)
+        if self._last_timestamp is not None and timestamp <= self._last_timestamp:
+            raise ValueError("sample timestamps must be strictly increasing")
+        self._last_timestamp = timestamp
+        self._last_duration = float(duration_seconds)
+        self._start_event_history.append(
+            (timestamp, float(start_event_probability))
+        )
+        self._end_event_history.append((timestamp, float(end_event_probability)))
+        history_start = timestamp - max(
+            self.config.maximum_duration_seconds,
+            self.config.anchor_start_refinement_seconds,
+            self.config.anchor_end_refinement_seconds,
+        ) - 1.0
+        while self._start_event_history and self._start_event_history[0][0] < history_start:
+            self._start_event_history.popleft()
+        while self._end_event_history and self._end_event_history[0][0] < history_start:
+            self._end_event_history.popleft()
+
+        emitted: list[SegmentPrediction] = []
+        score = float(anchor_probability)
+        end_event = float(end_event_probability)
+        qualifies = (
+            end_event >= self.config.anchor_end_event_threshold
+        )
+        candidate = (
+            timestamp,
+            score,
+            float(start_offset_seconds),
+            float(end_offset_seconds),
+            float(duration_seconds),
+            score * end_event if self.config.anchor_end_event_threshold > 0.0 else score,
+        )
+        if self._pending is not None:
+            if (
+                qualifies
+                and score >= self.config.anchor_score_threshold
+                and candidate[5] > self._pending[5]
+            ):
+                self._pending = candidate
+                self._pending_age = 0
+            else:
+                self._pending_age += 1
+                if self._pending_age > self.config.anchor_peak_radius_frames:
+                    prediction = self._finish_pending()
+                    if prediction is not None:
+                        emitted.append(prediction)
+                    if qualifies and score >= self.config.anchor_score_threshold:
+                        self._pending = candidate
+                        self._pending_age = 0
+        elif qualifies and score >= self.config.anchor_score_threshold:
+            self._pending = candidate
+            self._pending_age = 0
+
+        if self._pending is not None and self._pending_age > self.config.anchor_peak_radius_frames:
+            prediction = self._finish_pending()
+            if prediction is not None:
+                emitted.append(prediction)
+        return tuple(emitted)
+
+    def close(self) -> tuple[SegmentPrediction, ...]:
+        if self._closed:
+            return ()
+        emitted: tuple[SegmentPrediction, ...] = ()
+        prediction = self._finish_pending()
+        if prediction is not None:
+            emitted = (prediction,)
+        self._pending = None
+        self._closed = True
+        return emitted
+
+    def _finish_pending(self) -> SegmentPrediction | None:
+        if self._pending is None:
+            return None
+        timestamp, score, start_offset, end_offset, _, _ = self._pending
+        self._pending = None
+        self._pending_age = 0
+        if (
+            self._last_anchor_timestamp is not None
+            and timestamp - self._last_anchor_timestamp
+            < max(
+                self.config.minimum_duration_seconds,
+                self.config.minimum_anchor_gap_seconds,
+            )
+        ):
+            return None
+        start = timestamp + start_offset
+        end = timestamp + end_offset
+        if self.config.anchor_start_refinement_seconds > 0.0:
+            start = self._refine_boundary(
+                start,
+                self.config.anchor_start_refinement_seconds,
+                self.config.anchor_start_event_threshold,
+                self._start_event_history,
+            )
+        if self.config.anchor_pair_start_events:
+            start = self._pair_start_event(
+                timestamp,
+                start,
+                self.config.anchor_start_event_threshold,
+                self._start_event_history,
+                self._last_anchor_timestamp,
+                self.config.minimum_anchor_gap_seconds,
+            )
+        if self.config.anchor_end_refinement_seconds > 0.0:
+            end = self._refine_boundary(
+                end,
+                self.config.anchor_end_refinement_seconds,
+                self.config.anchor_end_event_threshold,
+                self._end_event_history,
+            )
+        duration = end - start
+        if (
+            start < 0.0
+            or duration < self.config.minimum_duration_seconds
+            or duration > self.config.maximum_duration_seconds
+        ):
+            return None
+        prediction = SegmentPrediction(start, end, score)
+        previous = self._last_prediction
+        if previous is not None:
+            intersection = max(
+                0.0,
+                min(previous.end_seconds, prediction.end_seconds)
+                - max(previous.start_seconds, prediction.start_seconds),
+            )
+            union = max(previous.end_seconds, prediction.end_seconds) - min(
+                previous.start_seconds, prediction.start_seconds
+            )
+            iou = intersection / union if union > 0.0 else 0.0
+            if iou >= self.config.anchor_nms_iou_threshold:
+                return None
+        self._last_prediction = prediction
+        self._last_anchor_timestamp = timestamp
+        return prediction
+
+    @staticmethod
+    def _refine_boundary(
+        estimate: float,
+        window: float,
+        event_threshold: float,
+        history: deque[tuple[float, float]],
+    ) -> float:
+        candidates = [
+            (-probability, abs(timestamp - estimate), timestamp)
+            for timestamp, probability in history
+            if abs(timestamp - estimate) <= window
+            and probability >= event_threshold
+        ]
+        if not candidates:
+            return estimate
+        return min(candidates)[2]
+
+    @staticmethod
+    def _pair_start_event(
+        anchor_timestamp: float,
+        estimate: float,
+        event_threshold: float,
+        history: deque[tuple[float, float]],
+        previous_anchor_timestamp: float | None,
+        minimum_gap_seconds: float,
+    ) -> float:
+        lower_bound = (
+            -math.inf
+            if previous_anchor_timestamp is None
+            else previous_anchor_timestamp + max(0.2, minimum_gap_seconds)
+        )
+        candidates = [
+            (probability, timestamp)
+            for timestamp, probability in history
+            if lower_bound < timestamp < anchor_timestamp
+            and anchor_timestamp - timestamp <= 8.0
+            and probability >= event_threshold
+        ]
+        if not candidates:
+            return estimate
+        return max(candidates)[1]
+
+
+def decode_stream_anchor_predictions(
+    predictions: np.ndarray,
+    timestamps: np.ndarray,
+    durations: np.ndarray,
+    config: StreamingDecoderConfig = StreamingDecoderConfig(),
+) -> list[SegmentPrediction]:
+    """Decode `[anchor, start offset, end offset]` stream predictions."""
+    predictions = np.asarray(predictions)
+    timestamps = np.asarray(timestamps)
+    durations = np.asarray(durations)
+    if predictions.ndim != 2 or predictions.shape[1] != 6:
+        raise ValueError("anchor predictions must have shape [samples,6]")
+    if timestamps.shape != (len(predictions),) or durations.shape != (len(predictions),):
+        raise ValueError("timestamps and durations must match anchor predictions")
+    decoder = StreamingAnchorDecoder(config)
+    segments: list[SegmentPrediction] = []
+    for row, timestamp, duration in zip(
+        predictions, timestamps, durations, strict=True
+    ):
+        segments.extend(
+            decoder.push(
+                float(timestamp),
+                float(duration),
+                float(row[3]),
+                float(row[4]),
+                float(row[5]),
+                float(row[2]),
+                float(row[1]),
+            )
+        )
+    segments.extend(decoder.close())
+    return segments
+
+
 def decode_stream_predictions(
     predictions: np.ndarray,
     timestamps: np.ndarray,
@@ -363,7 +1032,12 @@ def decode_stream_predictions(
     if durations.shape != (sample_count,):
         raise ValueError("durations must have shape [samples]")
 
-    decoder = StreamingSegmentDecoder(config)
+    decoder: StreamingSegmentDecoder | StreamingEventPairDecoder
+    decoder = (
+        StreamingEventPairDecoder(config)
+        if config.causal_event_pairing
+        else StreamingSegmentDecoder(config)
+    )
     segments: list[SegmentPrediction] = []
     for prediction, timestamp, duration in zip(
         predictions, timestamps, durations, strict=True
