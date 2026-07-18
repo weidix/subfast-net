@@ -8,13 +8,13 @@ from torch.nn import functional as F
 
 from .alignment import extreme_gap_loss, pair_similarity
 from ..pairs import (
-    EmbeddingPair,
-    EmbeddingPairSelection,
+    RoiPair,
+    RoiPairSelection,
     is_same_subtitle_text,
     max_ocr_negative_pairs,
     normalize_ocr_text,
     normalized_ocr_text_similarity_at_most,
-    select_embedding_pairs,
+    select_pairs,
 )
 
 
@@ -290,10 +290,10 @@ def metric_embedding_loss(
     embedding_extreme_gap_tail_ratio: float = 0.10,
     embedding_extreme_gap_temperature: float = 0.05,
     embedding_extreme_gap_margin: float = 0.15,
-    explicit_pairs: Sequence[EmbeddingPair] | None = None,
+    explicit_pairs: Sequence[RoiPair] | None = None,
 ) -> tuple[torch.Tensor, int, int, int, int, int, int, int, int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
     if explicit_pairs is None:
-        selection = select_embedding_pairs(
+        selection = select_pairs(
             presence=presence,
             segment_ids=segment_ids,
             roots=roots,
@@ -305,7 +305,7 @@ def metric_embedding_loss(
             ocr_negative_ratio=ocr_negative_ratio,
         )
     else:
-        selection = EmbeddingPairSelection(
+        selection = RoiPairSelection(
             pairs=list(explicit_pairs),
             local_positive_pairs=sum(1 for pair in explicit_pairs if pair.same and pair.source == "local"),
             local_negative_pairs=sum(1 for pair in explicit_pairs if not pair.same and pair.source == "local"),
@@ -431,7 +431,7 @@ def roi_presence_embedding_loss(
     embedding_extreme_gap_margin: float = 0.15,
     presence_loss_enabled: bool = True,
     embedding_loss_enabled: bool = True,
-    explicit_embedding_pairs: Sequence[EmbeddingPair] | None = None,
+    explicit_embedding_pairs: Sequence[RoiPair] | None = None,
 ) -> RoiLossBreakdown:
     presence_loss = (
         F.binary_cross_entropy_with_logits(presence_logit, presence, weight=presence_loss_weights)

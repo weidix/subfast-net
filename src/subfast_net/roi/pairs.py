@@ -870,16 +870,3 @@ def infer_adjacent_segment_ids(
                 adjacent[index].add(previous_segment)
             previous_segment = segment_id
     return [frozenset(values) for values in adjacent]
-
-
-# ``EmbeddingPair`` was the original name used by the combined Presence +
-# Embedding trainer.  Keep these aliases while exposing the shorter ROI pair
-# vocabulary as the canonical API.
-EmbeddingPair = RoiPair
-EmbeddingPairSelection = RoiPairSelection
-ScheduledEmbeddingBatch = ScheduledPairBatch
-EmbeddingPairEpochSchedule = RoiPairEpochSchedule
-EmbeddingPairPools = RoiPairPools
-select_embedding_pairs = select_pairs
-build_embedding_pair_epoch_schedule = build_pair_epoch_schedule
-build_embedding_pair_pools = build_pair_pools

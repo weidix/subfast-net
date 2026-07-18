@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 @lru_cache(maxsize=128)
-def _sha256_for_stat(path: Path, size: int, modified_ns: int) -> str:
+def _sha256_for_stat(path: Path, _size: int, _modified_ns: int) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as file:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):

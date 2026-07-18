@@ -78,34 +78,6 @@ class MaskedAttentionEmbeddingHead(nn.Module):
         return embedding, attention_logits
 
 
-class MaskedGlobalEmbeddingHead(nn.Module):
-    """Legacy masked-global head kept for old checkpoint reproduction."""
-
-    def __init__(self, feature_dim: int, embedding_dim: int) -> None:
-        super().__init__()
-        self.contrast = LocalContrastResidual()
-        stacked_dim = feature_dim * 2
-        self.attention = nn.Sequential(
-            nn.Conv2d(stacked_dim, feature_dim, 3, padding=1, bias=False),
-            nn.BatchNorm2d(feature_dim),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(feature_dim, 1, 1),
-        )
-        self.projection = nn.Sequential(
-            nn.Linear(stacked_dim, stacked_dim),
-            nn.SiLU(inplace=True),
-            nn.Linear(stacked_dim, embedding_dim),
-        )
-
-    def forward(self, feature_map: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        stacked = torch.cat([feature_map, self.contrast(feature_map)], dim=1)
-        attention_logits = self.attention(stacked)
-        weights = torch.sigmoid(attention_logits)
-        denominator = weights.sum(dim=(2, 3)).clamp_min(1e-4)
-        pooled = (stacked * weights).sum(dim=(2, 3)) / denominator
-        return self.projection(pooled), attention_logits
-
-
 class LocalTextnessPresenceHead(nn.Module):
     def __init__(self, feature_dim: int, hidden_dim: int | None = None, topk_ratio: float = 0.05) -> None:
         super().__init__()
@@ -184,8 +156,6 @@ class RoiPresenceEmbeddingModel(nn.Module):
                 embedding_dim,
                 width_tokens=embedding_width_tokens,
             )
-        elif embedding_aggregation == "masked_global":
-            self.embedding_head = MaskedGlobalEmbeddingHead(feature_dim, embedding_dim)
         elif embedding_aggregation == "local_alignment":
             from .alignment import LocalAlignmentEmbeddingHead
 

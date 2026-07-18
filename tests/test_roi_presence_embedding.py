@@ -10,7 +10,7 @@ import torch
 from PIL import Image
 
 from subfast_net.roi.embedding.config import RoiTrainSettings
-from subfast_net.roi.data import RoiPresenceEmbeddingDataset, RoiSample, collate_roi_batch
+from subfast_net.roi.data import RoiPairDataset, RoiSample, collate_pair_batch
 from subfast_net.roi.embedding.loss import (
     EmbeddingPairMemory,
     balance_embedding_pairs,
@@ -20,10 +20,10 @@ from subfast_net.roi.embedding.loss import (
 )
 from subfast_net.roi.embedding.metrics import embedding_metrics
 from subfast_net.roi.pairs import (
-    EmbeddingPair,
-    EmbeddingPairPools,
-    build_embedding_pair_epoch_schedule,
-    select_embedding_pairs,
+    RoiPair,
+    RoiPairPools,
+    build_pair_epoch_schedule,
+    select_pairs,
 )
 from subfast_net.roi.embedding.model import MaskedAttentionEmbeddingHead, LocalContrastResidual, LocalTextnessPresenceHead, RoiPresenceEmbeddingModel
 from subfast_net.roi.embedding.train import (
@@ -182,7 +182,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
             )
 
     def test_embedding_pair_scheduler_does_not_repeat_positive_pairs_when_pool_is_sufficient(self):
-        schedule = build_embedding_pair_epoch_schedule(
+        schedule = build_pair_epoch_schedule(
             make_scheduler_samples(),
             batch_size=4,
             negative_ratio=0.0,
@@ -198,7 +198,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertEqual(schedule.positive_pair_repeat_rate, 0.0)
 
     def test_embedding_pair_scheduler_does_not_repeat_positive_pairs_when_pool_is_smaller_than_roi_count(self):
-        schedule = build_embedding_pair_epoch_schedule(
+        schedule = build_pair_epoch_schedule(
             make_scheduler_samples(segments=3, per_segment=2),
             batch_size=4,
             negative_ratio=0.0,
@@ -215,7 +215,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertEqual(schedule.positive_pair_repeat_rate, 0.0)
 
     def test_embedding_pair_scheduler_does_not_repeat_negative_pairs_when_pool_is_sufficient(self):
-        schedule = build_embedding_pair_epoch_schedule(
+        schedule = build_pair_epoch_schedule(
             make_scheduler_samples(),
             batch_size=4,
             negative_ratio=0.5,
@@ -231,7 +231,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertEqual(schedule.negative_pair_repeat_rate, 0.0)
 
     def test_embedding_pair_scheduler_prioritizes_positive_roi_coverage(self):
-        schedule = build_embedding_pair_epoch_schedule(
+        schedule = build_pair_epoch_schedule(
             make_scheduler_samples(),
             batch_size=4,
             negative_ratio=0.0,
@@ -247,7 +247,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
 
     def test_embedding_pair_scheduler_includes_maximum_time_span_positive(self):
         samples = make_scheduler_samples(segments=1, per_segment=4)
-        schedule = build_embedding_pair_epoch_schedule(
+        schedule = build_pair_epoch_schedule(
             samples,
             batch_size=4,
             negative_ratio=0.0,
@@ -285,7 +285,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
                         annotation={},
                     )
                 )
-        schedule = build_embedding_pair_epoch_schedule(
+        schedule = build_pair_epoch_schedule(
             samples,
             batch_size=4,
             negative_ratio=0.25,
@@ -309,7 +309,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertEqual(negative_segments, {frozenset(("segment-0", "segment-1"))})
 
     def test_embedding_pair_scheduler_respects_embedding_negative_ratio(self):
-        schedule = build_embedding_pair_epoch_schedule(
+        schedule = build_pair_epoch_schedule(
             make_scheduler_samples(),
             batch_size=4,
             negative_ratio=0.5,
@@ -326,23 +326,23 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
 
     def test_embedding_pair_scheduler_reserves_ocr_negative_budget(self):
         samples = make_scheduler_samples()
-        pools = EmbeddingPairPools(
+        pools = RoiPairPools(
             positive_pairs=tuple(
-                EmbeddingPair(i=index, j=index + 1, same=True, source="local")
+                RoiPair(i=index, j=index + 1, same=True, source="local")
                 for index in range(0, 12, 2)
             ),
             local_negative_pairs=tuple(
-                EmbeddingPair(i=index, j=(index + 2) % 12, same=False, source="local")
+                RoiPair(i=index, j=(index + 2) % 12, same=False, source="local")
                 for index in range(6)
             ),
             ocr_negative_pairs=tuple(
-                EmbeddingPair(i=index, j=index + 6, same=False, source="ocr")
+                RoiPair(i=index, j=index + 6, same=False, source="ocr")
                 for index in range(6)
             ),
             total_positive_roi_count=12,
         )
 
-        schedule = build_embedding_pair_epoch_schedule(
+        schedule = build_pair_epoch_schedule(
             samples,
             batch_size=4,
             negative_ratio=0.5,
@@ -530,7 +530,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertTrue(torch.allclose(dark_background, bright_background, atol=1e-4))
 
     def test_embedding_pair_selection_uses_only_local_subtitle_pairs(self):
-        selection = select_embedding_pairs(
+        selection = select_pairs(
             presence=torch.tensor([1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0]),
             segment_ids=["seg-a", "seg-a", "seg-b", "seg-c", "empty", "seg-d", "seg-a"],
             roots=["root-a", "root-a", "root-a", "root-b", "root-a", "root-a", "root-a"],
@@ -560,7 +560,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
         self.assertGreater(selection.skipped_pairs, 0)
 
     def test_embedding_pair_selection_adds_only_strong_ocr_negative_pairs(self):
-        selection = select_embedding_pairs(
+        selection = select_pairs(
             presence=torch.ones(6),
             segment_ids=["seg-a", "seg-b", "seg-b", "seg-d", "seg-a", "seg-e"],
             roots=["root-a", "root-a", "root-a", "root-a", "root-a", "root-b"],
@@ -582,8 +582,8 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
             root = Path(tmp)
             write_roi_dataset(root)
 
-            dataset = RoiPresenceEmbeddingDataset([root])
-            batch = collate_roi_batch([dataset[0], dataset[3]])
+            dataset = RoiPairDataset([root])
+            batch = collate_pair_batch([dataset[0], dataset[3]])
 
             self.assertEqual(dataset.summary.roi_size, (32, 16))
             self.assertEqual(dataset.summary.positive, 3)
@@ -599,7 +599,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
             root = Path(tmp)
             write_roi_dataset(root, size=(32, 16))
 
-            dataset = RoiPresenceEmbeddingDataset([root], resize_roi=(16, 8))
+            dataset = RoiPairDataset([root], resize_roi=(16, 8))
             item = dataset[0]
 
             mask = item["subtitle_mask"]
@@ -615,9 +615,9 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
             write_roi_dataset(root_b, size=(40, 20))
 
             with self.assertRaises(ValueError):
-                RoiPresenceEmbeddingDataset([root_a, root_b])
+                RoiPairDataset([root_a, root_b])
 
-            dataset = RoiPresenceEmbeddingDataset([root_a, root_b], resize_roi=(32, 16))
+            dataset = RoiPairDataset([root_a, root_b], resize_roi=(32, 16))
             self.assertEqual(dataset.summary.roi_size, (32, 16))
 
     def test_validation_limit_keeps_same_segment_pairs(self):
@@ -625,7 +625,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
             root = Path(tmp)
             write_roi_dataset(root)
 
-            dataset = RoiPresenceEmbeddingDataset(
+            dataset = RoiPairDataset(
                 [root],
                 max_samples=3,
                 empty_ratio=1 / 3,

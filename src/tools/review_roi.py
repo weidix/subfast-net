@@ -54,26 +54,12 @@ class SegmentReviewApp:
         if not self.review_path.exists():
             return {}
         data = json.loads(self.review_path.read_text(encoding="utf-8"))
+        if data.get("version") != 2:
+            raise ValueError(f"unsupported ROI review version in {self.review_path}")
         if "items" not in data:
             return {}
         loaded = dict(data["items"])
-        if data.get("version") != 2:
-            return self.migrate_legacy_review(loaded)
         return loaded
-
-    def migrate_legacy_review(self, legacy: dict[str, dict[str, object]]) -> dict[str, dict[str, object]]:
-        review = {}
-        for item in self.items:
-            marker = str(item.get("segment_marker") or item["id"])
-            old = legacy.get(marker, {})
-            segment_id = str(old.get("replacement_marker") or marker)
-            review[str(item["id"])] = {
-                "has_subtitle": bool(item.get("has_subtitle")),
-                "segment_id": segment_id,
-                "note": str(old.get("note", "")),
-                "updated_at": int(time.time()),
-            }
-        return review
 
     def load_craft_manifest(self) -> dict[str, dict[str, object]]:
         manifest_path = self.craft_outputs_dir / "manifest.jsonl"

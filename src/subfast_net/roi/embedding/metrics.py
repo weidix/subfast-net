@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from .alignment import pair_similarity
-from ..pairs import select_embedding_pairs
+from ..pairs import select_pairs
 
 
 def presence_metrics(presence_logit: torch.Tensor, presence: torch.Tensor) -> dict[str, float]:
@@ -106,7 +106,7 @@ def embedding_metrics(
     ocr_negative_ratio: float,
     threshold: float,
 ) -> dict[str, float]:
-    selection = select_embedding_pairs(
+    selection = select_pairs(
         presence=presence,
         segment_ids=segment_ids,
         roots=roots,

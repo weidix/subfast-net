@@ -433,10 +433,3 @@ def collate_pair_batch(items: list[dict]) -> RoiPairBatch:
         ocr_texts=[item["ocr_text"] for item in items],
         adjacent_segment_ids=[item["adjacent_segment_ids"] for item in items],
     )
-
-
-# Compatibility names for checkpoints and scripts created before the ROI
-# matcher/presence split.  The dataset is shared by both training paths.
-RoiPresenceEmbeddingDataset = RoiPairDataset
-RoiBatch = RoiPairBatch
-collate_roi_batch = collate_pair_batch

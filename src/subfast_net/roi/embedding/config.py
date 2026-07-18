@@ -50,7 +50,7 @@ class RoiTrainSettings(BaseModel):
     width: int = 32
     embedding_dim: int = Field(default=256, gt=0)
     embedding_width_tokens: int = Field(default=32, gt=0)
-    embedding_aggregation: Literal["masked_global", "width_tokens", "local_alignment"] = "width_tokens"
+    embedding_aggregation: Literal["width_tokens", "local_alignment"] = "width_tokens"
     embedding_extreme_gap_weight: float = Field(default=0.0, ge=0.0)
     embedding_extreme_gap_tail_ratio: float = Field(default=0.10, gt=0.0, le=1.0)
     embedding_extreme_gap_temperature: float = Field(default=0.05, gt=0.0)

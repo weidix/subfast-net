@@ -28,7 +28,7 @@ def load_streaming_records(
     *,
     boundary_event_sigma_seconds: float = 0.05,
 ) -> list[StreamingLoadedRecord]:
-    """Load validated legacy caches and derive causal streaming targets."""
+    """Load validated feature caches and derive causal streaming targets."""
     validated: list[LoadedRecord] = load_records(
         records,
         boundary_event_sigma_seconds=boundary_event_sigma_seconds,

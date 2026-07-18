@@ -44,11 +44,6 @@ class _MatchScore:
         return self.count, self.iou_sum, -self.boundary_error_sum
 
 
-_LegacyIntervalMetricSample = tuple[
-    Sequence[SubtitleInterval], Sequence[SubtitleInterval], float
-]
-
-
 def interval_iou(left: SubtitleInterval, right: SubtitleInterval) -> float:
     intersection = max(
         0.0,
@@ -221,20 +216,6 @@ def interval_metrics(
     )
 
 
-def _coerce_metric_sample(
-    sample: IntervalMetricSample | _LegacyIntervalMetricSample,
-) -> IntervalMetricSample:
-    if isinstance(sample, IntervalMetricSample):
-        return sample
-    predicted, target, duration = sample
-    return IntervalMetricSample(
-        predicted=predicted,
-        target=target,
-        video_duration_seconds=duration,
-        frame_tolerance_seconds=DEFAULT_FRAME_TOLERANCE_SECONDS,
-    )
-
-
 def _error_summary(values: list[float]) -> tuple[float, float, float]:
     if not values:
         return 0.0, 0.0, 0.0
@@ -261,7 +242,7 @@ def _add_segment_metrics(
 
 
 def aggregate_interval_metrics(
-    samples: Iterable[IntervalMetricSample | _LegacyIntervalMetricSample],
+    samples: Iterable[IntervalMetricSample],
 ) -> dict[str, float]:
     """Aggregate IoU and strict paired-boundary metrics across videos."""
     predicted_count = 0
@@ -276,8 +257,7 @@ def aggregate_interval_metrics(
         "100ms": [0, 0, 0],
         "250ms": [0, 0, 0],
     }
-    for raw_sample in samples:
-        sample = _coerce_metric_sample(raw_sample)
+    for sample in samples:
         predicted = sample.predicted
         target = sample.target
         matches = match_intervals(predicted, target)

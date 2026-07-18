@@ -622,7 +622,7 @@ class H264TimingTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "closed"):
             detector.push(StreamSample(7.0, 1 / 30.0, [0.0, 0.0]))
 
-    def test_streaming_checkpoint_is_separate_from_legacy_v5(self):
+    def test_streaming_checkpoint_is_separate_from_segment_v5(self):
         config = StreamingModelConfig(
             feature_count=2,
             token_count=1,

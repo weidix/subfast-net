@@ -14,18 +14,18 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .config import RoiTrainSettings
-from ..data import RoiPresenceEmbeddingDataset, collate_roi_batch
+from ..data import RoiPairDataset, collate_pair_batch
 from .loss import EmbeddingPairMemory, roi_presence_embedding_loss
 from .alignment import pair_similarity
 from .metrics import embedding_metrics, presence_metrics, similarity_percentile
 from .model import RoiPresenceEmbeddingModel
 from ..pairs import (
-    EmbeddingPair,
-    ScheduledEmbeddingBatch,
-    build_embedding_pair_epoch_schedule,
-    build_embedding_pair_pools,
+    RoiPair,
+    ScheduledPairBatch,
+    build_pair_epoch_schedule,
+    build_pair_pools,
     normalize_ocr_text,
-    select_embedding_pairs,
+    select_pairs,
 )
 from .sampler import RoiBalancedBatchSampler
 from ...detector.train import choose_device
@@ -136,9 +136,9 @@ def checkpoint_score(metrics: dict[str, float], phase_name: str = "joint") -> fl
     return 0.5 * presence_score + 0.5 * embedding_score
 
 
-def make_dataset(settings: RoiTrainSettings, train: bool) -> RoiPresenceEmbeddingDataset:
+def make_dataset(settings: RoiTrainSettings, train: bool) -> RoiPairDataset:
     roots = settings.train_roots if train else [settings.val_root]
-    return RoiPresenceEmbeddingDataset(
+    return RoiPairDataset(
         roots,
         resize_roi=settings.resize_roi,
         max_samples=settings.max_train_samples if train else settings.max_val_samples,
@@ -314,20 +314,14 @@ def load_resume_checkpoint(
     checkpoint = torch.load(checkpoint_path, map_location=device)
     if not isinstance(checkpoint, dict) or checkpoint.get("model_type") != "roi_presence_embedding":
         raise RuntimeError(f"invalid ROI Presence+Embedding checkpoint: {checkpoint_path}")
-    checkpoint_state, partial_model_load = compatible_model_state(model, checkpoint["model"])
-    if partial_model_load:
-        print(
-            f"warning: checkpoint model structure differs; loading {len(checkpoint_state)}/{len(model.state_dict())} matching tensors",
-            flush=True,
-        )
-    model.load_state_dict(checkpoint_state, strict=not partial_model_load)
+    model.load_state_dict(checkpoint["model"])
     metrics = dict(checkpoint.get("metrics") or {})
     completed_epoch = int(checkpoint.get("epoch", metrics.get("epoch", 0)))
     step = int(checkpoint.get("step", metrics.get("step", 0)))
     best_presence_f1 = float(checkpoint.get("best_presence_f1", metrics.get("presence_f1", -1.0)))
     best_epoch = int(checkpoint.get("best_epoch", metrics.get("best_epoch", completed_epoch)))
     best_metrics = dict(checkpoint.get("best_metrics") or metrics)
-    optimizer_state = checkpoint.get("optimizer") if not partial_model_load else None
+    optimizer_state = checkpoint.get("optimizer")
     training_phase = checkpoint.get("training_phase")
     return checkpoint_path, completed_epoch + 1, step, best_presence_f1, best_epoch, metrics, best_metrics, optimizer_state, training_phase
 
@@ -348,30 +342,10 @@ def load_model_checkpoint(
         embedding_width_tokens=int(
             raw_settings.get("embedding_width_tokens", RoiTrainSettings().embedding_width_tokens)
         ),
-        embedding_aggregation=str(raw_settings.get("embedding_aggregation", "masked_global")),
+        embedding_aggregation=str(raw_settings.get("embedding_aggregation", "width_tokens")),
     ).to(device)
-    checkpoint_state, partial_model_load = compatible_model_state(model, checkpoint["model"])
-    if partial_model_load:
-        print(
-            f"warning: checkpoint model structure differs; loading {len(checkpoint_state)}/{len(model.state_dict())} matching tensors",
-            flush=True,
-        )
-    model.load_state_dict(checkpoint_state, strict=not partial_model_load)
+    model.load_state_dict(checkpoint["model"])
     return model, checkpoint
-
-
-def compatible_model_state(
-    model: RoiPresenceEmbeddingModel,
-    checkpoint_model: dict[str, torch.Tensor],
-) -> tuple[dict[str, torch.Tensor], bool]:
-    model_state = model.state_dict()
-    compatible = {
-        key: value
-        for key, value in checkpoint_model.items()
-        if key in model_state and tuple(value.shape) == tuple(model_state[key].shape)
-    }
-    partial = set(compatible) != set(model_state) or set(checkpoint_model) != set(model_state)
-    return compatible, partial
 
 
 @torch.no_grad()
@@ -553,7 +527,7 @@ def scoped_validation_metrics(
     metrics.update(_presence_metrics_for_mask(logits, presence, negative_mask | normal_positive, "normal"))
     metrics.update(_presence_metrics_for_mask(logits, presence, negative_mask | short_positive, "short"))
 
-    selection = select_embedding_pairs(
+    selection = select_pairs(
         presence=presence,
         segment_ids=segment_ids,
         roots=roots,
@@ -616,7 +590,7 @@ def embedding_error_pair_records(
     ocr_negative_ratio: float,
     threshold: float,
 ) -> list[dict[str, Any]]:
-    selection = select_embedding_pairs(
+    selection = select_pairs(
         presence=presence,
         segment_ids=segment_ids,
         roots=roots,
@@ -886,7 +860,7 @@ def short_positive_mask_loss(
 
 
 def make_training_loader(
-    dataset: RoiPresenceEmbeddingDataset,
+    dataset: RoiPairDataset,
     *,
     batch_size: int,
     negative_ratio: float | None,
@@ -900,7 +874,7 @@ def make_training_loader(
                 batch_size=batch_size,
                 shuffle=True,
                 num_workers=num_workers,
-                collate_fn=collate_roi_batch,
+                collate_fn=collate_pair_batch,
             ),
             None,
         )
@@ -915,17 +889,17 @@ def make_training_loader(
             dataset,
             batch_sampler=sampler,
             num_workers=num_workers,
-            collate_fn=collate_roi_batch,
+            collate_fn=collate_pair_batch,
         ),
         sampler,
     )
 
 
 def load_scheduled_embedding_batch(
-    dataset: RoiPresenceEmbeddingDataset,
-    schedule_batch: ScheduledEmbeddingBatch,
+    dataset: RoiPairDataset,
+    schedule_batch: ScheduledPairBatch,
 ) -> Any:
-    return collate_roi_batch([dataset[index] for index in schedule_batch.sample_indices])
+    return collate_pair_batch([dataset[index] for index in schedule_batch.sample_indices])
 
 
 def compute_train_batch_result(
@@ -937,7 +911,7 @@ def compute_train_batch_result(
     mode: str,
     embedding_negative_ratio: float,
     embedding_pair_memory: EmbeddingPairMemory | None,
-    explicit_embedding_pairs: tuple[EmbeddingPair, ...] | None = None,
+    explicit_embedding_pairs: tuple[RoiPair, ...] | None = None,
 ) -> RoiTrainBatchResult:
     if mode not in {"presence", "embedding"}:
         raise ValueError(f"unsupported ROI train batch mode: {mode}")
@@ -1134,7 +1108,7 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
         batch_size=settings.presence_batch_size,
         shuffle=False,
         num_workers=settings.num_workers,
-        collate_fn=collate_roi_batch,
+        collate_fn=collate_pair_batch,
     )
     model = make_model(settings).to(device)
     optimizer: torch.optim.Optimizer | None = None
@@ -1237,7 +1211,7 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
             default=0.0,
         )
         pool_start = time.perf_counter()
-        embedding_pair_pools = build_embedding_pair_pools(
+        embedding_pair_pools = build_pair_pools(
             train_dataset.samples,
             ocr_negative_enabled=settings.embedding_ocr_negative_enabled,
             ocr_negative_max_similarity=settings.embedding_ocr_negative_max_similarity,
@@ -1294,7 +1268,7 @@ def run_training(settings: RoiTrainSettings) -> dict[str, float]:
                 embedding_schedule = None
             else:
                 assert embedding_pair_pools is not None
-                embedding_schedule = build_embedding_pair_epoch_schedule(
+                embedding_schedule = build_pair_epoch_schedule(
                     train_dataset.samples,
                     batch_size=settings.embedding_batch_size if phase.name == "embedding" else joint_embedding_batch_size,
                     negative_ratio=settings.embedding_negative_ratio if phase.name == "embedding" else joint_embedding_negative_ratio,
@@ -1750,7 +1724,7 @@ def parse_args(argv: list[str] | None = None) -> RoiTrainSettings:
     )
     parser.add_argument(
         "--embedding-aggregation",
-        choices=("masked_global", "width_tokens", "local_alignment"),
+        choices=("width_tokens", "local_alignment"),
         default=RoiTrainSettings().embedding_aggregation,
     )
     parser.add_argument("--log-interval", type=int, default=RoiTrainSettings().log_interval)
@@ -1984,19 +1958,19 @@ def run_validation(args: argparse.Namespace) -> dict[str, float]:
         embedding_width_tokens=int(
             raw_settings.get("embedding_width_tokens", RoiTrainSettings().embedding_width_tokens)
         ),
-        embedding_aggregation=str(raw_settings.get("embedding_aggregation", "masked_global")),
+        embedding_aggregation=str(raw_settings.get("embedding_aggregation", "width_tokens")),
         device=args.device,
     )
-    dataset = RoiPresenceEmbeddingDataset(
+    dataset = RoiPairDataset(
         [args.root],
         resize_roi=settings.resize_roi,
         max_samples=args.max_samples,
         empty_ratio=None,
         segment_aware_limit=True,
     )
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_roi_batch)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_pair_batch)
     metrics = validate(model, loader, device, settings, error_pair_audit_path=args.error_pair_audit)
-    forward_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_roi_batch)
+    forward_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_pair_batch)
     metrics.update(
         {
             "record_type": "roi_checkpoint_validation",

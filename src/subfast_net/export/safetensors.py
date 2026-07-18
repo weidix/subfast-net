@@ -283,8 +283,8 @@ def _roi_embedding_config(
     state_dict: Mapping[str, torch.Tensor],
 ) -> dict[str, Any]:
     resize_roi = _roi_size(checkpoint, settings)
-    aggregation = str(_checkpoint_value(checkpoint, settings, "embedding_aggregation", "masked_global"))
-    if aggregation not in {"masked_global", "width_tokens", "local_alignment"}:
+    aggregation = str(_checkpoint_value(checkpoint, settings, "embedding_aggregation", "width_tokens"))
+    if aggregation not in {"width_tokens", "local_alignment"}:
         raise RuntimeError(f"unsupported roi_presence_embedding aggregation: {aggregation}")
     return {
         "model": {
