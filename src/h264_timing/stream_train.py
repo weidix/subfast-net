@@ -1,0 +1,687 @@
+from __future__ import annotations
+
+import json
+import random
+from pathlib import Path
+from typing import Literal, Self
+
+import numpy as np
+import torch
+from pydantic import BaseModel, Field, model_validator
+from torch.optim import AdamW
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from . import FEATURE_VERSION, STREAM_CHECKPOINT_FORMAT, STREAM_CHECKPOINT_VERSION
+from .dataset import compute_feature_stats, ensure_source_disjoint, read_manifest
+from .metrics import IntervalMetricSample, aggregate_interval_metrics
+from .postprocess import SegmentPrediction
+from .stream_dataset import (
+    StreamingLoadedRecord,
+    StreamingTimingWindowDataset,
+    load_streaming_records,
+)
+from .stream_loss import streaming_detection_loss
+from .stream_model import StreamingH264SubtitleModel, StreamingModelConfig
+from .stream_postprocess import StreamingDecoderConfig, decode_stream_predictions
+from .stream_predict import predict_stream_cache
+
+
+class StreamingTrainSettings(BaseModel):
+    manifest: Path
+    output_dir: Path
+    epochs: int = Field(default=20, gt=0)
+    batch_size: int = Field(default=8, gt=0)
+    learning_rate: float = Field(default=1e-3, gt=0.0)
+    weight_decay: float = Field(default=1e-4, ge=0.0)
+    window_frames: int = Field(default=512, gt=15)
+    stride_frames: int = Field(default=256, gt=0)
+    boundary_event_sigma_seconds: float = Field(default=0.05, gt=0.0)
+    target_recall: float = Field(default=1.0, gt=0.0, le=1.0)
+    minimum_duration_seconds: float = Field(default=0.20, ge=0.0)
+    maximum_duration_seconds: float = Field(default=8.0, gt=0.0)
+    width: int = Field(default=64, ge=16)
+    temporal_layers: int = Field(default=6, ge=1, le=9)
+    recurrent_layers: int = Field(default=1, ge=1, le=3)
+    dropout: float = Field(default=0.10, ge=0.0, lt=1.0)
+    use_byte_branch: bool = False
+    max_train_windows: int | None = Field(default=None, gt=0)
+    max_val_windows: int | None = Field(default=None, gt=0)
+    seed: int = 2026
+    device: str = "auto"
+    validation_mode: Literal["held_out", "diagnostic_temporal"] = "held_out"
+    temporal_guard_seconds: float = Field(default=10.0, ge=0.0)
+    inference_chunk_frames: int = Field(default=128, gt=0)
+
+    @model_validator(mode="after")
+    def validate_ranges(self) -> Self:
+        if self.stride_frames > self.window_frames:
+            raise ValueError("stride_frames must not exceed window_frames")
+        if self.maximum_duration_seconds <= self.minimum_duration_seconds:
+            raise ValueError("maximum duration must be greater than minimum duration")
+        return self
+
+
+StreamingPredictions = list[tuple[StreamingLoadedRecord, np.ndarray]]
+DecodedRecords = list[tuple[StreamingLoadedRecord, list[SegmentPrediction]]]
+
+
+def _select_device(requested: str) -> torch.device:
+    if requested != "auto":
+        return torch.device(requested)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def _presence_positive_weight(records: list[StreamingLoadedRecord]) -> float:
+    frame_count = sum(len(item.presence_targets) for item in records)
+    positive_mass = sum(
+        float(item.presence_targets.sum(dtype=np.float64)) for item in records
+    )
+    if frame_count <= 0 or positive_mass <= 0.0 or positive_mass >= frame_count:
+        raise ValueError("presence targets need positive and negative examples")
+    weight = (frame_count - positive_mass) / positive_mass
+    if not np.isfinite(weight) or weight <= 0.0:
+        raise ValueError("could not derive a finite presence positive weight")
+    return float(weight)
+
+
+def _boundary_event_positive_weights(
+    records: list[StreamingLoadedRecord],
+) -> np.ndarray:
+    frame_count = sum(len(item.boundary_event_targets) for item in records)
+    positive_mass = sum(
+        (item.boundary_event_targets.sum(axis=0, dtype=np.float64) for item in records),
+        start=np.zeros((2,), dtype=np.float64),
+    )
+    if frame_count <= 0 or np.any(positive_mass <= 0.0):
+        raise ValueError("both boundary event channels need positive examples")
+    weights = (frame_count - positive_mass) / positive_mass
+    if not np.isfinite(weights).all() or np.any(weights <= 0.0):
+        raise ValueError("could not derive finite boundary event weights")
+    return weights.astype(np.float32)
+
+
+def _window_loss(
+    model: StreamingH264SubtitleModel,
+    loader: DataLoader,
+    *,
+    device: torch.device,
+    optimizer: AdamW | None,
+    presence_positive_weight: torch.Tensor,
+    boundary_event_positive_weights: torch.Tensor,
+) -> dict[str, float]:
+    training = optimizer is not None
+    model.train(training)
+    totals = {
+        "loss": 0.0,
+        "presence_loss": 0.0,
+        "start_event_loss": 0.0,
+        "end_event_loss": 0.0,
+    }
+    total_frames = 0.0
+    context = torch.enable_grad() if training else torch.inference_mode()
+    with context:
+        for batch in tqdm(
+            loader, desc="stream-train" if training else "stream-val", leave=False
+        ):
+            features = batch["features"].to(device)
+            tokens = batch["tokens"]
+            if model.config.use_byte_branch:
+                tokens = tokens.to(device)
+            presence_targets = batch["presence_targets"].to(device)
+            boundary_targets = batch["boundary_event_targets"].to(device)
+            mask = batch["mask"].to(device)
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
+            output = model(features, tokens)
+            loss, components = streaming_detection_loss(
+                output,
+                presence_targets,
+                boundary_targets,
+                mask,
+                presence_positive_weight,
+                boundary_event_positive_weights,
+            )
+            if optimizer is not None:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                optimizer.step()
+            valid_frames = float(mask.sum().detach())
+            if valid_frames <= 0.0:
+                continue
+            totals["loss"] += float(loss.detach()) * valid_frames
+            for key, value in components.items():
+                totals[key] += value * valid_frames
+            total_frames += valid_frames
+    if total_frames <= 0.0:
+        raise ValueError("streaming timing dataset contains no valid frames")
+    return {key: value / total_frames for key, value in totals.items()}
+
+
+def _predict_records(
+    model: StreamingH264SubtitleModel,
+    records: list[StreamingLoadedRecord],
+    *,
+    feature_mean: np.ndarray,
+    feature_std: np.ndarray,
+    chunk_frames: int,
+    device: torch.device,
+) -> StreamingPredictions:
+    predictions: StreamingPredictions = []
+    for item in records:
+        predictions.append(
+            (
+                item,
+                predict_stream_cache(
+                    model,
+                    item.cache,
+                    feature_mean=feature_mean,
+                    feature_std=feature_std,
+                    chunk_frames=chunk_frames,
+                    device=device,
+                ),
+            )
+        )
+    return predictions
+
+
+def _frame_tolerance(item: StreamingLoadedRecord) -> float:
+    timestamps = np.asarray(item.cache.timestamps, dtype=np.float64)
+    positive_steps = np.diff(timestamps)
+    positive_steps = positive_steps[positive_steps > 0.0]
+    return float(np.median(positive_steps)) if positive_steps.size else 1.0 / 30.0
+
+
+def _decode_records(
+    predictions: StreamingPredictions,
+    config: StreamingDecoderConfig,
+) -> DecodedRecords:
+    return [
+        (
+            item,
+            decode_stream_predictions(
+                probabilities,
+                np.asarray(item.cache.timestamps, dtype=np.float64),
+                np.asarray(item.cache.durations, dtype=np.float64),
+                config,
+            ),
+        )
+        for item, probabilities in predictions
+    ]
+
+
+def _metric_samples(
+    decoded: DecodedRecords,
+    *,
+    score_threshold: float,
+) -> list[IntervalMetricSample]:
+    samples: list[IntervalMetricSample] = []
+    for item, segments in decoded:
+        cache_start, cache_end = item.cache.coverage_range_seconds
+        samples.append(
+            IntervalMetricSample(
+                predicted=[
+                    segment.to_interval()
+                    for segment in segments
+                    if segment.confidence >= score_threshold
+                ],
+                target=item.intervals,
+                video_duration_seconds=cache_end - cache_start,
+                frame_tolerance_seconds=_frame_tolerance(item),
+            )
+        )
+    return samples
+
+
+def _decoded_metrics(
+    decoded: DecodedRecords,
+    config: StreamingDecoderConfig,
+    *,
+    target_recall: float,
+    include_roles: bool,
+) -> dict[str, float]:
+    metrics = aggregate_interval_metrics(
+        _metric_samples(decoded, score_threshold=config.score_threshold)
+    )
+    if include_roles:
+        role_prefixes = {
+            "subtitle_signal": "signal",
+            "clean_control": "clean",
+            "source_timing": "source_timing",
+        }
+        for role, prefix in role_prefixes.items():
+            role_decoded = [
+                item
+                for item in decoded
+                if item[0].record.signal_validation_role == role
+            ]
+            if role_decoded:
+                role_metrics = aggregate_interval_metrics(
+                    _metric_samples(
+                        role_decoded,
+                        score_threshold=config.score_threshold,
+                    )
+                )
+                metrics.update(
+                    {f"{prefix}_{key}": value for key, value in role_metrics.items()}
+                )
+    metrics.update(
+        {
+            "score_threshold": config.score_threshold,
+            "presence_on_threshold": config.presence_on_threshold,
+            "presence_off_threshold": config.presence_off_threshold,
+            "boundary_event_threshold": config.boundary_event_threshold,
+            "confirmation_samples": float(config.confirmation_samples),
+            "recall_target": target_recall,
+            "recall_target_met": float(
+                metrics["interval_recall_iou50"] + 1e-12 >= target_recall
+            ),
+        }
+    )
+    return metrics
+
+
+def _calibration_key(metrics: dict[str, float], *, target_recall: float) -> tuple:
+    recall = metrics["interval_recall_iou50"]
+    target_met = recall + 1e-12 >= target_recall
+    if target_met:
+        return (
+            1,
+            metrics["segment_recall_1frame"],
+            metrics["segment_recall_100ms"],
+            metrics["matched_interval_mean_iou"],
+            -metrics["start_error_p95_seconds"],
+            -metrics["end_error_p95_seconds"],
+            metrics["interval_precision_iou50"],
+            -metrics["false_intervals_per_minute"],
+            metrics["score_threshold"],
+        )
+    return (
+        0,
+        recall,
+        metrics["segment_recall_1frame"],
+        metrics["segment_recall_100ms"],
+        metrics["matched_interval_mean_iou"],
+        metrics["interval_precision_iou50"],
+        -metrics["false_intervals_per_minute"],
+        metrics["score_threshold"],
+    )
+
+
+def _calibrate_decoder(
+    predictions: StreamingPredictions,
+    *,
+    settings: StreamingTrainSettings,
+) -> tuple[StreamingDecoderConfig, dict[str, float]]:
+    best: tuple[tuple, StreamingDecoderConfig, dict[str, float]] | None = None
+    presence_thresholds = (
+        (0.10, 0.05),
+        (0.35, 0.20),
+        (0.50, 0.35),
+        (0.65, 0.50),
+    )
+    for presence_on, presence_off in presence_thresholds:
+        for event_threshold in (0.15, 0.35, 0.50, 0.65):
+            base_config = StreamingDecoderConfig(
+                score_threshold=0.0,
+                presence_on_threshold=presence_on,
+                presence_off_threshold=presence_off,
+                boundary_event_threshold=event_threshold,
+                minimum_duration_seconds=settings.minimum_duration_seconds,
+                maximum_duration_seconds=settings.maximum_duration_seconds,
+            )
+            decoded = _decode_records(predictions, base_config)
+            for score_threshold in (0.0, 0.10, 0.25):
+                config = StreamingDecoderConfig(
+                    score_threshold=score_threshold,
+                    presence_on_threshold=presence_on,
+                    presence_off_threshold=presence_off,
+                    boundary_event_threshold=event_threshold,
+                    minimum_duration_seconds=settings.minimum_duration_seconds,
+                    maximum_duration_seconds=settings.maximum_duration_seconds,
+                )
+                metrics = _decoded_metrics(
+                    decoded,
+                    config,
+                    target_recall=settings.target_recall,
+                    include_roles=False,
+                )
+                key = _calibration_key(
+                    metrics,
+                    target_recall=settings.target_recall,
+                )
+                if best is None or key > best[0]:
+                    best = (key, config, metrics)
+    if best is None:
+        raise ValueError("streaming decoder calibration found no candidates")
+    return best[1], best[2]
+
+
+def _validation_metrics(
+    predictions: StreamingPredictions,
+    config: StreamingDecoderConfig,
+    *,
+    target_recall: float,
+) -> dict[str, float]:
+    return _decoded_metrics(
+        _decode_records(predictions, config),
+        config,
+        target_recall=target_recall,
+        include_roles=True,
+    )
+
+
+def _checkpoint_selection_key(
+    metrics: dict[str, float],
+    *,
+    validation_loss: float,
+    target_recall: float,
+) -> tuple:
+    return (
+        float(metrics["interval_recall_iou50"] + 1e-12 >= target_recall),
+        metrics["interval_recall_iou50"],
+        metrics["segment_recall_1frame"],
+        metrics["segment_recall_100ms"],
+        metrics["matched_interval_mean_iou"],
+        -metrics["start_error_p95_seconds"],
+        -metrics["end_error_p95_seconds"],
+        metrics["interval_precision_iou50"],
+        -metrics["false_intervals_per_minute"],
+        -validation_loss,
+    )
+
+
+def _checkpoint(
+    model: StreamingH264SubtitleModel,
+    *,
+    model_config: StreamingModelConfig,
+    decoder_config: StreamingDecoderConfig,
+    settings: StreamingTrainSettings,
+    train_records: list[StreamingLoadedRecord],
+    val_records: list[StreamingLoadedRecord],
+    feature_mean: np.ndarray,
+    feature_std: np.ndarray,
+    presence_positive_weight: float,
+    boundary_event_positive_weights: np.ndarray,
+    calibration_metrics: dict[str, float],
+    epoch: int,
+    metrics: dict[str, float],
+) -> dict:
+    first_cache = train_records[0].cache
+    training_provenance = {
+        "manifest": str(settings.manifest.expanduser().resolve()),
+        "settings": settings.model_dump(mode="json"),
+        "train_video_ids": [item.record.video_id for item in train_records],
+        "val_video_ids": [item.record.video_id for item in val_records],
+        "train_source_groups": sorted(
+            {item.record.source_group for item in train_records}
+        ),
+        "val_source_groups": sorted({item.record.source_group for item in val_records}),
+        "causal_window_context_frames": settings.window_frames - settings.stride_frames,
+        "calibration_split": "train",
+    }
+    return {
+        "format": STREAM_CHECKPOINT_FORMAT,
+        "version": STREAM_CHECKPOINT_VERSION,
+        "feature_version": FEATURE_VERSION,
+        "model": model.state_dict(),
+        "model_config": model_config.to_dict(),
+        "model_output_contract": "causal_streaming_presence_events",
+        "feature_names": first_cache.feature_names,
+        "feature_mean": torch.from_numpy(feature_mean),
+        "feature_std": torch.from_numpy(feature_std),
+        "feature_settings": dict(first_cache.meta["feature_settings"]),
+        "visual_feature_settings": dict(first_cache.visual_feature_settings or {}),
+        "spatial_contract": dict(first_cache.meta["spatial_contract"]),
+        "payload_tail_ratio": float(
+            first_cache.meta["feature_settings"]["payload_tail_ratio"]
+        ),
+        "streaming_decoder_config": decoder_config.to_dict(),
+        "inference_chunk_frames": settings.inference_chunk_frames,
+        "window_frames": settings.window_frames,
+        "stride_frames": settings.stride_frames,
+        "boundary_event_sigma_seconds": settings.boundary_event_sigma_seconds,
+        "presence_positive_weight": presence_positive_weight,
+        "boundary_event_positive_weights": torch.from_numpy(
+            boundary_event_positive_weights
+        ),
+        "validation_mode": settings.validation_mode,
+        "training_provenance": training_provenance,
+        "calibration_metrics": calibration_metrics,
+        "epoch": epoch,
+        "metrics": metrics,
+    }
+
+
+def _prepare_output_dir(path: Path) -> tuple[Path, Path]:
+    output_dir = path.expanduser().resolve()
+    collision_names = ("metrics.jsonl", "last.pt", "best.pt", "summary.json")
+    collisions = [name for name in collision_names if (output_dir / name).exists()]
+    if collisions:
+        raise FileExistsError(
+            "training output already contains a run and resume is not implemented: "
+            f"{output_dir}"
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir, output_dir / "metrics.jsonl"
+
+
+def train_streaming(settings: StreamingTrainSettings) -> dict:
+    """Train and calibrate the independent causal streaming timing model."""
+
+    output_dir, metrics_path = _prepare_output_dir(settings.output_dir)
+    _seed_everything(settings.seed)
+    device = _select_device(settings.device)
+    train_records = load_streaming_records(
+        read_manifest(settings.manifest, split="train"),
+        boundary_event_sigma_seconds=settings.boundary_event_sigma_seconds,
+    )
+    val_records = load_streaming_records(
+        read_manifest(settings.manifest, split="val"),
+        boundary_event_sigma_seconds=settings.boundary_event_sigma_seconds,
+    )
+    if not train_records or not val_records:
+        raise ValueError(
+            "manifest must contain at least one train and one val source video"
+        )
+    ensure_source_disjoint(
+        train_records,
+        val_records,
+        allow_same_source_temporal=settings.validation_mode == "diagnostic_temporal",
+        temporal_guard_seconds=settings.temporal_guard_seconds,
+    )
+
+    presence_positive_weight = _presence_positive_weight(train_records)
+    boundary_event_positive_weights = _boundary_event_positive_weights(train_records)
+    presence_weight_tensor = torch.tensor(presence_positive_weight, device=device)
+    boundary_weight_tensor = torch.from_numpy(boundary_event_positive_weights).to(
+        device
+    )
+    feature_mean, feature_std = compute_feature_stats(train_records)
+    train_dataset = StreamingTimingWindowDataset(
+        train_records,
+        feature_mean=feature_mean,
+        feature_std=feature_std,
+        window_frames=settings.window_frames,
+        stride_frames=settings.stride_frames,
+        max_windows=settings.max_train_windows,
+    )
+    val_dataset = StreamingTimingWindowDataset(
+        val_records,
+        feature_mean=feature_mean,
+        feature_std=feature_std,
+        window_frames=settings.window_frames,
+        stride_frames=settings.stride_frames,
+        max_windows=settings.max_val_windows,
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=settings.batch_size,
+        shuffle=True,
+        num_workers=0,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=settings.batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+
+    first_cache = train_records[0].cache
+    model_config = StreamingModelConfig(
+        feature_count=first_cache.features.shape[1],
+        token_count=first_cache.tokens.shape[1],
+        width=settings.width,
+        temporal_layers=settings.temporal_layers,
+        recurrent_layers=settings.recurrent_layers,
+        dropout=settings.dropout,
+        use_byte_branch=settings.use_byte_branch,
+    )
+    model = StreamingH264SubtitleModel(model_config).to(device)
+    optimizer = AdamW(
+        model.parameters(),
+        lr=settings.learning_rate,
+        weight_decay=settings.weight_decay,
+    )
+
+    best_selection: tuple | None = None
+    best_epoch = 0
+    best_metrics: dict[str, float] = {}
+    best_decoder_config: StreamingDecoderConfig | None = None
+    last_metrics: dict[str, float] = {}
+    for epoch in range(1, settings.epochs + 1):
+        train_losses = _window_loss(
+            model,
+            train_loader,
+            device=device,
+            optimizer=optimizer,
+            presence_positive_weight=presence_weight_tensor,
+            boundary_event_positive_weights=boundary_weight_tensor,
+        )
+        val_losses = _window_loss(
+            model,
+            val_loader,
+            device=device,
+            optimizer=None,
+            presence_positive_weight=presence_weight_tensor,
+            boundary_event_positive_weights=boundary_weight_tensor,
+        )
+        calibration_predictions = _predict_records(
+            model,
+            train_records,
+            feature_mean=feature_mean,
+            feature_std=feature_std,
+            chunk_frames=settings.inference_chunk_frames,
+            device=device,
+        )
+        decoder_config, calibration_metrics = _calibrate_decoder(
+            calibration_predictions,
+            settings=settings,
+        )
+        validation_predictions = _predict_records(
+            model,
+            val_records,
+            feature_mean=feature_mean,
+            feature_std=feature_std,
+            chunk_frames=settings.inference_chunk_frames,
+            device=device,
+        )
+        validation_metrics = _validation_metrics(
+            validation_predictions,
+            decoder_config,
+            target_recall=settings.target_recall,
+        )
+        last_metrics = {
+            **{f"train_{key}": value for key, value in train_losses.items()},
+            **{f"val_{key}": value for key, value in val_losses.items()},
+            "calibration_interval_recall_iou50": calibration_metrics[
+                "interval_recall_iou50"
+            ],
+            "calibration_interval_precision_iou50": calibration_metrics[
+                "interval_precision_iou50"
+            ],
+            "calibration_recall_target_met": calibration_metrics["recall_target_met"],
+            **validation_metrics,
+        }
+        metric_record = {"epoch": epoch, **last_metrics}
+        with metrics_path.open("a", encoding="utf-8") as file:
+            file.write(
+                json.dumps(metric_record, ensure_ascii=False, allow_nan=False) + "\n"
+            )
+        checkpoint = _checkpoint(
+            model,
+            model_config=model_config,
+            decoder_config=decoder_config,
+            settings=settings,
+            train_records=train_records,
+            val_records=val_records,
+            feature_mean=feature_mean,
+            feature_std=feature_std,
+            presence_positive_weight=presence_positive_weight,
+            boundary_event_positive_weights=boundary_event_positive_weights,
+            calibration_metrics=calibration_metrics,
+            epoch=epoch,
+            metrics=last_metrics,
+        )
+        torch.save(checkpoint, output_dir / "last.pt")
+        selection = _checkpoint_selection_key(
+            validation_metrics,
+            validation_loss=val_losses["loss"],
+            target_recall=settings.target_recall,
+        )
+        if best_selection is None or selection > best_selection:
+            best_selection = selection
+            best_epoch = epoch
+            best_metrics = dict(last_metrics)
+            best_decoder_config = decoder_config
+            torch.save(checkpoint, output_dir / "best.pt")
+        print(json.dumps(metric_record, ensure_ascii=False))
+
+    summary = {
+        "best_epoch": best_epoch,
+        "recall_target": settings.target_recall,
+        "best_recall_target_met": bool(best_metrics.get("recall_target_met", 0.0)),
+        "best_interval_recall_iou50": best_metrics.get("interval_recall_iou50", 0.0),
+        "best_metrics": best_metrics,
+        "last_metrics": last_metrics,
+        "best_streaming_decoder_config": (
+            best_decoder_config.to_dict() if best_decoder_config is not None else None
+        ),
+        "presence_positive_weight": presence_positive_weight,
+        "boundary_event_positive_weights": boundary_event_positive_weights.tolist(),
+        "use_byte_branch": settings.use_byte_branch,
+        "model_parameters": sum(parameter.numel() for parameter in model.parameters()),
+        "train_sources": len(train_records),
+        "val_sources": len(val_records),
+        "train_source_groups": len(
+            {item.record.source_group for item in train_records}
+        ),
+        "val_source_groups": len({item.record.source_group for item in val_records}),
+        "train_windows": len(train_dataset),
+        "val_windows": len(val_dataset),
+        "device": str(device),
+        "model_output_contract": "causal_streaming_presence_events",
+        "inference_chunk_frames": settings.inference_chunk_frames,
+        "visual_pixel_decode": first_cache.visual_feature_settings is not None,
+        "validation_contract": (
+            "held_out_by_declared_source_group_and_container_fingerprint"
+            if settings.validation_mode == "held_out"
+            else "diagnostic_same_source_temporal_not_held_out"
+        ),
+        "streaming_decoder_calibration_split": "train",
+    }
+    (output_dir / "summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    return summary

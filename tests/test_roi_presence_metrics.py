@@ -6,12 +6,16 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from src.roi_presence_config import RoiPresenceTrainSettings
-from src.roi_presence_dataset import RoiPresenceDataset
-from src.roi_presence_loss import counterfactual_presence_loss, subtitle_region_loss
-from src.roi_presence_metrics import checkpoint_rank, presence_metrics, text_distractor_metrics
-from src.roi_presence_model import CoherentEvidencePooling, RoiPresenceModel
-from src.train_presence import make_training_loader
+from subfast_net.roi.presence.config import RoiPresenceTrainSettings
+from subfast_net.roi.presence.dataset import RoiPresenceDataset
+from subfast_net.roi.presence.loss import counterfactual_presence_loss, subtitle_region_loss
+from subfast_net.roi.presence.metrics import (
+    checkpoint_rank,
+    presence_metrics,
+    text_distractor_metrics,
+)
+from subfast_net.roi.presence.model import CoherentEvidencePooling, RoiPresenceModel
+from subfast_net.roi.presence.train import make_training_loader
 
 
 class RoiPresenceMetricsTest(unittest.TestCase):

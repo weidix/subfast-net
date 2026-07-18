@@ -1,19 +1,22 @@
 import json
+import contextlib
+import io
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from torch import nn
 
-from src.model import SubtitleDetector
+from subfast_net.detector.model import SubtitleDetector
 
 
 class CliTests(unittest.TestCase):
     def test_export_unified_subcommand_writes_model_directory(self):
-        from src.cli import main
+        from subfast_net.cli import main
 
         model = nn.Conv2d(3, 2, kernel_size=3, stride=2, padding=1).eval()
         exported = torch.export.export(model, (torch.randn(1, 3, 8, 8),))
@@ -23,14 +26,14 @@ class CliTests(unittest.TestCase):
             output_dir = Path(tmp) / "unified"
             torch.export.save(exported, pt2_path)
 
-            main(["export-unified", str(pt2_path), str(output_dir)])
+            main(["export", "unified", str(pt2_path), str(output_dir)])
 
             manifest = json.loads((output_dir / "model.json").read_text())
             self.assertEqual(manifest["format"], "subfast-net.unified-model")
             self.assertTrue((output_dir / "weights.bin").is_file())
 
     def test_export_unified_subcommand_accepts_training_checkpoint(self):
-        from src.cli import main
+        from subfast_net.cli import main
 
         model = SubtitleDetector().eval()
 
@@ -45,7 +48,7 @@ class CliTests(unittest.TestCase):
                 checkpoint_path,
             )
 
-            main(["export-unified", str(checkpoint_path), str(output_dir)])
+            main(["export", "unified", str(checkpoint_path), str(output_dir)])
 
             manifest = json.loads((output_dir / "model.json").read_text())
             self.assertEqual(manifest["format"], "subfast-net.unified-model")
@@ -53,7 +56,7 @@ class CliTests(unittest.TestCase):
             self.assertTrue((output_dir / "weights.bin").is_file())
 
     def test_export_unified_subcommand_accepts_batch_size_and_head_output(self):
-        from src.cli import main
+        from subfast_net.cli import main
 
         model = SubtitleDetector().eval()
 
@@ -69,7 +72,8 @@ class CliTests(unittest.TestCase):
             )
 
             main([
-                "export-unified",
+                "export",
+                "unified",
                 "--batch-size",
                 "4",
                 "--head-output",
@@ -84,7 +88,7 @@ class CliTests(unittest.TestCase):
             self.assertNotIn("aten.upsample_bilinear2d.vec", [node["op"] for node in manifest["nodes"]])
 
     def test_export_coreml_subcommand_writes_model_package(self):
-        from src.cli import main
+        from subfast_net.cli import main
 
         class FakeTensorType:
             def __init__(self, name, shape):
@@ -116,7 +120,7 @@ class CliTests(unittest.TestCase):
                     checkpoint_path,
                 )
 
-                main(["export-coreml", str(checkpoint_path), str(output_dir)])
+                main(["export", "coreml", str(checkpoint_path), str(output_dir)])
 
                 self.assertTrue(output_path.is_dir())
         finally:
@@ -129,7 +133,7 @@ class CliTests(unittest.TestCase):
         from safetensors import safe_open
         from safetensors.torch import load_file
 
-        from src.cli import main
+        from subfast_net.cli import main
 
         model = SubtitleDetector().eval()
         with tempfile.TemporaryDirectory() as tmp:
@@ -148,7 +152,7 @@ class CliTests(unittest.TestCase):
                 checkpoint_path,
             )
 
-            main(["export-safetensors", str(checkpoint_path), str(output_dir)])
+            main(["export", "safetensors", str(checkpoint_path), str(output_dir)])
 
             weights_path = output_dir / "model.safetensors"
             config = json.loads((output_dir / "config.json").read_text())
@@ -162,33 +166,59 @@ class CliTests(unittest.TestCase):
             with safe_open(weights_path, framework="pt", device="cpu") as archive:
                 self.assertEqual(archive.metadata()["model_type"], "subtitle_detector")
 
-    def test_train_roi_subcommand_dispatches_to_roi_trainer(self):
-        from src import train_roi
-        from src.cli import main
+    def test_training_validation_and_benchmark_commands_dispatch(self):
+        from subfast_net.cli import main
 
-        calls = []
-        original = train_roi.main
-        train_roi.main = lambda argv: calls.append(argv)
-        try:
-            main(["train-roi", "--presence-epochs", "3", "--embedding-epochs", "0", "--joint-epochs", "0"])
-        finally:
-            train_roi.main = original
+        calls: list[tuple[str, str, list[str]]] = []
 
-        self.assertEqual(calls, [["--presence-epochs", "3", "--embedding-epochs", "0", "--joint-epochs", "0"]])
+        def fake_import(module_name: str) -> SimpleNamespace:
+            def record(function_name: str):
+                return lambda argv: calls.append((module_name, function_name, argv))
 
-    def test_benchmark_presence_subcommand_dispatches(self):
-        from src import train_presence
-        from src.cli import main
+            return SimpleNamespace(
+                main=record("main"),
+                main_validate=record("main_validate"),
+                main_benchmark=record("main_benchmark"),
+            )
 
-        calls = []
-        original = train_presence.main_benchmark
-        train_presence.main_benchmark = lambda argv: calls.append(argv)
-        try:
-            main(["benchmark-presence", "--device", "mps"])
-        finally:
-            train_presence.main_benchmark = original
+        cases = [
+            (
+                ["train", "detector", "--epochs", "2"],
+                ("subfast_net.detector.train", "main", ["--epochs", "2"]),
+            ),
+            (
+                ["train", "presence", "--epochs", "3"],
+                ("subfast_net.roi.presence.train", "main", ["--epochs", "3"]),
+            ),
+            (
+                ["train", "matcher", "--epochs", "4"],
+                ("subfast_net.roi.matcher.train", "main", ["--epochs", "4"]),
+            ),
+            (
+                ["validate", "matcher", "--checkpoint", "best.pt"],
+                ("subfast_net.roi.matcher.train", "main_validate", ["--checkpoint", "best.pt"]),
+            ),
+            (
+                ["benchmark", "presence", "--device", "mps"],
+                ("subfast_net.roi.presence.train", "main_benchmark", ["--device", "mps"]),
+            ),
+        ]
 
-        self.assertEqual(calls, [["--device", "mps"]])
+        with patch("subfast_net.cli.import_module", side_effect=fake_import):
+            for command, expected in cases:
+                with self.subTest(command=command):
+                    main(command)
+                    self.assertEqual(calls[-1], expected)
+
+    def test_tools_are_not_routed_through_model_cli(self):
+        from subfast_net.cli import main
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            status = main(["data", "build-samples"])
+
+        self.assertEqual(status, 2)
+        self.assertIn("unknown command 'data'", stderr.getvalue())
 
 
 if __name__ == "__main__":

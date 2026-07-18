@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -7,24 +9,24 @@ from unittest.mock import patch
 import torch
 from PIL import Image
 
-from src.roi_config import RoiTrainSettings
-from src.roi_dataset import RoiPresenceEmbeddingDataset, RoiSample, collate_roi_batch
-from src.roi_loss import (
+from subfast_net.roi.embedding.config import RoiTrainSettings
+from subfast_net.roi.data import RoiPresenceEmbeddingDataset, RoiSample, collate_roi_batch
+from subfast_net.roi.embedding.loss import (
     EmbeddingPairMemory,
     balance_embedding_pairs,
     embedding_margin_loss,
     roi_presence_embedding_loss,
     supervised_contrastive_embedding_loss,
 )
-from src.roi_metrics import embedding_metrics
-from src.roi_pairs import (
+from subfast_net.roi.embedding.metrics import embedding_metrics
+from subfast_net.roi.pairs import (
     EmbeddingPair,
     EmbeddingPairPools,
     build_embedding_pair_epoch_schedule,
     select_embedding_pairs,
 )
-from src.roi_model import MaskedAttentionEmbeddingHead, LocalContrastResidual, LocalTextnessPresenceHead, RoiPresenceEmbeddingModel
-from src.train_roi import (
+from subfast_net.roi.embedding.model import MaskedAttentionEmbeddingHead, LocalContrastResidual, LocalTextnessPresenceHead, RoiPresenceEmbeddingModel
+from subfast_net.roi.embedding.train import (
     configure_training_phase,
     embedding_attention_mask_loss,
     format_epoch_summary,
@@ -36,7 +38,7 @@ from src.train_roi import (
     training_phases,
     validation_overlaps_training,
 )
-from src.roi_sampler import RoiBalancedBatchSampler
+from subfast_net.roi.embedding.sampler import RoiBalancedBatchSampler
 
 
 def write_roi_dataset(root: Path, *, size: tuple[int, int] = (32, 16)) -> None:
@@ -139,6 +141,15 @@ def make_scheduler_samples(*, segments: int = 3, per_segment: int = 4) -> list[R
 
 
 class RoiPresenceEmbeddingTests(unittest.TestCase):
+    def test_embedding_help_has_canonical_description(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as raised:
+            parse_args(["--help"])
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn("Train the ROI subtitle-presence and embedding model.", output.getvalue())
+        self.assertNotIn("DEPRECATED", output.getvalue())
+
     def test_balanced_batch_sampler_realizes_presence_ratio_and_covers_every_sample(self):
         samples = make_sampler_samples(positives=6, negatives=10)
         sampler = RoiBalancedBatchSampler(samples, batch_size=4, negative_ratio=0.5, seed=7)
@@ -1060,7 +1071,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
             output = Path(tmp) / "out"
             write_roi_dataset(root)
 
-            with patch("src.train_roi.EmbeddingPairMemory") as memory_class:
+            with patch("subfast_net.roi.embedding.train.EmbeddingPairMemory") as memory_class:
                 metrics = run_training(
                     RoiTrainSettings(
                         train_roots=[root],

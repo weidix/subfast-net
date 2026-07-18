@@ -1,0 +1,7 @@
+1
+00:00:12,400 --> 00:00:14,933
+subtitle text is ignored by the timing project
+
+2
+00:00:16,100 --> 00:00:18,533
+subtitle text is ignored by the timing project

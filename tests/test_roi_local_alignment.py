@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from src.roi_local_alignment import extreme_gap_loss, local_alignment_similarity
+from subfast_net.roi.embedding.alignment import extreme_gap_loss, local_alignment_similarity
 
 
 def _tokens(count: int = 10) -> torch.Tensor:

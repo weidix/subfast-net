@@ -1,4 +1,3 @@
-import sys
 import unittest
 import tempfile
 import json
@@ -7,8 +6,7 @@ from pathlib import Path
 
 from PIL import Image
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-import tools.prepare_roi_samples as roi_prep
+from tools import prepare_roi as roi_prep
 
 
 class PrepareRoiSamplesTests(unittest.TestCase):

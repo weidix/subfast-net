@@ -1,14 +1,30 @@
+import contextlib
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from src.config import TrainSettings
-from src.dataset import SubtitleDataset, apply_label_masks
-from src.train import format_epoch_summary, parse_args, resolve_resume_checkpoint, run_training
+from subfast_net.detector.config import TrainSettings
+from subfast_net.detector.dataset import SubtitleDataset, apply_label_masks
+from subfast_net.detector.train import (
+    format_epoch_summary,
+    parse_args,
+    resolve_resume_checkpoint,
+    run_training,
+)
 
 
 class TrainingSmokeTests(unittest.TestCase):
+    def test_detector_help_has_canonical_description(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as raised:
+            parse_args(["--help"])
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn("Train the full-frame subtitle-region detector.", output.getvalue())
+        self.assertNotIn("DEPRECATED", output.getvalue())
+
     def test_dataset_loads_project_data(self):
         dataset = SubtitleDataset([Path("data/generated_samples1")], image_size=128, max_samples=4)
         self.assertEqual(len(dataset), 4)

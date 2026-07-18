@@ -1,7 +1,7 @@
 [project]
 name = "subfast-net"
 version = "0.1.0"
-description = "Small PyTorch models for detecting and matching subtitle regions"
+description = "Subtitle detection models, H.264 timing, and dataset tools"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -21,11 +21,29 @@ dependencies = [
 ]
 
 [project.scripts]
-subfast-net = "src.cli:main"
+subfast-net = "subfast_net.cli:main"
+h264-timing = "h264_timing.cli:main"
+subfast-tools = "tools.cli:main"
 
 [build-system]
 requires = ["setuptools>=80"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["src"]
+package-dir = {"" = "src"}
+packages = [
+    "subfast_net",
+    "subfast_net.detector",
+    "subfast_net.export",
+    "subfast_net.roi",
+    "subfast_net.roi.embedding",
+    "subfast_net.roi.matcher",
+    "subfast_net.roi.presence",
+    "h264_timing",
+    "tools",
+]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"h264_timing" = ["*.csv", "*.jsonl", "*.srt", "README.md"]
+"tools" = ["*.html", "*.md"]

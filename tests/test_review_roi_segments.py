@@ -1,12 +1,9 @@
 import json
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from tools.review_roi_segments import (
+from tools.review_roi import (
     HTML,
     OCR_REVIEW_HTML,
     SegmentReviewApp,

@@ -1,2 +1,0 @@
-"""PyTorch subtitle-region detector."""
-
