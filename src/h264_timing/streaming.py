@@ -45,6 +45,7 @@ class StreamingSegmentDetector:
     ) -> None:
         resolved_device = _select_device(device)
         self._model = model.to(resolved_device).eval()
+        self._model.prepare_step_inference()
         self._device = resolved_device
         self._model_dtype = _model_dtype(self._model)
         self._feature_mean = _feature_statistic(
@@ -63,6 +64,8 @@ class StreamingSegmentDetector:
         )
         if torch.any(self._feature_std <= 0.0).item():
             raise ValueError("feature standard deviation must be positive")
+        self._feature_scale = self._feature_std.reciprocal()
+        self._feature_offset = -self._feature_mean * self._feature_scale
         self._feature_names = _validate_feature_names(
             feature_names,
             feature_count=self._model.config.feature_count,
@@ -162,7 +165,69 @@ class StreamingSegmentDetector:
     def push(self, sample: StreamSample) -> tuple[SegmentPrediction, ...]:
         """Process one sample and return segments finalized by that sample."""
 
-        return self.push_many((sample,))
+        self._ensure_open()
+        if not isinstance(sample, StreamSample):
+            raise TypeError("stream input must contain StreamSample values")
+        timestamp, duration = _validate_timing(sample)
+        if (
+            self._last_timestamp_seconds is not None
+            and timestamp <= self._last_timestamp_seconds
+        ):
+            raise ValueError("stream sample timestamps must be strictly increasing")
+        feature_row = _sample_features(
+            sample.features, self._model.config.feature_count
+        )
+        token_row = _sample_tokens(
+            sample.tokens,
+            token_count=self._model.config.token_count,
+            required=self._model.config.use_byte_branch,
+        )
+        features = torch.as_tensor(
+            feature_row,
+            device=self._device,
+            dtype=self._model_dtype,
+        ).reshape(1, 1, -1)
+        features = torch.addcmul(
+            self._feature_offset, features, self._feature_scale
+        )
+        tokens = torch.as_tensor(
+            token_row,
+            device=self._device,
+            dtype=torch.long,
+        ).reshape(1, 1, -1)
+
+        with torch.inference_mode():
+            output, next_state = self._model.forward_step(
+                features,
+                tokens,
+                self._model_state,
+            )
+            values = _single_frame_output_values(
+                output,
+                use_segment_head=self._model.config.use_segment_head,
+            )
+
+        if self._model.config.use_segment_head:
+            finalized = self._decoder.push(
+                timestamp,
+                duration,
+                values[3],
+                values[4],
+                values[5],
+                values[2],
+                values[1],
+            )
+        else:
+            finalized = self._decoder.push(
+                timestamp,
+                duration,
+                values[0],
+                values[1],
+                values[2],
+            )
+        self._model_state = next_state
+        self._last_timestamp_seconds = timestamp
+        return finalized
 
     def push_many(
         self, samples: Iterable[StreamSample]
@@ -173,6 +238,8 @@ class StreamingSegmentDetector:
         chunk = tuple(samples)
         if not chunk:
             return ()
+        if len(chunk) == 1:
+            return self.push(chunk[0])
 
         timestamps: list[float] = []
         durations: list[float] = []
@@ -204,7 +271,9 @@ class StreamingSegmentDetector:
             device=self._device,
             dtype=self._model_dtype,
         ).unsqueeze(0)
-        features = (features - self._feature_mean) / self._feature_std
+        features = torch.addcmul(
+            self._feature_offset, features, self._feature_scale
+        )
         tokens = torch.as_tensor(
             np.stack(token_rows),
             device=self._device,
@@ -336,13 +405,8 @@ def _select_device(requested: str | torch.device) -> torch.device:
         return torch.device(requested)
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        try:
-            torch.empty(1, device="mps")
-        except RuntimeError:
-            pass
-        else:
-            return torch.device("mps")
+    # This small stateful model is launch-bound on MPS at its deployment chunk
+    # sizes. CPU is substantially faster; MPS remains available explicitly.
     return torch.device("cpu")
 
 
@@ -441,3 +505,40 @@ def _tensor_elements(value: Any) -> int:
     if isinstance(value, (tuple, list)):
         return sum(_tensor_elements(item) for item in value)
     return 0
+
+
+def _single_frame_output_values(
+    output: Any, *, use_segment_head: bool
+) -> list[float]:
+    if output.presence_logits.shape != (1, 1):
+        raise RuntimeError("streaming model presence output must have shape (1, 1)")
+    if output.boundary_event_logits.shape != (1, 1, 2):
+        raise RuntimeError("streaming model boundary output must have shape (1, 1, 2)")
+    tensors = [
+        output.presence_logits.reshape(-1),
+        output.boundary_event_logits.reshape(-1),
+    ]
+    probability_count = 3
+    if use_segment_head:
+        expected_shape = (1, 1)
+        if (
+            output.segment_anchor_logits.shape != expected_shape
+            or output.segment_start_offsets_seconds.shape != expected_shape
+            or output.segment_end_offsets_seconds.shape != expected_shape
+        ):
+            raise RuntimeError(
+                "streaming model segment-anchor outputs must have shape (1, 1)"
+            )
+        tensors.extend(
+            (
+                output.segment_anchor_logits.reshape(-1),
+                output.segment_start_offsets_seconds.reshape(-1),
+                output.segment_end_offsets_seconds.reshape(-1),
+            )
+        )
+        probability_count = 4
+    values = torch.cat(tensors)
+    if not torch.isfinite(values).all().item():
+        raise RuntimeError("streaming model output must be finite")
+    values[:probability_count].sigmoid_()
+    return values.detach().cpu().tolist()

@@ -80,6 +80,8 @@ class CausalConvolution(nn.Module):
             padding=0,
             dilation=dilation,
         )
+        self.register_buffer("_step_weight", None, persistent=False)
+        self._step_weight_source_version = -1
 
     def forward_stream(
         self, inputs: torch.Tensor, history: torch.Tensor
@@ -88,6 +90,48 @@ class CausalConvolution(nn.Module):
         outputs = self.convolution(combined)
         next_history = combined[..., -self.history_frames :].clone()
         return outputs, next_history
+
+    def forward_step(
+        self, inputs: torch.Tensor, history: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Evaluate one frame without the slow dilated-Conv1d CPU kernel."""
+
+        dilation = self.history_frames // 2
+        taps = torch.cat(
+            (history[..., 0], history[..., dilation], inputs[..., 0]), dim=-1
+        )
+        outputs = F.linear(
+            taps,
+            self._linear_step_weight(),
+            self.convolution.bias,
+        ).unsqueeze(-1)
+        next_history = torch.cat((history[..., 1:], inputs), dim=-1)
+        return outputs, next_history
+
+    def prepare_step_inference(self) -> None:
+        """Pack the three causal taps for the single-frame inference kernel."""
+
+        self._linear_step_weight()
+
+    def _linear_step_weight(self) -> torch.Tensor:
+        source = self.convolution.weight
+        cached = self._step_weight
+        source_version = source._version
+        if (
+            cached is None
+            or self._step_weight_source_version != source_version
+            or cached.device != source.device
+            or cached.dtype != source.dtype
+        ):
+            cached = (
+                source.detach()
+                .permute(0, 2, 1)
+                .reshape(source.shape[0], -1)
+                .contiguous()
+            )
+            self._step_weight = cached
+            self._step_weight_source_version = source_version
+        return cached
 
 
 class CausalTemporalResidualBlock(nn.Module):
@@ -117,6 +161,26 @@ class CausalTemporalResidualBlock(nn.Module):
             inputs + self.scale * encoded,
             StreamingTemporalBlockState(first_history, second_history),
         )
+
+    def forward_step(
+        self, inputs: torch.Tensor, state: StreamingTemporalBlockState
+    ) -> tuple[torch.Tensor, StreamingTemporalBlockState]:
+        encoded, first_history = self.first_convolution.forward_step(
+            inputs, state.first_history
+        )
+        encoded = F.silu(encoded)
+        encoded, second_history = self.second_convolution.forward_step(
+            encoded, state.second_history
+        )
+        encoded = F.silu(encoded)
+        return (
+            inputs + self.scale * encoded,
+            StreamingTemporalBlockState(first_history, second_history),
+        )
+
+    def prepare_step_inference(self) -> None:
+        self.first_convolution.prepare_step_inference()
+        self.second_convolution.prepare_step_inference()
 
 
 class StreamingH264SubtitleModel(nn.Module):
@@ -205,14 +269,7 @@ class StreamingH264SubtitleModel(nn.Module):
         """Process one non-empty chunk and return its outputs plus continuation state."""
 
         batch, frames = self._validate_inputs(features, tokens)
-        numeric = self.numeric_encoder(features)
-        if self.byte_encoder is None:
-            fused = numeric
-        else:
-            byte_features = self.byte_encoder(
-                tokens.reshape(batch * frames, -1)
-            ).reshape(batch, frames, -1)
-            fused = self.fusion(torch.cat((numeric, byte_features), dim=-1))
+        fused = self._encode_inputs(features, tokens, batch=batch, frames=frames)
 
         if state is None:
             state = self._initial_state(fused)
@@ -229,7 +286,106 @@ class StreamingH264SubtitleModel(nn.Module):
         encoded = encoded.transpose(1, 2)
         recurrent, recurrent_hidden = self.recurrent(encoded, state.recurrent_hidden)
         encoded = self.temporal_norm(encoded + recurrent)
-        output = StreamingSegmentModelOutput(
+        output = self._output_from_encoded(encoded, batch=batch, frames=frames)
+        next_state = StreamingModelState(
+            temporal_blocks=tuple(block_states),
+            recurrent_hidden=recurrent_hidden,
+        )
+        return output, next_state
+
+    def prepare_step_inference(self) -> None:
+        """Prepare immutable weights used by the low-latency one-frame path."""
+
+        if self.training:
+            raise RuntimeError("step inference preparation requires eval mode")
+        for block in self.temporal:
+            block.prepare_step_inference()
+
+    def forward_step(
+        self,
+        features: torch.Tensor,
+        tokens: torch.Tensor,
+        state: StreamingModelState | None = None,
+    ) -> tuple[StreamingSegmentModelOutput, StreamingModelState]:
+        """Process exactly one frame with kernels specialized for streaming latency."""
+
+        if self.training:
+            raise RuntimeError("step inference requires eval mode")
+        batch, frames = self._validate_inputs(features, tokens)
+        if frames != 1:
+            raise ValueError("step inference requires exactly one frame")
+
+        fused = self._encode_inputs(features, tokens, batch=batch, frames=frames)
+
+        if state is None:
+            state = self._initial_state(fused)
+        else:
+            self._validate_state(state, fused)
+
+        encoded = fused.transpose(1, 2)
+        block_states: list[StreamingTemporalBlockState] = []
+        for block, block_state in zip(
+            self.temporal, state.temporal_blocks, strict=True
+        ):
+            encoded, next_block_state = block.forward_step(encoded, block_state)
+            block_states.append(next_block_state)
+
+        encoded = encoded.transpose(1, 2)
+        recurrent_input = encoded[:, 0]
+        recurrent_hidden: list[torch.Tensor] = []
+        for layer in range(self.config.recurrent_layers):
+            previous_hidden = state.recurrent_hidden[layer]
+            input_gates = F.linear(
+                recurrent_input,
+                getattr(self.recurrent, f"weight_ih_l{layer}"),
+                getattr(self.recurrent, f"bias_ih_l{layer}"),
+            )
+            hidden_gates = F.linear(
+                previous_hidden,
+                getattr(self.recurrent, f"weight_hh_l{layer}"),
+                getattr(self.recurrent, f"bias_hh_l{layer}"),
+            )
+            input_reset, input_update, input_new = input_gates.chunk(3, dim=-1)
+            hidden_reset, hidden_update, hidden_new = hidden_gates.chunk(3, dim=-1)
+            reset = torch.sigmoid(input_reset + hidden_reset)
+            update = torch.sigmoid(input_update + hidden_update)
+            new = torch.tanh(input_new + reset * hidden_new)
+            recurrent_input = (1.0 - update) * new + update * previous_hidden
+            recurrent_hidden.append(recurrent_input)
+
+        next_recurrent_hidden = torch.stack(recurrent_hidden)
+        encoded = self.temporal_norm(encoded + recurrent_input.unsqueeze(1))
+        output = self._output_from_encoded(encoded, batch=batch, frames=frames)
+        return output, StreamingModelState(
+            temporal_blocks=tuple(block_states),
+            recurrent_hidden=next_recurrent_hidden,
+        )
+
+    def _encode_inputs(
+        self,
+        features: torch.Tensor,
+        tokens: torch.Tensor,
+        *,
+        batch: int,
+        frames: int,
+    ) -> torch.Tensor:
+        numeric = self.numeric_encoder(features)
+        if self.byte_encoder is None:
+            return numeric
+        byte_features = self.byte_encoder(
+            tokens.reshape(batch * frames, -1)
+        ).reshape(batch, frames, -1)
+        return self.fusion(torch.cat((numeric, byte_features), dim=-1))
+
+    def _output_from_encoded(
+        self, encoded: torch.Tensor, *, batch: int, frames: int
+    ) -> StreamingSegmentModelOutput:
+        segment_boundaries = (
+            self.segment_boundary_head(encoded)
+            if self.segment_boundary_head is not None
+            else None
+        )
+        return StreamingSegmentModelOutput(
             presence_logits=self.presence_head(encoded).squeeze(-1),
             boundary_event_logits=self.boundary_event_head(encoded),
             segment_anchor_logits=(
@@ -238,21 +394,16 @@ class StreamingH264SubtitleModel(nn.Module):
                 else encoded.new_zeros((batch, frames))
             ),
             segment_start_offsets_seconds=(
-                -F.softplus(self.segment_boundary_head(encoded)[..., 0])
-                if self.segment_boundary_head is not None
+                -F.softplus(segment_boundaries[..., 0])
+                if segment_boundaries is not None
                 else encoded.new_zeros((batch, frames))
             ),
             segment_end_offsets_seconds=(
-                F.softplus(self.segment_boundary_head(encoded)[..., 1])
-                if self.segment_boundary_head is not None
+                F.softplus(segment_boundaries[..., 1])
+                if segment_boundaries is not None
                 else encoded.new_zeros((batch, frames))
             ),
         )
-        next_state = StreamingModelState(
-            temporal_blocks=tuple(block_states),
-            recurrent_hidden=recurrent_hidden,
-        )
-        return output, next_state
 
     def _validate_inputs(
         self, features: torch.Tensor, tokens: torch.Tensor

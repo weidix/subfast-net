@@ -581,6 +581,56 @@ class H264TimingTests(unittest.TestCase):
             torch.cat(boundary_chunks, dim=1), complete.boundary_event_logits
         )
 
+    def test_streaming_step_kernel_matches_general_stream_path(self):
+        torch.manual_seed(11)
+        model = StreamingH264SubtitleModel(
+            StreamingModelConfig(
+                feature_count=5,
+                token_count=16,
+                width=8,
+                byte_embedding_dim=4,
+                temporal_layers=3,
+                recurrent_layers=2,
+                dropout=0.0,
+                use_byte_branch=True,
+                use_segment_head=True,
+            )
+        ).eval()
+        model.prepare_step_inference()
+        features = torch.randn((2, 7, 5))
+        tokens = torch.randint(0, 256, (2, 7, 16))
+        general_state = None
+        step_state = None
+
+        for frame in range(features.shape[1]):
+            frame_features = features[:, frame : frame + 1]
+            frame_tokens = tokens[:, frame : frame + 1]
+            general_output, general_state = model.forward_stream(
+                frame_features, frame_tokens, general_state
+            )
+            step_output, step_state = model.forward_step(
+                frame_features, frame_tokens, step_state
+            )
+            for general_value, step_value in zip(
+                general_output, step_output, strict=True
+            ):
+                torch.testing.assert_close(general_value, step_value)
+
+        for general_block, step_block in zip(
+            general_state.temporal_blocks,
+            step_state.temporal_blocks,
+            strict=True,
+        ):
+            torch.testing.assert_close(
+                general_block.first_history, step_block.first_history
+            )
+            torch.testing.assert_close(
+                general_block.second_history, step_block.second_history
+            )
+        torch.testing.assert_close(
+            general_state.recurrent_hidden, step_state.recurrent_hidden
+        )
+
     def test_streaming_decoder_emits_adjacent_segments_and_flushes_tail(self):
         config = StreamingDecoderConfig(
             score_threshold=0.0,
