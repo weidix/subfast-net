@@ -18,11 +18,57 @@ from .stream_labels import (
 @dataclass
 class StreamingLoadedRecord:
     record: ManifestRecord
-    cache: FeatureCache
+    cache: FeatureCache | VisualOnlyFeatureCache
     intervals: list[SubtitleInterval]
     presence_targets: np.ndarray
     boundary_event_targets: np.ndarray
     segment_anchor_targets: np.ndarray
+
+
+class VisualOnlyFeatureCache:
+    """Read-only streaming view that exposes decoded visual features only."""
+
+    def __init__(self, cache: FeatureCache) -> None:
+        if cache.visual_features is None or not cache.visual_feature_names:
+            raise ValueError(
+                f"streaming cache has no visual features: {cache.directory}"
+            )
+        self._cache = cache
+        self.features = cache.visual_features
+        self.tokens = cache.tokens
+        self.timestamps = cache.timestamps
+        self.durations = cache.durations
+        self.meta = cache.meta
+
+    @property
+    def feature_names(self) -> list[str]:
+        return self._cache.visual_feature_names
+
+    @property
+    def visual_feature_settings(self) -> dict | None:
+        return self._cache.visual_feature_settings
+
+    @property
+    def coverage_range_seconds(self) -> tuple[float, float]:
+        return self._cache.coverage_range_seconds
+
+
+def use_visual_only_features(
+    records: list[StreamingLoadedRecord],
+) -> list[StreamingLoadedRecord]:
+    """Return record views whose model input cannot contain compressed features."""
+
+    return [
+        StreamingLoadedRecord(
+            record=item.record,
+            cache=VisualOnlyFeatureCache(item.cache),
+            intervals=item.intervals,
+            presence_targets=item.presence_targets,
+            boundary_event_targets=item.boundary_event_targets,
+            segment_anchor_targets=item.segment_anchor_targets,
+        )
+        for item in records
+    ]
 
 
 def load_streaming_records(

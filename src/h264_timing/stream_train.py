@@ -20,6 +20,7 @@ from .stream_dataset import (
     StreamingLoadedRecord,
     StreamingTimingWindowDataset,
     load_streaming_records,
+    use_visual_only_features,
 )
 from .stream_loss import streaming_detection_loss
 from .stream_model import StreamingH264SubtitleModel, StreamingModelConfig
@@ -64,6 +65,7 @@ class StreamingTrainSettings(BaseModel):
     temporal_guard_seconds: float = Field(default=10.0, ge=0.0)
     inference_chunk_frames: int = Field(default=128, gt=0)
     initial_checkpoint: Path | None = None
+    input_domain: Literal["combined", "visual_only"] = "combined"
 
     @model_validator(mode="after")
     def validate_ranges(self) -> Self:
@@ -71,6 +73,8 @@ class StreamingTrainSettings(BaseModel):
             raise ValueError("stride_frames must not exceed window_frames")
         if self.maximum_duration_seconds <= self.minimum_duration_seconds:
             raise ValueError("maximum duration must be greater than minimum duration")
+        if self.input_domain == "visual_only" and self.use_byte_branch:
+            raise ValueError("visual-only streaming training cannot use byte tokens")
         return self
 
 
@@ -165,7 +169,10 @@ def _window_loss(
     segment_loss_weight: float = 1.0,
     negative_weight: float = 1.0,
     boundary_event_loss_weight: float = 1.0,
+    visual_distillation_weight: float = 0.0,
 ) -> dict[str, float]:
+    if visual_distillation_weight < 0.0:
+        raise ValueError("visual_distillation_weight must be non-negative")
     training = optimizer is not None
     model.train(training)
     totals = {
@@ -178,6 +185,8 @@ def _window_loss(
         "segment_end_loss": 0.0,
         "segment_anchor_iou_loss": 0.0,
     }
+    if visual_distillation_weight > 0.0:
+        totals["visual_distillation_loss"] = 0.0
     total_frames = 0.0
     context = torch.enable_grad() if training else torch.inference_mode()
     with context:
@@ -217,6 +226,33 @@ def _window_loss(
                 boundary_event_loss_weight=boundary_event_loss_weight,
                 sample_weight=loss_weights,
             )
+            if visual_distillation_weight > 0.0:
+                if "visual_teacher_probabilities" not in batch:
+                    raise ValueError(
+                        "visual teacher probabilities are required for distillation"
+                    )
+                teacher = batch["visual_teacher_probabilities"].to(device)
+                if teacher.shape != (*presence_targets.shape, 3):
+                    raise ValueError(
+                        "visual teacher probabilities must have shape [batch,time,3]"
+                    )
+                student_logits = torch.cat(
+                    (output.presence_logits.unsqueeze(-1), output.boundary_event_logits),
+                    dim=-1,
+                )
+                distillation_per_frame = torch.nn.functional.binary_cross_entropy_with_logits(
+                    student_logits,
+                    teacher,
+                    reduction="none",
+                ).mean(dim=-1)
+                distillation_denominator = mask.sum().clamp_min(1.0)
+                distillation_loss = (
+                    distillation_per_frame * mask
+                ).sum() / distillation_denominator
+                loss = loss + visual_distillation_weight * distillation_loss
+                components["visual_distillation_loss"] = float(
+                    distillation_loss.detach()
+                )
             if optimizer is not None:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -645,6 +681,8 @@ def _checkpoint(
         "feature_std": torch.from_numpy(feature_std),
         "feature_settings": dict(first_cache.meta["feature_settings"]),
         "visual_feature_settings": dict(first_cache.visual_feature_settings or {}),
+        "input_domain": settings.input_domain,
+        "pixel_decode_required": settings.input_domain == "visual_only",
         "spatial_contract": dict(first_cache.meta["spatial_contract"]),
         "payload_tail_ratio": float(
             first_cache.meta["feature_settings"]["payload_tail_ratio"]
@@ -704,6 +742,9 @@ def train_streaming(settings: StreamingTrainSettings) -> dict:
         allow_same_source_temporal=settings.validation_mode == "diagnostic_temporal",
         temporal_guard_seconds=settings.temporal_guard_seconds,
     )
+    if settings.input_domain == "visual_only":
+        train_records = use_visual_only_features(train_records)
+        val_records = use_visual_only_features(val_records)
 
     presence_positive_weight = _presence_positive_weight(train_records)
     boundary_event_positive_weights = _boundary_event_positive_weights(train_records)
@@ -919,6 +960,8 @@ def train_streaming(settings: StreamingTrainSettings) -> dict:
         "segment_anchor_positive_weight": segment_anchor_positive_weight,
         "use_byte_branch": settings.use_byte_branch,
         "use_segment_head": settings.use_segment_head,
+        "input_domain": settings.input_domain,
+        "numeric_feature_count": model_config.feature_count,
         "model_parameters": sum(parameter.numel() for parameter in model.parameters()),
         "train_sources": len(train_records),
         "val_sources": len(val_records),

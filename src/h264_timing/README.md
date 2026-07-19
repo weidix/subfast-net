@@ -88,9 +88,9 @@ Build all videos, labels, feature caches, the manifest, and the dataset audit:
 uv run h264-timing prepare \
   data/h264_timing/source/MIAB-462.mp4 \
   data/h264_timing/source/MIAB-462.zh-CN.srt \
-  data/h264_timing/composite/sample-plan.csv \
-  data/h264_timing/p1-v2 \
-  --source-group miab-462-p1-v2 \
+  data/h264_timing/window-training/window-clip-plan.csv \
+  data/h264_timing/window-training \
+  --source-group miab-462-window-training \
   --seed 2026
 ```
 
@@ -101,8 +101,8 @@ the command resumes only after validating all recorded contracts. Use
 The resulting manifest uses explicit pair metadata:
 
 ```json
-{"video_id":"source-train-01-signal","source_group":"source-p1-v2","features":"features/source-train-01-signal","labels":"composite/labels/source-train-01-signal.csv","split":"train","source_time_offset_seconds":541.541,"synthesis_audit":"composite/videos/source-train-01-signal.audit.json","pair_id":"source-train-01","signal_validation_role":"subtitle_signal"}
-{"video_id":"source-train-01-clean","source_group":"source-p1-v2","features":"features/source-train-01-clean","labels":"composite/labels/source-train-01-clean.csv","split":"train","source_time_offset_seconds":541.541,"synthesis_audit":"composite/videos/source-train-01-clean.audit.json","pair_id":"source-train-01","signal_validation_role":"clean_control"}
+{"video_id":"source-train-01-signal","source_group":"source-window-training","features":"features/source-train-01-signal","labels":"composite/labels/source-train-01-signal.csv","split":"train","source_time_offset_seconds":541.541,"synthesis_audit":"composite/videos/source-train-01-signal.audit.json","pair_id":"source-train-01","signal_validation_role":"subtitle_signal"}
+{"video_id":"source-train-01-clean","source_group":"source-window-training","features":"features/source-train-01-clean","labels":"composite/labels/source-train-01-clean.csv","split":"train","source_time_offset_seconds":541.541,"synthesis_audit":"composite/videos/source-train-01-clean.audit.json","pair_id":"source-train-01","signal_validation_role":"clean_control"}
 ```
 
 `dataset-audit.json` is the source of truth for pair counts, packet counts, cue
@@ -141,8 +141,8 @@ must use diagnostic temporal validation:
 
 ```bash
 uv run h264-timing train \
-  data/h264_timing/p1-v2/manifest.jsonl \
-  outputs/h264_timing/p1-v6-final \
+  data/h264_timing/window-training/manifest.jsonl \
+  outputs/h264_timing/window-final \
   --epochs 15 \
   --batch-size 16 \
   --width 64 \
@@ -160,10 +160,10 @@ that value is explicitly overridden on the command line:
 
 ```bash
 uv run h264-timing infer \
-  data/h264_timing/p1-v2/features/miab-462-val-01-signal \
-  outputs/h264_timing/p1-v6-final/best.pt \
-  outputs/h264_timing/p1-v6-final/miab-462-val-01-signal.csv \
-  --labels data/h264_timing/p1-v2/composite/labels/miab-462-val-01-signal.csv
+  data/h264_timing/window-training/features/miab-462-val-01-signal \
+  outputs/h264_timing/window-final/best.pt \
+  outputs/h264_timing/window-final/miab-462-val-01-signal.csv \
+  --labels data/h264_timing/window-training/composite/labels/miab-462-val-01-signal.csv
 ```
 
 The command writes only interval CSV. It reports interval precision/recall/F1 at
@@ -188,8 +188,8 @@ Streaming checkpoints use a separate format and must be trained independently:
 
 ```bash
 uv run h264-timing train-stream \
-  data/h264_timing/p1-v2/manifest.jsonl \
-  outputs/h264_timing/p1-v2-stream \
+  data/h264_timing/streaming-training/manifest.jsonl \
+  outputs/h264_timing/streaming-final \
   --epochs 15 \
   --batch-size 16 \
   --validation-mode diagnostic_temporal \
@@ -227,17 +227,94 @@ feature order stored in the checkpoint. Byte tokens are optional unless the
 checkpoint enabled the byte branch. `push_many()` processes a supplied chunk in
 one model call without changing results at chunk boundaries.
 
-The command-line streaming entry reads JSON Lines from stdin and emits finalized
-segments immediately as JSON Lines:
+The command-line streaming entry accepts an H.264 video directly and emits
+finalized segments as JSON Lines. MP4/MOV-family files are read directly;
+other timestamped H.264 containers such as MKV and TS are losslessly remuxed
+to a temporary MP4 before feature extraction:
 
 ```bash
 uv run h264-timing stream-infer \
-  outputs/h264_timing/p1-v2-stream/best.pt < live-samples.jsonl
+  outputs/h264_timing/streaming-final/best.pt input.mp4
+```
+
+Omit the video argument to read model-ready JSON Lines from stdin instead:
+
+```bash
+uv run h264-timing stream-infer \
+  outputs/h264_timing/streaming-final/best.pt < live-samples.jsonl
 ```
 
 Each sample object contains `timestamp_seconds`, `duration_seconds`, `features`,
 and optional `tokens`. Send `{"type":"close"}` or end stdin to flush the active
-tail and close the inference session.
+tail and close the inference session. Video feature settings, visual settings,
+and inference chunk size are loaded from the streaming checkpoint.
+
+### Compressed-only streaming
+
+The dedicated compressed stream family never uses ROI pixels at inference. Its
+default expanded representation contains 498 numeric H.264 payload statistics
+and 512 sampled ROI slice-payload bytes per frame. Build that cache family
+without changing the existing streaming manifest:
+
+```bash
+uv run h264-timing prepare-compressed-stream \
+  data/h264_timing/streaming-training/manifest.jsonl \
+  data/h264_timing/compressed-streaming-training
+```
+
+Training may use the existing visual model as a teacher. The visual manifest is
+read only for training supervision; it is not part of the student checkpoint's
+input contract:
+
+```bash
+uv run h264-timing train-compressed-stream \
+  data/h264_timing/compressed-streaming-training/manifest.jsonl \
+  outputs/h264_timing/compressed-streaming-final-498 \
+  --visual-teacher-checkpoint outputs/h264_timing/streaming-final/best.pt \
+  --visual-teacher-manifest data/h264_timing/streaming-training/manifest.jsonl \
+  --validation-mode diagnostic_temporal
+```
+
+`summary.json` contains a strict `quality_gate`. It passes only when validation
+recall, interval F1, and one-frame boundary F1 are all 1.0 and the maximum
+boundary drift is at most one frame. A checkpoint is still retained when the
+gate fails so that an unsuccessful compressed-only experiment is inspectable;
+it must not be reported as satisfying those deployment metrics.
+
+Deployment uses the dedicated command. It performs container demux, packet
+reads, NAL splitting, and slice-header-prefix parsing only; FFmpeg is used only
+for lossless container remux when necessary, never for pixel decode:
+
+```bash
+uv run h264-timing compressed-stream-infer \
+  outputs/h264_timing/compressed-streaming-final-498/best.pt input.mp4
+```
+
+### Streaming visual-only training comparison
+
+The existing epoch-24 `outputs/h264_timing/streaming-final/best.pt` checkpoint
+is the combined-input baseline. A separate visual-only model was trained from
+scratch for 24 epochs with the same seed, data split, model width, temporal
+layers, windowing, loss weights, and decoder calibration procedure. Its model
+input structurally contains only the 198 decoded visual features; the 128
+compressed numeric features and 256-byte branch are absent from both training
+and inference.
+
+Both best checkpoints were evaluated on all 10 validation records (34,636
+frames and 113 labeled cues):
+
+| Trained model | IoU50 precision | IoU50 recall | IoU50 F1 | One-frame F1 | Matched / target | False intervals |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Combined baseline | 1.000000 | 1.000000 | 1.000000 | 1.000000 | 113 / 113 | 0 |
+| Visual only | 1.000000 | 0.982301 | 0.991071 | 0.937500 | 111 / 113 | 0 |
+
+The retrained visual-only model preserves almost all interval-detection quality,
+so the current same-source task is predominantly solved by visual features.
+Compressed inputs still provide a measurable benefit: two additional cues and
+perfect one-frame boundary matching. The baseline was produced by staged
+training while the visual-only run was trained from scratch, so this comparison
+does not isolate feature domain from training schedule. Neither result proves
+source-disjoint generalization.
 
 ## Verified local result
 

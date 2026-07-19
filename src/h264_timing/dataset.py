@@ -77,6 +77,7 @@ class FeatureCache:
             if file_sha256(self.directory / name) != artifact_sha256[name]:
                 raise ValueError(f"feature cache artifact fingerprint mismatch: {self.directory / name}")
         compressed_features = np.load(self.directory / "features.npy", mmap_mode="r")
+        self.compressed_features = compressed_features
         self.tokens = np.load(self.directory / "tokens.npy", mmap_mode="r")
         self.timestamps = np.load(self.directory / "timestamps.npy", mmap_mode="r")
         self.durations = np.load(self.directory / "durations.npy", mmap_mode="r")
@@ -98,6 +99,7 @@ class FeatureCache:
         if np.any(np.diff(self.timestamps) <= 0.0):
             raise ValueError(f"feature-cache timestamps must be strictly increasing: {self.directory}")
         self.visual_meta: dict | None = None
+        self.visual_features: np.ndarray | None = None
         arrays: tuple[np.ndarray, ...] = (compressed_features,)
         visual_meta_path = self.directory / "visual_meta.json"
         visual_feature_path = self.directory / "visual_features.npy"
@@ -129,8 +131,21 @@ class FeatureCache:
                     f"visual feature shape disagrees with metadata: {self.directory}"
                 )
             self.visual_meta = visual_meta
+            self.visual_features = visual_features
             arrays = (compressed_features, visual_features)
         self.features = CombinedFeatureArray(arrays)
+
+    @property
+    def compressed_feature_names(self) -> list[str]:
+        return list(self.meta["feature_names"])
+
+    @property
+    def visual_feature_names(self) -> list[str]:
+        return (
+            list(self.visual_meta["feature_names"])
+            if self.visual_meta is not None
+            else []
+        )
 
     @property
     def feature_names(self) -> list[str]:
@@ -167,6 +182,8 @@ class FeatureCache:
         timestamps = np.asarray(self.timestamps).copy()
         durations = np.asarray(self.durations).copy()
         self._close_mmaps([self.tokens, *self.features.arrays])
+        self.compressed_features = arrays[0]
+        self.visual_features = arrays[1] if len(arrays) > 1 else None
         self.features = CombinedFeatureArray(arrays)
         self.tokens = tokens
         self.timestamps = timestamps

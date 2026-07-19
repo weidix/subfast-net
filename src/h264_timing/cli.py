@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import subprocess
 import sys
+import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +20,15 @@ from .bitstream import (
     extract_feature_cache,
     probe_stream,
 )
+from .compressed_stream_train import (
+    CompressedStreamingTrainSettings,
+    train_compressed_streaming,
+)
+from .compressed_stream_prepare import (
+    CompressedStreamingPrepareSettings,
+    prepare_compressed_streaming_features,
+)
+from .compressed_streaming import CompressedStreamingSegmentDetector
 from .dataset import FeatureCache, intervals_inside_cache
 from .labels import parse_srt_timing, read_intervals, write_intervals
 from .metrics import interval_metrics
@@ -212,6 +225,11 @@ def build_parser(prog: str = "h264-timing") -> argparse.ArgumentParser:
     stream_training.add_argument("--dropout", type=float, default=0.10)
     stream_training.add_argument("--use-byte-branch", action="store_true")
     stream_training.add_argument(
+        "--visual-only",
+        action="store_true",
+        help="train and checkpoint a model using decoded visual features only",
+    )
+    stream_training.add_argument(
         "--no-segment-head",
         action="store_true",
         help="disable the causal end-anchor segment head",
@@ -239,6 +257,82 @@ def build_parser(prog: str = "h264-timing") -> argparse.ArgumentParser:
     )
     stream_training.add_argument("--temporal-guard", type=float, default=10.0)
 
+    compressed_stream_training = subparsers.add_parser(
+        "train-compressed-stream",
+        help="Train a causal stream model with compressed-domain inference input only",
+    )
+    compressed_stream_training.add_argument("manifest", type=Path)
+    compressed_stream_training.add_argument("output_dir", type=Path)
+    compressed_stream_training.add_argument("--epochs", type=int, default=30)
+    compressed_stream_training.add_argument("--batch-size", type=int, default=64)
+    compressed_stream_training.add_argument("--lr", type=float, default=1e-3)
+    compressed_stream_training.add_argument("--weight-decay", type=float, default=1e-4)
+    compressed_stream_training.add_argument("--window-frames", type=int, default=512)
+    compressed_stream_training.add_argument("--stride-frames", type=int, default=256)
+    compressed_stream_training.add_argument("--boundary-event-sigma", type=float, default=0.05)
+    compressed_stream_training.add_argument("--target-recall", type=float, default=1.0)
+    compressed_stream_training.add_argument("--minimum-duration", type=float, default=0.20)
+    compressed_stream_training.add_argument("--maximum-duration", type=float, default=8.0)
+    compressed_stream_training.add_argument("--width", type=int, default=128)
+    compressed_stream_training.add_argument("--temporal-layers", type=int, default=6)
+    compressed_stream_training.add_argument("--recurrent-layers", type=int, default=1)
+    compressed_stream_training.add_argument("--dropout", type=float, default=0.10)
+    compressed_stream_training.add_argument(
+        "--byte-branch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="consume compressed packet-tail byte tokens; enabled by default",
+    )
+    compressed_stream_training.add_argument("--use-segment-head", action="store_true")
+    compressed_stream_training.add_argument("--segment-boundary-weight", type=float, default=2.0)
+    compressed_stream_training.add_argument("--segment-loss-weight", type=float, default=0.25)
+    compressed_stream_training.add_argument("--negative-weight", type=float, default=1.0)
+    compressed_stream_training.add_argument("--boundary-event-loss-weight", type=float, default=1.5)
+    compressed_stream_training.add_argument("--clean-negative-weight", type=float, default=4.0)
+    compressed_stream_training.add_argument("--short-segment-weight", type=float, default=2.0)
+    compressed_stream_training.add_argument("--max-train-windows", type=int)
+    compressed_stream_training.add_argument("--max-val-windows", type=int)
+    compressed_stream_training.add_argument("--inference-chunk-frames", type=int, default=128)
+    compressed_stream_training.add_argument(
+        "--calibration-interval-epochs", type=int, default=5
+    )
+    compressed_stream_training.add_argument("--initial-checkpoint", type=Path)
+    compressed_stream_training.add_argument(
+        "--visual-teacher-checkpoint",
+        type=Path,
+        help="optional existing visual stream checkpoint used only to initialize compatible training weights",
+    )
+    compressed_stream_training.add_argument(
+        "--visual-teacher-manifest",
+        type=Path,
+        help="optional visual-feature manifest aligned by video_id for training-only supervision",
+    )
+    compressed_stream_training.add_argument(
+        "--visual-distillation-weight", type=float, default=0.5
+    )
+    compressed_stream_training.add_argument("--seed", type=int, default=2026)
+    compressed_stream_training.add_argument("--device", default="auto")
+    compressed_stream_training.add_argument(
+        "--validation-mode",
+        choices=("held_out", "diagnostic_temporal"),
+        default="held_out",
+    )
+    compressed_stream_training.add_argument("--temporal-guard", type=float, default=10.0)
+
+    compressed_stream_prepare = subparsers.add_parser(
+        "prepare-compressed-stream",
+        help="Rebuild a manifest with expanded compressed-only H.264 features",
+    )
+    compressed_stream_prepare.add_argument("manifest", type=Path)
+    compressed_stream_prepare.add_argument("output_root", type=Path)
+    compressed_stream_prepare.add_argument("--video-dir", type=Path)
+    compressed_stream_prepare.add_argument("--tokens", type=int, default=512)
+    compressed_stream_prepare.add_argument("--histogram-bins", type=int, default=64)
+    compressed_stream_prepare.add_argument("--payload-segments", type=int, default=6)
+    compressed_stream_prepare.add_argument("--workers", type=int, default=4)
+    compressed_stream_prepare.add_argument("--ffprobe", default="ffprobe")
+    compressed_stream_prepare.add_argument("--overwrite", action="store_true")
+
     infer = subparsers.add_parser(
         "infer", help="Emit subtitle intervals from a feature cache"
     )
@@ -265,10 +359,34 @@ def build_parser(prog: str = "h264-timing") -> argparse.ArgumentParser:
     )
 
     stream_infer = subparsers.add_parser(
-        "stream-infer", help="Consume model-ready feature samples as JSON Lines"
+        "stream-infer",
+        help="Run causal inference from an H.264 video or JSON Lines on stdin",
     )
     stream_infer.add_argument("checkpoint", type=Path)
+    stream_infer.add_argument(
+        "video",
+        type=Path,
+        nargs="?",
+        help="timestamped H.264 video file; omit for JSON Lines on stdin",
+    )
     stream_infer.add_argument("--device", default="auto")
+    stream_infer.add_argument("--ffmpeg", default="ffmpeg")
+    stream_infer.add_argument("--ffprobe", default="ffprobe")
+
+    compressed_stream_infer = subparsers.add_parser(
+        "compressed-stream-infer",
+        help="Run causal inference using H.264 compressed data only",
+    )
+    compressed_stream_infer.add_argument("checkpoint", type=Path)
+    compressed_stream_infer.add_argument(
+        "video",
+        type=Path,
+        nargs="?",
+        help="timestamped H.264 video; omit for compressed-feature JSON Lines",
+    )
+    compressed_stream_infer.add_argument("--device", default="auto")
+    compressed_stream_infer.add_argument("--ffmpeg", default="ffmpeg")
+    compressed_stream_infer.add_argument("--ffprobe", default="ffprobe")
     return parser
 
 
@@ -419,29 +537,21 @@ def _stream_infer(args: argparse.Namespace) -> None:
     sample_count = 0
     interrupted = False
     try:
-        for line_number, line in enumerate(sys.stdin, start=1):
-            if not line.strip():
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise ValueError(
-                    f"invalid stream JSON at input line {line_number}"
-                ) from error
-            if not isinstance(payload, dict):
-                raise ValueError(
-                    f"stream input line {line_number} must contain a JSON object"
-                )
-            if payload.get("type") == "close":
-                break
-            sample = StreamSample(
-                timestamp_seconds=payload["timestamp_seconds"],
-                duration_seconds=payload["duration_seconds"],
-                features=payload["features"],
-                tokens=payload.get("tokens"),
-            )
-            sample_count += 1
-            _write_stream_segments(detector.push(sample))
+        video = getattr(args, "video", None)
+        if video is None:
+            for sample in _iter_json_stream_samples():
+                sample_count += 1
+                _write_stream_segments(detector.push(sample))
+        else:
+            for samples in _iter_video_stream_samples(
+                video,
+                args.checkpoint,
+                expected_feature_names=detector.feature_names,
+                ffmpeg=getattr(args, "ffmpeg", "ffmpeg"),
+                ffprobe=getattr(args, "ffprobe", "ffprobe"),
+            ):
+                sample_count += len(samples)
+                _write_stream_segments(detector.push_many(samples))
     except KeyboardInterrupt:
         interrupted = True
     _write_stream_segments(detector.close())
@@ -457,6 +567,318 @@ def _stream_infer(args: argparse.Namespace) -> None:
         ),
         flush=True,
     )
+
+
+def _compressed_stream_infer(args: argparse.Namespace) -> None:
+    detector = CompressedStreamingSegmentDetector.from_checkpoint(
+        args.checkpoint,
+        device=args.device,
+    )
+    sample_count = 0
+    interrupted = False
+    try:
+        video = getattr(args, "video", None)
+        if video is None:
+            for sample in _iter_json_stream_samples():
+                sample_count += 1
+                _write_stream_segments(detector.push(sample))
+        else:
+            for samples in _iter_compressed_video_stream_samples(
+                video,
+                args.checkpoint,
+                expected_feature_names=detector.feature_names,
+                ffmpeg=getattr(args, "ffmpeg", "ffmpeg"),
+                ffprobe=getattr(args, "ffprobe", "ffprobe"),
+            ):
+                sample_count += len(samples)
+                _write_stream_segments(detector.push_many(samples))
+    except KeyboardInterrupt:
+        interrupted = True
+    _write_stream_segments(detector.close())
+    print(
+        json.dumps(
+            {
+                "type": "closed",
+                "sample_count": sample_count,
+                "interrupted": interrupted,
+                "input_domain": "h264_compressed_only",
+                "pixel_decode": False,
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+        ),
+        flush=True,
+    )
+
+
+def _iter_json_stream_samples() -> Iterator[StreamSample]:
+    for line_number, line in enumerate(sys.stdin, start=1):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"invalid stream JSON at input line {line_number}"
+            ) from error
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"stream input line {line_number} must contain a JSON object"
+            )
+        if payload.get("type") == "close":
+            return
+        yield StreamSample(
+            timestamp_seconds=payload["timestamp_seconds"],
+            duration_seconds=payload["duration_seconds"],
+            features=payload["features"],
+            tokens=payload.get("tokens"),
+        )
+
+
+def _iter_video_stream_samples(
+    video: Path,
+    checkpoint_path: Path,
+    *,
+    expected_feature_names: tuple[str, ...],
+    ffmpeg: str,
+    ffprobe: str,
+) -> Iterator[tuple[StreamSample, ...]]:
+    checkpoint = torch.load(
+        checkpoint_path.expanduser().resolve(),
+        map_location="cpu",
+        weights_only=False,
+    )
+    if not isinstance(checkpoint, dict) or "feature_settings" not in checkpoint:
+        raise ValueError("streaming checkpoint lacks video feature settings")
+    try:
+        feature_settings = FeatureSettings(**dict(checkpoint["feature_settings"]))
+        visual_values = dict(checkpoint.get("visual_feature_settings") or {})
+        if "edge_thresholds" in visual_values:
+            visual_values["edge_thresholds"] = tuple(visual_values["edge_thresholds"])
+        visual_settings = (
+            VisualFeatureSettings(**visual_values) if visual_values else None
+        )
+        chunk_frames = int(checkpoint.get("inference_chunk_frames", 128))
+    except (TypeError, ValueError) as error:
+        raise ValueError("streaming checkpoint has invalid video feature settings") from error
+    if chunk_frames <= 0:
+        raise ValueError("streaming checkpoint inference chunk size must be positive")
+
+    source_video = video.expanduser().resolve()
+    with tempfile.TemporaryDirectory(prefix="h264-timing-stream-infer-") as temporary:
+        temporary_path = Path(temporary)
+        compatible_video = _compatible_packet_source(
+            source_video,
+            temporary_path / "source.mp4",
+            ffmpeg=ffmpeg,
+            ffprobe=ffprobe,
+        )
+        feature_dir = temporary_path / "features"
+        extract_feature_cache(
+            compatible_video,
+            feature_dir,
+            settings=feature_settings,
+            ffprobe=ffprobe,
+        )
+        if visual_settings is not None:
+            extract_visual_feature_cache(
+                feature_dir,
+                settings=visual_settings,
+                ffmpeg=ffmpeg,
+            )
+        cache = FeatureCache(feature_dir)
+        try:
+            _validate_stream_video_cache(
+                cache,
+                checkpoint,
+                expected_feature_names=expected_feature_names,
+            )
+            feature_array = (
+                cache.visual_features
+                if checkpoint.get("input_domain") == "visual_only"
+                else cache.features
+            )
+            if feature_array is None:
+                raise ValueError("visual-only streaming cache has no visual features")
+            for start in range(0, len(cache.timestamps), chunk_frames):
+                stop = min(start + chunk_frames, len(cache.timestamps))
+                yield tuple(
+                    StreamSample(
+                        timestamp_seconds=float(cache.timestamps[index]),
+                        duration_seconds=float(cache.durations[index]),
+                        features=np.asarray(feature_array[index]),
+                        tokens=np.asarray(cache.tokens[index]),
+                    )
+                    for index in range(start, stop)
+                )
+        finally:
+            cache.release()
+
+
+def _iter_compressed_video_stream_samples(
+    video: Path,
+    checkpoint_path: Path,
+    *,
+    expected_feature_names: tuple[str, ...],
+    ffmpeg: str,
+    ffprobe: str,
+) -> Iterator[tuple[StreamSample, ...]]:
+    checkpoint = torch.load(
+        checkpoint_path.expanduser().resolve(),
+        map_location="cpu",
+        weights_only=False,
+    )
+    if (
+        not isinstance(checkpoint, dict)
+        or checkpoint.get("input_domain") != "h264_compressed_only"
+        or checkpoint.get("pixel_decode_required") is not False
+        or "visual_feature_settings" in checkpoint
+    ):
+        raise ValueError("checkpoint is not compressed-only streaming inference")
+    try:
+        feature_settings = FeatureSettings(**dict(checkpoint["feature_settings"]))
+        chunk_frames = int(checkpoint.get("inference_chunk_frames", 128))
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            "compressed streaming checkpoint has invalid feature settings"
+        ) from error
+    if chunk_frames <= 0:
+        raise ValueError("compressed streaming inference chunk size must be positive")
+
+    source_video = video.expanduser().resolve()
+    with tempfile.TemporaryDirectory(
+        prefix="h264-timing-compressed-stream-infer-"
+    ) as temporary:
+        temporary_path = Path(temporary)
+        compatible_video = _compatible_packet_source(
+            source_video,
+            temporary_path / "source.mp4",
+            ffmpeg=ffmpeg,
+            ffprobe=ffprobe,
+        )
+        feature_dir = temporary_path / "features"
+        extract_feature_cache(
+            compatible_video,
+            feature_dir,
+            settings=feature_settings,
+            ffprobe=ffprobe,
+        )
+        cache = FeatureCache(feature_dir)
+        try:
+            _validate_compressed_stream_video_cache(
+                cache,
+                checkpoint,
+                expected_feature_names=expected_feature_names,
+            )
+            for start in range(0, len(cache.timestamps), chunk_frames):
+                stop = min(start + chunk_frames, len(cache.timestamps))
+                yield tuple(
+                    StreamSample(
+                        timestamp_seconds=float(cache.timestamps[index]),
+                        duration_seconds=float(cache.durations[index]),
+                        features=np.asarray(cache.compressed_features[index]),
+                        tokens=np.asarray(cache.tokens[index]),
+                    )
+                    for index in range(start, stop)
+                )
+        finally:
+            cache.release()
+
+
+def _compatible_packet_source(
+    video: Path,
+    remuxed_video: Path,
+    *,
+    ffmpeg: str,
+    ffprobe: str,
+) -> Path:
+    stream = probe_stream(video, ffprobe=ffprobe)
+    format_names = set((stream.format_name or "").split(","))
+    if format_names == {"h264"}:
+        raise ValueError(
+            "raw H.264 input has no presentation timeline; use a timestamped "
+            "container such as MP4, MOV, MKV, or TS"
+        )
+    if stream.is_avc and format_names.intersection(
+        {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"}
+    ):
+        return video
+
+    binary = shutil.which(ffmpeg)
+    if binary is None:
+        raise FileNotFoundError(f"required executable not found: {ffmpeg}")
+    command = [
+        binary,
+        "-v",
+        "error",
+        "-fflags",
+        "+genpts",
+        "-i",
+        str(video),
+        "-map",
+        "0:v:0",
+        "-c:v",
+        "copy",
+        "-an",
+        "-sn",
+        "-dn",
+        "-f",
+        "mp4",
+        str(remuxed_video),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = result.stderr.strip()
+        raise RuntimeError(detail or "FFmpeg could not remux the H.264 video")
+    probe_stream(remuxed_video, ffprobe=ffprobe)
+    return remuxed_video
+
+
+def _validate_stream_video_cache(
+    cache: FeatureCache,
+    checkpoint: dict,
+    *,
+    expected_feature_names: tuple[str, ...],
+) -> None:
+    input_domain = checkpoint.get("input_domain", "combined")
+    if input_domain not in {"combined", "visual_only"}:
+        raise ValueError("streaming checkpoint has an unsupported input domain")
+    cache_feature_names = (
+        cache.visual_feature_names
+        if input_domain == "visual_only"
+        else cache.feature_names
+    )
+    if cache_feature_names != list(expected_feature_names):
+        raise ValueError("video feature schema does not match streaming checkpoint")
+    if dict(cache.meta["feature_settings"]) != dict(checkpoint["feature_settings"]):
+        raise ValueError("video feature settings do not match streaming checkpoint")
+    expected_visual = dict(checkpoint.get("visual_feature_settings") or {}) or None
+    if cache.visual_feature_settings != expected_visual:
+        raise ValueError("video visual features do not match streaming checkpoint")
+    if cache.meta["spatial_contract"] != checkpoint.get("spatial_contract"):
+        raise ValueError("video spatial contract does not match streaming checkpoint")
+
+
+def _validate_compressed_stream_video_cache(
+    cache: FeatureCache,
+    checkpoint: dict,
+    *,
+    expected_feature_names: tuple[str, ...],
+) -> None:
+    if cache.visual_feature_settings is not None:
+        raise ValueError("compressed streaming inference cache contains visual features")
+    if cache.compressed_feature_names != list(expected_feature_names):
+        raise ValueError(
+            "video compressed feature schema does not match streaming checkpoint"
+        )
+    if dict(cache.meta["feature_settings"]) != dict(checkpoint["feature_settings"]):
+        raise ValueError(
+            "video compressed feature settings do not match streaming checkpoint"
+        )
+    if cache.meta["spatial_contract"] != checkpoint.get("spatial_contract"):
+        raise ValueError(
+            "video compressed spatial contract does not match streaming checkpoint"
+        )
 
 
 def _write_stream_segments(segments: tuple[SegmentPrediction, ...]) -> None:
@@ -482,6 +904,9 @@ def main(argv: list[str] | None = None, *, prog: str = "h264-timing") -> None:
     args = build_parser(prog=prog).parse_args(argv)
     if args.command == "stream-infer":
         _stream_infer(args)
+        return
+    if args.command == "compressed-stream-infer":
+        _compressed_stream_infer(args)
         return
     if args.command == "probe":
         info = probe_stream(args.video, ffprobe=args.ffprobe)
@@ -636,10 +1061,66 @@ def main(argv: list[str] | None = None, *, prog: str = "h264-timing") -> None:
                 max_val_windows=args.max_val_windows,
                 inference_chunk_frames=args.inference_chunk_frames,
                 initial_checkpoint=args.initial_checkpoint,
+                input_domain="visual_only" if args.visual_only else "combined",
                 seed=args.seed,
                 device=args.device,
                 validation_mode=args.validation_mode,
                 temporal_guard_seconds=args.temporal_guard,
+            )
+        )
+    elif args.command == "train-compressed-stream":
+        result = train_compressed_streaming(
+            CompressedStreamingTrainSettings(
+                manifest=args.manifest,
+                output_dir=args.output_dir,
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+                learning_rate=args.lr,
+                weight_decay=args.weight_decay,
+                window_frames=args.window_frames,
+                stride_frames=args.stride_frames,
+                boundary_event_sigma_seconds=args.boundary_event_sigma,
+                target_recall=args.target_recall,
+                minimum_duration_seconds=args.minimum_duration,
+                maximum_duration_seconds=args.maximum_duration,
+                width=args.width,
+                temporal_layers=args.temporal_layers,
+                recurrent_layers=args.recurrent_layers,
+                dropout=args.dropout,
+                use_byte_branch=args.byte_branch,
+                use_segment_head=args.use_segment_head,
+                segment_boundary_weight=args.segment_boundary_weight,
+                segment_loss_weight=args.segment_loss_weight,
+                negative_weight=args.negative_weight,
+                boundary_event_loss_weight=args.boundary_event_loss_weight,
+                clean_negative_weight=args.clean_negative_weight,
+                short_segment_weight=args.short_segment_weight,
+                max_train_windows=args.max_train_windows,
+                max_val_windows=args.max_val_windows,
+                inference_chunk_frames=args.inference_chunk_frames,
+                calibration_interval_epochs=args.calibration_interval_epochs,
+                initial_checkpoint=args.initial_checkpoint,
+                visual_teacher_checkpoint=args.visual_teacher_checkpoint,
+                visual_teacher_manifest=args.visual_teacher_manifest,
+                visual_distillation_weight=args.visual_distillation_weight,
+                seed=args.seed,
+                device=args.device,
+                validation_mode=args.validation_mode,
+                temporal_guard_seconds=args.temporal_guard,
+            )
+        )
+    elif args.command == "prepare-compressed-stream":
+        result = prepare_compressed_streaming_features(
+            CompressedStreamingPrepareSettings(
+                manifest=args.manifest,
+                output_root=args.output_root,
+                video_dir=args.video_dir,
+                token_count=args.tokens,
+                histogram_bins=args.histogram_bins,
+                payload_segments=args.payload_segments,
+                workers=args.workers,
+                ffprobe=args.ffprobe,
+                overwrite=args.overwrite,
             )
         )
     elif args.command == "train":

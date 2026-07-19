@@ -12,12 +12,16 @@ import numpy as np
 import torch
 
 from h264_timing import (
+    COMPRESSED_STREAM_CHECKPOINT_FORMAT,
+    COMPRESSED_STREAM_CHECKPOINT_VERSION,
     FEATURE_FORMAT,
     FEATURE_VERSION,
     STREAM_CHECKPOINT_FORMAT,
     STREAM_CHECKPOINT_VERSION,
     cli,
 )
+from h264_timing.compressed_streaming import CompressedStreamingSegmentDetector
+from h264_timing.compressed_stream_train import _quality_gate
 from h264_timing.bitstream import (
     FeatureSettings,
     PacketInfo,
@@ -330,10 +334,32 @@ class H264TimingTests(unittest.TestCase):
         self.assertFalse(inference.require_boundary_events)
 
         stream_inference = parser.parse_args(["stream-infer", "stream.pt"])
+        video_stream_inference = parser.parse_args(
+            ["stream-infer", "stream.pt", "input.mp4"]
+        )
+        compressed_stream_inference = parser.parse_args(
+            ["compressed-stream-infer", "compressed.pt", "input.mp4"]
+        )
+        compressed_stream_training = parser.parse_args(
+            ["train-compressed-stream", "manifest.jsonl", "compressed-output"]
+        )
+        compressed_stream_prepare = parser.parse_args(
+            ["prepare-compressed-stream", "manifest.jsonl", "expanded-features"]
+        )
         stream_training = parser.parse_args(
             ["train-stream", "manifest.jsonl", "stream-output"]
         )
         self.assertEqual(stream_inference.checkpoint, Path("stream.pt"))
+        self.assertIsNone(stream_inference.video)
+        self.assertEqual(video_stream_inference.video, Path("input.mp4"))
+        self.assertEqual(
+            compressed_stream_inference.checkpoint, Path("compressed.pt")
+        )
+        self.assertTrue(compressed_stream_training.byte_branch)
+        self.assertEqual(compressed_stream_training.width, 128)
+        self.assertEqual(compressed_stream_prepare.tokens, 512)
+        self.assertEqual(compressed_stream_prepare.histogram_bins, 64)
+        self.assertEqual(compressed_stream_prepare.payload_segments, 6)
         self.assertEqual(stream_training.inference_chunk_frames, 128)
 
     def test_segment_targets_reconstruct_exact_adjacent_segments(self):
@@ -706,6 +732,113 @@ class H264TimingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unsupported checkpoint"):
                 cli._load_model(path, torch.device("cpu"))
 
+    def test_compressed_streaming_checkpoint_has_no_visual_input_contract(self):
+        config = StreamingModelConfig(
+            feature_count=2,
+            token_count=4,
+            width=8,
+            temporal_layers=1,
+            dropout=0.0,
+            use_byte_branch=True,
+        )
+        model = StreamingH264SubtitleModel(config)
+        checkpoint = {
+            "format": COMPRESSED_STREAM_CHECKPOINT_FORMAT,
+            "version": COMPRESSED_STREAM_CHECKPOINT_VERSION,
+            "feature_version": FEATURE_VERSION,
+            "input_domain": "h264_compressed_only",
+            "pixel_decode_required": False,
+            "model_output_contract": "causal_compressed_streaming_presence_events",
+            "model_config": config.to_dict(),
+            "model": model.state_dict(),
+            "compressed_feature_names": ["first", "second"],
+            "feature_mean": torch.zeros((2,)),
+            "feature_std": torch.ones((2,)),
+            "streaming_decoder_config": StreamingDecoderConfig().to_dict(),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "compressed-stream.pt"
+            torch.save(checkpoint, path)
+            detector = CompressedStreamingSegmentDetector.from_checkpoint(
+                path, device="cpu"
+            )
+            self.assertEqual(detector.feature_names, ("first", "second"))
+
+            checkpoint["visual_feature_settings"] = {"width": 256, "height": 32}
+            torch.save(checkpoint, path)
+            with self.assertRaisesRegex(ValueError, "must not define visual"):
+                CompressedStreamingSegmentDetector.from_checkpoint(path, device="cpu")
+
+    def test_compressed_video_stream_never_extracts_visual_features(self):
+        checkpoint = {
+            "input_domain": "h264_compressed_only",
+            "pixel_decode_required": False,
+            "feature_settings": {
+                "token_count": 2,
+                "histogram_bins": 16,
+                "payload_segments": 4,
+                "payload_tail_ratio": 0.2,
+                "spatial_mode": "exact_bottom_slices",
+            },
+            "inference_chunk_frames": 2,
+            "spatial_contract": {"scope": "compressed"},
+        }
+        cache = SimpleNamespace(
+            visual_feature_settings=None,
+            compressed_feature_names=["first"],
+            compressed_features=np.asarray([[1.0], [2.0]], dtype=np.float32),
+            tokens=np.asarray([[1, 2], [3, 4]], dtype=np.uint8),
+            timestamps=np.asarray([0.0, 1 / 30], dtype=np.float64),
+            durations=np.asarray([1 / 30, 1 / 30], dtype=np.float32),
+            meta={
+                "feature_settings": checkpoint["feature_settings"],
+                "spatial_contract": checkpoint["spatial_contract"],
+            },
+            release=lambda: None,
+        )
+        with (
+            patch.object(cli.torch, "load", return_value=checkpoint),
+            patch.object(cli, "_compatible_packet_source", return_value=Path("input.mp4")),
+            patch.object(cli, "extract_feature_cache") as extract_compressed,
+            patch.object(cli, "extract_visual_feature_cache") as extract_visual,
+            patch.object(cli, "FeatureCache", return_value=cache),
+        ):
+            chunks = list(
+                cli._iter_compressed_video_stream_samples(
+                    Path("input.mp4"),
+                    Path("compressed-stream.pt"),
+                    expected_feature_names=("first",),
+                    ffmpeg="ffmpeg",
+                    ffprobe="ffprobe",
+                )
+            )
+
+        extract_compressed.assert_called_once()
+        extract_visual.assert_not_called()
+        self.assertEqual(len(chunks), 1)
+        np.testing.assert_array_equal(chunks[0][0].features, [1.0])
+
+    def test_compressed_quality_gate_requires_exact_metrics_and_one_frame_drift(self):
+        passing = _quality_gate(
+            {
+                "interval_recall_iou50": 1.0,
+                "interval_f1_iou50": 1.0,
+                "segment_f1_1frame": 1.0,
+                "maximum_boundary_drift_frames": 1.0,
+            }
+        )
+        failing = _quality_gate(
+            {
+                "interval_recall_iou50": 1.0,
+                "interval_f1_iou50": 1.0,
+                "segment_f1_1frame": 1.0,
+                "maximum_boundary_drift_frames": 1.01,
+            }
+        )
+
+        self.assertTrue(passing["passed"])
+        self.assertFalse(failing["passed"])
+
     def test_stream_cli_stops_and_flushes_on_manual_close_record(self):
         pushed = []
         close_count = 0
@@ -748,6 +881,56 @@ class H264TimingTests(unittest.TestCase):
         self.assertEqual(len(pushed), 1)
         self.assertEqual(close_count, 1)
         self.assertEqual(json.loads(output.getvalue())["type"], "closed")
+
+    def test_stream_cli_consumes_direct_video_in_chunks(self):
+        pushed = []
+
+        class FakeDetector:
+            feature_names = ("feature",)
+
+            def push_many(self, samples):
+                pushed.append(samples)
+                return ()
+
+            def close(self):
+                return ()
+
+        samples = (
+            StreamSample(0.0, 1 / 30, [0.0]),
+            StreamSample(1 / 30, 1 / 30, [1.0]),
+        )
+        output = io.StringIO()
+        arguments = Namespace(
+            checkpoint=Path("stream.pt"),
+            video=Path("input.mp4"),
+            device="cpu",
+            ffmpeg="ffmpeg",
+            ffprobe="ffprobe",
+        )
+        with (
+            patch.object(
+                cli.StreamingSegmentDetector,
+                "from_checkpoint",
+                return_value=FakeDetector(),
+            ),
+            patch.object(
+                cli,
+                "_iter_video_stream_samples",
+                return_value=iter((samples,)),
+            ) as stream_samples,
+            redirect_stdout(output),
+        ):
+            cli._stream_infer(arguments)
+
+        stream_samples.assert_called_once_with(
+            Path("input.mp4"),
+            Path("stream.pt"),
+            expected_feature_names=("feature",),
+            ffmpeg="ffmpeg",
+            ffprobe="ffprobe",
+        )
+        self.assertEqual(pushed, [samples])
+        self.assertEqual(json.loads(output.getvalue())["sample_count"], 2)
 
     def test_stream_targets_never_place_boundary_mass_before_the_event(self):
         timestamps = np.arange(8, dtype=np.float64) / 10.0
