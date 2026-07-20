@@ -6,7 +6,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from h264_timing.dataset import FeatureCache, read_manifest
+from subtitle_timing_core.dataset import FeatureCache, read_manifest
 
 from . import INPUT_DOMAIN
 from .features import (

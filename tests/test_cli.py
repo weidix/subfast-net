@@ -11,12 +11,12 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from subfast_net.detector.model import SubtitleDetector
+from subfast_detector.model import SubtitleDetector
 
 
 class CliTests(unittest.TestCase):
     def test_export_unified_subcommand_writes_model_directory(self):
-        from subfast_net.cli import main
+        from subfast_detector.cli import main
 
         model = nn.Conv2d(3, 2, kernel_size=3, stride=2, padding=1).eval()
         exported = torch.export.export(model, (torch.randn(1, 3, 8, 8),))
@@ -33,7 +33,7 @@ class CliTests(unittest.TestCase):
             self.assertTrue((output_dir / "weights.bin").is_file())
 
     def test_export_unified_subcommand_accepts_training_checkpoint(self):
-        from subfast_net.cli import main
+        from subfast_detector.cli import main
 
         model = SubtitleDetector().eval()
 
@@ -56,7 +56,7 @@ class CliTests(unittest.TestCase):
             self.assertTrue((output_dir / "weights.bin").is_file())
 
     def test_export_unified_subcommand_accepts_batch_size_and_head_output(self):
-        from subfast_net.cli import main
+        from subfast_detector.cli import main
 
         model = SubtitleDetector().eval()
 
@@ -88,7 +88,7 @@ class CliTests(unittest.TestCase):
             self.assertNotIn("aten.upsample_bilinear2d.vec", [node["op"] for node in manifest["nodes"]])
 
     def test_export_coreml_subcommand_writes_model_package(self):
-        from subfast_net.cli import main
+        from subfast_detector.cli import main
 
         class FakeTensorType:
             def __init__(self, name, shape):
@@ -133,7 +133,7 @@ class CliTests(unittest.TestCase):
         from safetensors import safe_open
         from safetensors.torch import load_file
 
-        from subfast_net.cli import main
+        from subfast_detector.cli import main
 
         model = SubtitleDetector().eval()
         with tempfile.TemporaryDirectory() as tmp:
@@ -167,7 +167,7 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(archive.metadata()["model_type"], "subtitle_detector")
 
     def test_training_validation_and_benchmark_commands_dispatch(self):
-        from subfast_net.cli import main
+        from subfast_detector.cli import main
 
         calls: list[tuple[str, str, list[str]]] = []
 
@@ -184,34 +184,34 @@ class CliTests(unittest.TestCase):
         cases = [
             (
                 ["train", "detector", "--epochs", "2"],
-                ("subfast_net.detector.train", "main", ["--epochs", "2"]),
+                ("subfast_detector.train", "main", ["--epochs", "2"]),
             ),
             (
                 ["train", "presence", "--epochs", "3"],
-                ("subfast_net.roi.presence.train", "main", ["--epochs", "3"]),
+                ("subfast_roi_presence.train", "main", ["--epochs", "3"]),
             ),
             (
                 ["train", "matcher", "--epochs", "4"],
-                ("subfast_net.roi.matcher.train", "main", ["--epochs", "4"]),
+                ("subfast_roi_matcher.train", "main", ["--epochs", "4"]),
             ),
             (
                 ["validate", "matcher", "--checkpoint", "best.pt"],
-                ("subfast_net.roi.matcher.train", "main_validate", ["--checkpoint", "best.pt"]),
+                ("subfast_roi_matcher.train", "main_validate", ["--checkpoint", "best.pt"]),
             ),
             (
                 ["benchmark", "presence", "--device", "mps"],
-                ("subfast_net.roi.presence.train", "main_benchmark", ["--device", "mps"]),
+                ("subfast_roi_presence.train", "main_benchmark", ["--device", "mps"]),
             ),
         ]
 
-        with patch("subfast_net.cli.import_module", side_effect=fake_import):
+        with patch("subfast_detector.cli.import_module", side_effect=fake_import):
             for command, expected in cases:
                 with self.subTest(command=command):
                     main(command)
                     self.assertEqual(calls[-1], expected)
 
     def test_tools_are_not_routed_through_model_cli(self):
-        from subfast_net.cli import main
+        from subfast_detector.cli import main
 
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):

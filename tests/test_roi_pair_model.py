@@ -4,12 +4,12 @@ import unittest
 
 import torch
 
-from subfast_net.detector.dataset import IMAGENET_MEAN, IMAGENET_STD
-from subfast_net.roi.matcher.model import (
+from subfast_roi_matcher.model import (
     RoiPairMatcher,
     fuse_pair_matcher_for_inference,
     trace_pair_matcher_for_inference,
 )
+from subfast_shared.vision import IMAGENET_MEAN, IMAGENET_STD
 
 
 class RoiPairModelTest(unittest.TestCase):

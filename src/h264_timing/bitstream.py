@@ -16,7 +16,7 @@ from numpy.lib.format import open_memmap
 from tqdm import tqdm
 
 from . import FEATURE_FORMAT, FEATURE_VERSION
-from .hashing import file_sha256
+from subtitle_timing_core.hashing import file_sha256
 
 
 VCL_NAL_TYPES = {1, 2, 3, 4, 5}

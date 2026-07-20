@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from . import CHECKPOINT_FORMAT, CHECKPOINT_VERSION, FEATURE_VERSION
-from .dataset import (
+from subtitle_timing_core.dataset import (
     LoadedRecord,
     TimingWindowDataset,
     compute_feature_stats,
@@ -22,9 +22,13 @@ from .dataset import (
     read_manifest,
 )
 from .loss import segment_detection_loss
-from .metrics import IntervalMetricSample, aggregate_interval_metrics
+from subtitle_timing_core.metrics import IntervalMetricSample, aggregate_interval_metrics
 from .model import H264SubtitleSegmentModel, ModelConfig
-from .postprocess import SegmentPrediction, SegmentSelectionConfig, select_segments
+from subtitle_timing_core.postprocess import (
+    SegmentPrediction,
+    SegmentSelectionConfig,
+    select_segments,
+)
 from .predict import predict_cache
 
 

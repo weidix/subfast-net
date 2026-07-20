@@ -5,9 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from subfast_net.detector.config import TrainSettings
-from subfast_net.detector.dataset import SubtitleDataset, apply_label_masks
-from subfast_net.detector.train import (
+from subfast_detector.config import TrainSettings
+from subfast_detector.dataset import SubtitleDataset, apply_label_masks
+from subfast_detector.train import (
     format_epoch_summary,
     parse_args,
     resolve_resume_checkpoint,

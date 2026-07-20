@@ -8,8 +8,8 @@ from pathlib import Path
 import torch
 from PIL import Image
 
-from subfast_net.roi.data import RoiPairBatch, RoiPairDataset, RoiSample, collate_pair_batch
-from subfast_net.roi.pairs import (
+from subfast_roi_data.data import RoiPairBatch, RoiPairDataset, RoiSample, collate_pair_batch
+from subfast_roi_data.pairs import (
     RoiPair,
     RoiPairEpochSchedule,
     RoiPairPools,

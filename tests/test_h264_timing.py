@@ -11,60 +11,64 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from h264_timing import (
+from h264_compressed_stream_timing import (
     COMPRESSED_STREAM_CHECKPOINT_FORMAT,
     COMPRESSED_STREAM_CHECKPOINT_VERSION,
+)
+from h264_compressed_stream_timing.compressed_stream_train import _quality_gate
+from h264_compressed_stream_timing.compressed_streaming import CompressedStreamingSegmentDetector
+from h264_timing import (
     FEATURE_FORMAT,
     FEATURE_VERSION,
-    STREAM_CHECKPOINT_FORMAT,
-    STREAM_CHECKPOINT_VERSION,
     cli,
 )
-from h264_timing.compressed_streaming import CompressedStreamingSegmentDetector
-from h264_timing.compressed_stream_train import _quality_gate
 from h264_timing.bitstream import (
     FeatureSettings,
     PacketInfo,
     StreamInfo,
     _select_spatial_payload,
 )
-from h264_timing.dataset import FeatureCache, read_manifest, window_starts
-from h264_timing.hashing import file_sha256
-from h264_timing.labels import (
-    SrtCue,
-    SubtitleInterval,
-    segment_targets_from_intervals,
-)
 from h264_timing.loss import segment_detection_loss
-from h264_timing.metrics import interval_metrics
 from h264_timing.model import H264SubtitleSegmentModel, ModelConfig
-from h264_timing.postprocess import (
-    SegmentPrediction,
-    SegmentSelectionConfig,
-    select_segments,
-)
-from h264_timing.prepare import ClipPlan, _validate_resumed_source_range
 from h264_timing.predict import predict_cache
+from h264_timing.prepare import ClipPlan, _validate_resumed_source_range
 from h264_timing.synthesis import (
     CueScheduleSettings,
     _partition_randomized_cues,
     _payload_sha256,
 )
-from h264_timing.stream_labels import (
+from h264_timing.train import TrainSettings, _checkpoint
+from subtitle_timing_core.dataset import FeatureCache, read_manifest, window_starts
+from subtitle_timing_core.hashing import file_sha256
+from subtitle_timing_core.labels import (
+    SrtCue,
+    SubtitleInterval,
+    segment_targets_from_intervals,
+)
+from subtitle_timing_core.metrics import interval_metrics
+from subtitle_timing_core.postprocess import (
+    SegmentPrediction,
+    SegmentSelectionConfig,
+    select_segments,
+)
+from subtitle_timing_stream import (
+    STREAM_CHECKPOINT_FORMAT,
+    STREAM_CHECKPOINT_VERSION,
+)
+from subtitle_timing_stream.stream_labels import (
     causal_boundary_event_targets_from_intervals,
     presence_targets_from_intervals,
 )
-from h264_timing.stream_model import (
+from subtitle_timing_stream.stream_model import (
     StreamingH264SubtitleModel,
     StreamingModelConfig,
 )
-from h264_timing.stream_postprocess import (
+from subtitle_timing_stream.stream_postprocess import (
     StreamingDecoderConfig,
     StreamingEventPairDecoder,
     StreamingSegmentDecoder,
 )
-from h264_timing.streaming import StreamSample, StreamingSegmentDetector
-from h264_timing.train import TrainSettings, _checkpoint
+from subtitle_timing_stream.streaming import StreamSample, StreamingSegmentDetector
 
 
 def _unsigned_exp_golomb(value: int) -> str:

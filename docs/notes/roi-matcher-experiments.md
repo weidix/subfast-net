@@ -1,6 +1,6 @@
 # ROI Pair Matcher 优化记录
 
-> 历史归档：本文记录曾用于选择当前 Direct Pair Matcher 的实验。当前 Direct Pair Matcher 与独立的 ROI Presence + Embedding 训练结构并存；本页只描述 matcher 的历史取舍。当前训练与验证入口分别是 `subfast-net train matcher` 和 `subfast-net validate matcher`。
+> 历史归档：本文记录曾用于选择当前 Direct Pair Matcher 的实验。当前 Direct Pair Matcher 与独立的 ROI Presence + Embedding 训练结构并存；本页只描述 matcher 的历史取舍。当前训练与验证入口分别是 `subfast-roi-matcher` 和 `subfast-roi-matcher-validate`。
 
 ## 当前基线与目标
 
@@ -281,7 +281,7 @@ flowchart TD
     J --> K["固定阈值错误数 → FP → gap"]
 ```
 
-这条路径由 `subfast-net train matcher` 运行，不包含 presence head，不冻结任何随机特征层，也不使用 OCR
+这条路径由 `subfast-roi-matcher` 运行，不包含 presence head，不冻结任何随机特征层，也不使用 OCR
 作为模型输入。OCR 只沿用可信 pair 池的筛选语义。
 
 ### 原 masked-global 基线训练流程（历史对照）

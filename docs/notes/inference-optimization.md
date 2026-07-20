@@ -11,7 +11,7 @@ The optimized runtime artifact is exported from the same trained checkpoint. It 
 Optimized export:
 
 ```bash
-uv run subfast-net export unified \
+uv run subfast-export unified \
   --batch-size 16 \
   --head-output \
   outputs/full_512/best.pt \
@@ -116,7 +116,7 @@ In the current experiment, `256x256` batch-16 reached about `0.894 ms/img` infer
 Export optimized artifact from `full_512`:
 
 ```bash
-uv run subfast-net export unified \
+uv run subfast-export unified \
   --batch-size 16 \
   --head-output \
   outputs/full_512/best.pt \
@@ -126,7 +126,7 @@ uv run subfast-net export unified \
 Export ordinary artifact from `full_512`:
 
 ```bash
-uv run subfast-net export unified \
+uv run subfast-export unified \
   outputs/full_512/best.pt \
   outputs/full_512/unified
 ```

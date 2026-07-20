@@ -1,7 +1,11 @@
 """Full-frame visual subtitle timing detection."""
 
-FEATURE_FORMAT = "subfast-net.full-frame-timing-features"
-FEATURE_VERSION = 1
+from subtitle_timing_core.formats import (
+    FULL_FRAME_TIMING_FEATURE_FORMAT as FEATURE_FORMAT,
+    FULL_FRAME_TIMING_FEATURE_VERSION as FEATURE_VERSION,
+)
+
+
 CHECKPOINT_FORMAT = "subfast-net.full-frame-timing-stream-model"
 CHECKPOINT_VERSION = 1
 INPUT_DOMAIN = "full_frame_visual"

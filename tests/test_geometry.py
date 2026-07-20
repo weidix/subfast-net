@@ -2,10 +2,10 @@ import unittest
 
 import numpy as np
 
-from subfast_net.detector.geometry import Box, letterbox_shape, yolo_to_box
-from subfast_net.detector.metrics import evaluate_image
-from subfast_net.detector.postprocess import logits_to_boxes
-from subfast_net.detector.targets import build_targets
+from subfast_detector.metrics import evaluate_image
+from subfast_detector.postprocess import logits_to_boxes
+from subfast_detector.targets import build_targets
+from subfast_shared.geometry import Box, letterbox_shape, yolo_to_box
 
 
 class GeometryTests(unittest.TestCase):

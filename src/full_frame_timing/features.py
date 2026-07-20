@@ -10,8 +10,8 @@ from pathlib import Path
 
 import numpy as np
 
-from h264_timing.dataset import FeatureCache
-from h264_timing.hashing import file_sha256
+from subtitle_timing_core.dataset import FeatureCache
+from subtitle_timing_core.hashing import file_sha256
 
 from . import FEATURE_FORMAT, FEATURE_VERSION, INPUT_DOMAIN
 

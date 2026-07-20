@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from subfast_net.detector.model import SubtitleDetector
-from subfast_net.export.unified import export_pt2_to_unified_model
+from subfast_detector.model import SubtitleDetector
+from subfast_export.unified import export_pt2_to_unified_model
 
 
 class TinyExportModel(nn.Module):
@@ -91,7 +91,7 @@ class UnifiedModelExportTests(unittest.TestCase):
             self.assertEqual(weight_blob.stat().st_size, bias_meta["offset"] + bias_meta["byte_length"])
 
     def test_export_cli_writes_unified_model_directory(self):
-        from subfast_net.export.unified import main
+        from subfast_export.unified import main
 
         model = TinyExportModel().eval()
         exported = torch.export.export(model, (torch.randn(1, 3, 8, 8),))
@@ -176,7 +176,7 @@ class UnifiedModelExportTests(unittest.TestCase):
             torch.testing.assert_close(actual_bias, expected_bias)
 
     def test_export_checkpoint_to_coreml_saves_mlpackage(self):
-        from subfast_net.export.unified import export_model_to_coreml_model
+        from subfast_export.unified import export_model_to_coreml_model
 
         calls = {}
 

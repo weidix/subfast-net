@@ -8,11 +8,11 @@ from pathlib import Path
 
 import numpy as np
 
-from .hashing import file_sha256
-
-
-VISUAL_FEATURE_FORMAT = "subfast-net.h264-timing-visual-features"
-VISUAL_FEATURE_VERSION = 1
+from subtitle_timing_core.formats import (
+    H264_TIMING_VISUAL_FEATURE_FORMAT as VISUAL_FEATURE_FORMAT,
+    H264_TIMING_VISUAL_FEATURE_VERSION as VISUAL_FEATURE_VERSION,
+)
+from subtitle_timing_core.hashing import file_sha256
 
 
 @dataclass(frozen=True)

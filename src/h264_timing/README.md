@@ -1,5 +1,11 @@
 # Direct subtitle segments from H.264 timing features
 
+This package owns the direct interval-proposal model and H.264 feature/data
+pipeline. Visual causal streaming is separately exposed by
+[`h264_stream_timing`](../h264_stream_timing/README.md); compressed-only
+causal streaming is separately exposed by
+[`h264_compressed_stream_timing`](../h264_compressed_stream_timing/README.md).
+
 This project trains a small temporal detector for complete burned-in subtitle
 segments. Every compressed-frame anchor predicts a scored `(start, end)` pair.
 Auxiliary start/end event heads may refine and confirm the two boundaries of an
@@ -187,7 +193,7 @@ are consumed.
 Streaming checkpoints use a separate format and must be trained independently:
 
 ```bash
-uv run h264-timing train-stream \
+uv run h264-stream-timing train \
   data/h264_timing/streaming-training/manifest.jsonl \
   outputs/h264_timing/streaming-final \
   --epochs 15 \
@@ -200,7 +206,7 @@ The Python inference entry accepts one sample or a chunk and owns all temporal
 state until `close()`:
 
 ```python
-from h264_timing.streaming import (
+from h264_stream_timing import (
     StreamSample,
     StreamingSegmentDetector,
 )
@@ -233,14 +239,14 @@ other timestamped H.264 containers such as MKV and TS are losslessly remuxed
 to a temporary MP4 before feature extraction:
 
 ```bash
-uv run h264-timing stream-infer \
+uv run h264-stream-timing infer \
   outputs/h264_timing/streaming-final/best.pt input.mp4
 ```
 
 Omit the video argument to read model-ready JSON Lines from stdin instead:
 
 ```bash
-uv run h264-timing stream-infer \
+uv run h264-stream-timing infer \
   outputs/h264_timing/streaming-final/best.pt < live-samples.jsonl
 ```
 
@@ -257,7 +263,7 @@ and 512 sampled ROI slice-payload bytes per frame. Build that cache family
 without changing the existing streaming manifest:
 
 ```bash
-uv run h264-timing prepare-compressed-stream \
+uv run h264-compressed-stream-timing prepare \
   data/h264_timing/streaming-training/manifest.jsonl \
   data/h264_timing/compressed-streaming-training
 ```
@@ -267,7 +273,7 @@ read only for training supervision; it is not part of the student checkpoint's
 input contract:
 
 ```bash
-uv run h264-timing train-compressed-stream \
+uv run h264-compressed-stream-timing train \
   data/h264_timing/compressed-streaming-training/manifest.jsonl \
   outputs/h264_timing/compressed-streaming-final-498 \
   --visual-teacher-checkpoint outputs/h264_timing/streaming-final/best.pt \
@@ -286,7 +292,7 @@ reads, NAL splitting, and slice-header-prefix parsing only; FFmpeg is used only
 for lossless container remux when necessary, never for pixel decode:
 
 ```bash
-uv run h264-timing compressed-stream-infer \
+uv run h264-compressed-stream-timing infer \
   outputs/h264_timing/compressed-streaming-final-498/best.pt input.mp4
 ```
 

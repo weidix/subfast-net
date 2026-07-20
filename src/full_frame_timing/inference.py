@@ -6,13 +6,16 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from h264_timing.dataset import FeatureCache, intervals_inside_cache
-from h264_timing.labels import read_intervals
-from h264_timing.metrics import interval_metrics
-from h264_timing.postprocess import SegmentPrediction, write_segment_predictions
-from h264_timing.stream_model import StreamingH264SubtitleModel, StreamingModelConfig
-from h264_timing.stream_postprocess import StreamingDecoderConfig
-from h264_timing.streaming import (
+from subtitle_timing_core.dataset import FeatureCache, intervals_inside_cache
+from subtitle_timing_core.labels import read_intervals
+from subtitle_timing_core.metrics import interval_metrics
+from subtitle_timing_core.postprocess import SegmentPrediction, write_segment_predictions
+from subtitle_timing_stream.stream_model import (
+    StreamingH264SubtitleModel,
+    StreamingModelConfig,
+)
+from subtitle_timing_stream.stream_postprocess import StreamingDecoderConfig
+from subtitle_timing_stream.streaming import (
     StreamSample,
     StreamingSegmentDetector,
 )

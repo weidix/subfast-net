@@ -6,8 +6,8 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, Field, model_validator
 
-from h264_timing.dataset import FeatureCache, read_manifest
-from h264_timing.stream_train import StreamingTrainSettings, train_streaming
+from subtitle_timing_core.dataset import FeatureCache, read_manifest
+from subtitle_timing_stream.stream_train import StreamingTrainSettings, train_streaming
 
 from . import FEATURE_FORMAT, INPUT_DOMAIN
 

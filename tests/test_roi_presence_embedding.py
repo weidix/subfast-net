@@ -9,24 +9,24 @@ from unittest.mock import patch
 import torch
 from PIL import Image
 
-from subfast_net.roi.embedding.config import RoiTrainSettings
-from subfast_net.roi.data import RoiPairDataset, RoiSample, collate_pair_batch
-from subfast_net.roi.embedding.loss import (
+from subfast_roi_data.data import RoiPairDataset, RoiSample, collate_pair_batch
+from subfast_roi_data.pairs import (
+    RoiPair,
+    RoiPairPools,
+    build_pair_epoch_schedule,
+    select_pairs,
+)
+from subfast_roi_embedding.config import RoiTrainSettings
+from subfast_roi_embedding.loss import (
     EmbeddingPairMemory,
     balance_embedding_pairs,
     embedding_margin_loss,
     roi_presence_embedding_loss,
     supervised_contrastive_embedding_loss,
 )
-from subfast_net.roi.embedding.metrics import embedding_metrics
-from subfast_net.roi.pairs import (
-    RoiPair,
-    RoiPairPools,
-    build_pair_epoch_schedule,
-    select_pairs,
-)
-from subfast_net.roi.embedding.model import MaskedAttentionEmbeddingHead, LocalContrastResidual, LocalTextnessPresenceHead, RoiPresenceEmbeddingModel
-from subfast_net.roi.embedding.train import (
+from subfast_roi_embedding.metrics import embedding_metrics
+from subfast_roi_embedding.model import MaskedAttentionEmbeddingHead, LocalContrastResidual, LocalTextnessPresenceHead, RoiPresenceEmbeddingModel
+from subfast_roi_embedding.train import (
     configure_training_phase,
     embedding_attention_mask_loss,
     format_epoch_summary,
@@ -38,7 +38,7 @@ from subfast_net.roi.embedding.train import (
     training_phases,
     validation_overlaps_training,
 )
-from subfast_net.roi.embedding.sampler import RoiBalancedBatchSampler
+from subfast_roi_embedding.sampler import RoiBalancedBatchSampler
 
 
 def write_roi_dataset(root: Path, *, size: tuple[int, int] = (32, 16)) -> None:
@@ -1071,7 +1071,7 @@ class RoiPresenceEmbeddingTests(unittest.TestCase):
             output = Path(tmp) / "out"
             write_roi_dataset(root)
 
-            with patch("subfast_net.roi.embedding.train.EmbeddingPairMemory") as memory_class:
+            with patch("subfast_roi_embedding.train.EmbeddingPairMemory") as memory_class:
                 metrics = run_training(
                     RoiTrainSettings(
                         train_roots=[root],

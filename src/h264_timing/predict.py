@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from .dataset import FeatureCache, window_starts
+from subtitle_timing_core.dataset import FeatureCache, window_starts
 from .model import H264SubtitleSegmentModel
 
 

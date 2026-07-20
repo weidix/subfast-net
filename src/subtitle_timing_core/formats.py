@@ -1,0 +1,18 @@
+"""Stable on-disk feature-cache contracts shared by timing model families."""
+
+
+H264_TIMING_FEATURE_FORMAT = "subfast-net.h264-timing-features"
+H264_TIMING_FEATURE_VERSION = 2
+H264_TIMING_VISUAL_FEATURE_FORMAT = "subfast-net.h264-timing-visual-features"
+H264_TIMING_VISUAL_FEATURE_VERSION = 1
+FULL_FRAME_TIMING_FEATURE_FORMAT = "subfast-net.full-frame-timing-features"
+FULL_FRAME_TIMING_FEATURE_VERSION = 1
+
+__all__ = [
+    "FULL_FRAME_TIMING_FEATURE_FORMAT",
+    "FULL_FRAME_TIMING_FEATURE_VERSION",
+    "H264_TIMING_FEATURE_FORMAT",
+    "H264_TIMING_FEATURE_VERSION",
+    "H264_TIMING_VISUAL_FEATURE_FORMAT",
+    "H264_TIMING_VISUAL_FEATURE_VERSION",
+]

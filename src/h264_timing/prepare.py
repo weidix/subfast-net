@@ -19,9 +19,9 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .bitstream import EXACT_BOTTOM_SLICES, FeatureSettings, extract_feature_cache
-from .dataset import FeatureCache
-from .hashing import file_sha256
-from .labels import SubtitleInterval, read_intervals
+from subtitle_timing_core.dataset import FeatureCache
+from subtitle_timing_core.hashing import file_sha256
+from subtitle_timing_core.labels import SubtitleInterval, read_intervals
 from .synthesis import (
     CueScheduleSettings,
     SynthesisSettings,

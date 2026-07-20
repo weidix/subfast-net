@@ -1,11 +1,11 @@
 # ROI Direct Pair Matcher
 
-`subfast-net train matcher` 是独立的同字幕二分类训练命令。它直接输入两个 `256×32` ROI；模型内部先撤销 ImageNet 标准化并仅保留标准化后的 HSV Value，再构造 pair 特征，因此 hue 和 saturation 不会进入匹配网络。训练 forward 返回同字幕 logit 和辅助 mask，优化后的部署 runtime 只返回 logit，调用 sigmoid 后得到同字幕 score。不包含 presence head，也不输出 embedding descriptor。
+`subfast-roi-matcher` 是独立的同字幕二分类训练命令。它直接输入两个 `256×32` ROI；模型内部先撤销 ImageNet 标准化并仅保留标准化后的 HSV Value，再构造 pair 特征，因此 hue 和 saturation 不会进入匹配网络。训练 forward 返回同字幕 logit 和辅助 mask，优化后的部署 runtime 只返回 logit，调用 sigmoid 后得到同字幕 score。不包含 presence head，也不输出 embedding descriptor。
 
 ## 训练
 
 ```bash
-uv run subfast-net train matcher \
+uv run subfast-roi-matcher \
   --train-root data/roi_samples1 \
   --train-root data/roi_samples2 \
   --train-root data/roi_samples3 \
@@ -30,7 +30,7 @@ uv run subfast-net train matcher \
 ## 验证
 
 ```bash
-uv run subfast-net validate matcher \
+uv run subfast-roi-matcher-validate \
   outputs/roi_pair_matcher/best_inference.pt \
   --root data/roi_validation_samples \
   --resize-roi 256x32 \
@@ -48,7 +48,7 @@ uv run subfast-net validate matcher \
 import torch
 from pathlib import Path
 
-from subfast_net.roi.matcher.train import load_pair_inference_checkpoint
+from subfast_roi_matcher.train import load_pair_inference_checkpoint
 
 runtime, _ = load_pair_inference_checkpoint(
     Path("outputs/roi_pair_matcher/best_inference.pt"),

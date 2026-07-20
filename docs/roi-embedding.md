@@ -4,7 +4,7 @@
 
 This document lists the commands for the ROI subtitle Presence + Embedding model.
 
-This is separate from bbox detector training. Use the canonical `train embedding` command to train the combined Presence + Embedding model.
+This is separate from bbox detector training. Use `subfast-roi-embedding` to train the combined Presence + Embedding model.
 
 ## Current Data Roots
 
@@ -23,7 +23,7 @@ These roots have different native ROI sizes, so multi-root training must use exp
 ## Full ROI Training
 
 ```bash
-uv run subfast-net train embedding \
+uv run subfast-roi-embedding \
   --train-root data/roi_samples1 \
   --train-root data/roi_samples2 \
   --train-root data/roi_samples4 \
@@ -50,7 +50,7 @@ uv run subfast-net train embedding \
 ## Presence-only Training
 
 ```bash
-uv run subfast-net train embedding \
+uv run subfast-roi-embedding \
   --train-root data/roi_samples1 \
   --train-root data/roi_samples2 \
   --train-root data/roi_samples4 \
@@ -75,7 +75,7 @@ uv run subfast-net train embedding \
 This is the shorter run used to verify the current training path:
 
 ```bash
-uv run subfast-net train embedding \
+uv run subfast-roi-embedding \
   --train-root data/roi_samples1 \
   --train-root data/roi_samples2 \
   --train-root data/roi_samples4 \
@@ -118,7 +118,7 @@ Stage 3 checkpoint score is `0.5 * mean(global/normal/short Presence F1) + 0.5 *
 Validate on the main ROI validation set:
 
 ```bash
-uv run subfast-net validate embedding \
+uv run subfast-roi-embedding-validate \
   outputs/roi_presence_embedding_effect_check/best.pt \
   --root data/roi_validation_samples \
   --resize-roi 256x64 \
@@ -129,7 +129,7 @@ uv run subfast-net validate embedding \
 Validate on the second ROI eval set:
 
 ```bash
-uv run subfast-net validate embedding \
+uv run subfast-roi-embedding-validate \
   outputs/roi_presence_embedding_effect_check/best.pt \
   --root data/roi_samples3 \
   --resize-roi 256x64 \
@@ -140,7 +140,7 @@ uv run subfast-net validate embedding \
 ## Resume Training
 
 ```bash
-uv run subfast-net train embedding \
+uv run subfast-roi-embedding \
   --train-root data/roi_samples1 \
   --train-root data/roi_samples2 \
   --train-root data/roi_samples4 \

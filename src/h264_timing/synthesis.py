@@ -24,8 +24,14 @@ from .bitstream import (
     slice_header_prefix_from_nal,
     split_nals,
 )
-from .hashing import file_sha256
-from .labels import InvalidSrtInterval, SrtCue, SubtitleInterval, parse_srt_cues, write_intervals
+from subtitle_timing_core.hashing import file_sha256
+from subtitle_timing_core.labels import (
+    InvalidSrtInterval,
+    SrtCue,
+    SubtitleInterval,
+    parse_srt_cues,
+    write_intervals,
+)
 
 
 _HTML_TAG = re.compile(r"</?[^>]+>")

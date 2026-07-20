@@ -7,7 +7,7 @@ This document lists the current training and export commands for the PyTorch sub
 Train a `512x512` model with the current full local dataset:
 
 ```bash
-uv run subfast-net train detector \
+uv run subfast-detector \
   --train-root data/generated_samples1 \
   --train-root data/generated_samples2 \
   --train-root data/generated_samples3 \
@@ -28,7 +28,7 @@ uv run subfast-net train detector \
 The same command for a separate new run:
 
 ```bash
-uv run subfast-net train detector \
+uv run subfast-detector \
   --train-root data/generated_samples1 \
   --train-root data/generated_samples2 \
   --train-root data/generated_samples3 \
@@ -51,7 +51,7 @@ uv run subfast-net train detector \
 Use this only to check that the training pipeline runs:
 
 ```bash
-uv run subfast-net train detector \
+uv run subfast-detector \
   --train-root data/generated_samples1 \
   --val-root data/validation_samples \
   --output-dir outputs/smoke_train \
@@ -71,7 +71,7 @@ Smoke runs are not training-quality evidence. Use held-out validation from a ful
 Resume from an output directory:
 
 ```bash
-uv run subfast-net train detector \
+uv run subfast-detector \
   --train-root data/generated_samples1 \
   --train-root data/generated_samples2 \
   --train-root data/generated_samples3 \
@@ -103,7 +103,7 @@ When resuming from an output directory, the code picks the latest `epoch_outputs
 Optimized runtime artifact:
 
 ```bash
-uv run subfast-net export unified \
+uv run subfast-export unified \
   --batch-size 16 \
   --head-output \
   outputs/full_512/best.pt \
@@ -113,7 +113,7 @@ uv run subfast-net export unified \
 Ordinary single-image artifact:
 
 ```bash
-uv run subfast-net export unified \
+uv run subfast-export unified \
   outputs/full_512/best.pt \
   outputs/full_512/unified
 ```
@@ -130,7 +130,7 @@ Install the Core ML extra and export a model package:
 
 ```bash
 uv sync --extra coreml
-uv run subfast-net export coreml \
+uv run subfast-export coreml \
   outputs/full_512/best.pt \
   outputs/full_512/model.mlpackage
 ```
@@ -140,7 +140,7 @@ uv run subfast-net export coreml \
 Export deployable PyTorch weights without the optimizer or training state:
 
 ```bash
-uv run subfast-net export safetensors \
+uv run subfast-export safetensors \
   outputs/full_512/best.pt \
   outputs/full_512/safetensors
 ```
