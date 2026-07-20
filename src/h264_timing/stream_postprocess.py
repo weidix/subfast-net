@@ -54,12 +54,21 @@ class StreamingDecoderConfig:
     # causal peak/recovery state was introduced retain their old behavior.
     causal_event_pairing: bool = False
     start_event_threshold: float = 0.86
+    split_start_event_threshold: float = 0.0
     end_event_threshold: float = 0.20
     event_confirmation_samples: int = 5
     event_recovery_threshold: float = 0.60
     event_recovery_samples: int = 3
     strong_end_event_threshold: float = 0.50
+    weak_end_presence_threshold: float = 1.0
+    preserve_first_strong_end_candidate: bool = False
+    preserve_strong_end_minimum_duration_seconds: float = 0.0
+    track_confirmation_score_threshold: float = 0.0
+    track_confirmation_max_pending_segments: int = 0
     minimum_start_gap_seconds: float = 0.30
+    start_confirmation_presence_threshold: float = 0.0
+    start_confirmation_samples: int = 0
+    start_confirmation_window_samples: int = 0
     end_refinement_frames: int = 1
     end_refinement_event_threshold: float = 0.50
 
@@ -89,12 +98,30 @@ class StreamingDecoderConfig:
             "anchor_start_event_threshold", self.anchor_start_event_threshold
         )
         _validate_probability("start_event_threshold", self.start_event_threshold)
+        _validate_probability(
+            "split_start_event_threshold", self.split_start_event_threshold
+        )
         _validate_probability("end_event_threshold", self.end_event_threshold)
         _validate_probability(
             "event_recovery_threshold", self.event_recovery_threshold
         )
         _validate_probability(
             "strong_end_event_threshold", self.strong_end_event_threshold
+        )
+        _validate_probability(
+            "weak_end_presence_threshold", self.weak_end_presence_threshold
+        )
+        if not isinstance(self.preserve_first_strong_end_candidate, bool):
+            raise ValueError(
+                "preserve_first_strong_end_candidate must be boolean"
+            )
+        _validate_non_negative(
+            "preserve_strong_end_minimum_duration_seconds",
+            self.preserve_strong_end_minimum_duration_seconds,
+        )
+        _validate_probability(
+            "track_confirmation_score_threshold",
+            self.track_confirmation_score_threshold,
         )
         _validate_probability(
             "end_refinement_event_threshold", self.end_refinement_event_threshold
@@ -108,6 +135,10 @@ class StreamingDecoderConfig:
         )
         _validate_non_negative(
             "minimum_start_gap_seconds", self.minimum_start_gap_seconds
+        )
+        _validate_probability(
+            "start_confirmation_presence_threshold",
+            self.start_confirmation_presence_threshold,
         )
         if (
             isinstance(self.maximum_duration_seconds, bool)
@@ -136,6 +167,48 @@ class StreamingDecoderConfig:
             or self.event_recovery_samples <= 0
         ):
             raise ValueError("event_recovery_samples must be a positive integer")
+        for name, value in (
+            ("start_confirmation_samples", self.start_confirmation_samples),
+            (
+                "start_confirmation_window_samples",
+                self.start_confirmation_window_samples,
+            ),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Integral)
+                or value < 0
+            ):
+                raise ValueError(f"{name} must be a non-negative integer")
+        if (
+            isinstance(self.track_confirmation_max_pending_segments, bool)
+            or not isinstance(
+                self.track_confirmation_max_pending_segments, Integral
+            )
+            or self.track_confirmation_max_pending_segments < 0
+        ):
+            raise ValueError(
+                "track_confirmation_max_pending_segments must be a non-negative integer"
+            )
+        if (self.track_confirmation_score_threshold == 0.0) != (
+            self.track_confirmation_max_pending_segments == 0
+        ):
+            raise ValueError(
+                "track confirmation threshold and pending limit must both be disabled or positive"
+            )
+        if (self.start_confirmation_samples == 0) != (
+            self.start_confirmation_window_samples == 0
+        ):
+            raise ValueError(
+                "start confirmation samples and window must both be zero or positive"
+            )
+        if (
+            self.start_confirmation_samples
+            > self.start_confirmation_window_samples + 1
+        ):
+            raise ValueError(
+                "start_confirmation_samples cannot exceed the peak plus confirmation window"
+            )
         if (
             isinstance(self.anchor_peak_radius_frames, bool)
             or not isinstance(self.anchor_peak_radius_frames, Integral)
@@ -496,6 +569,7 @@ class StreamingEventPairDecoder:
             + config.event_confirmation_samples
             + config.event_recovery_samples
             + 4,
+            config.start_confirmation_window_samples + 4,
         )
         self._recent_timestamps: deque[tuple[int, float]] = deque(
             maxlen=history_size
@@ -508,11 +582,20 @@ class StreamingEventPairDecoder:
         self._active_presence_count = 0
         self._active_start_evidence = 0.0
 
+        self._pending_start: _CausalEventPeak | None = None
+        self._pending_start_age = 0
+        self._pending_start_presence_hits = 0
+        self._pending_start_presence_sum = 0.0
+        self._pending_start_presence_count = 0
+
         self._pending_end: _CausalEventPeak | None = None
         self._last_end_candidate: _CausalEventPeak | None = None
+        self._first_strong_end_candidate: _CausalEventPeak | None = None
         self._pending_age = 0
         self._recovery_count = 0
         self._last_strong_end_timestamp = -math.inf
+        self._track_confirmed = config.track_confirmation_score_threshold == 0.0
+        self._pending_track_predictions: deque[SegmentPrediction] = deque()
 
     def push(
         self,
@@ -553,6 +636,10 @@ class StreamingEventPairDecoder:
         self._consume_end_peak(end_peak)
         self._consume_start_peak(start_peak, emitted)
 
+        activated_from_pending = False
+        if self._active_start is None and self._pending_start is not None:
+            activated_from_pending = self._advance_pending_start(presence)
+
         if self._active_start is not None:
             if pending_before and self._pending_end is not None:
                 self._pending_age += 1
@@ -570,8 +657,8 @@ class StreamingEventPairDecoder:
                 ):
                     prediction = self._finish_active(self._pending_end)
                     if prediction is not None:
-                        emitted.append(prediction)
-            elif self._pending_end is None:
+                        self._emit_prediction(prediction, emitted)
+            elif self._pending_end is None and not activated_from_pending:
                 self._active_presence_sum += presence
                 self._active_presence_count += 1
 
@@ -583,7 +670,7 @@ class StreamingEventPairDecoder:
                 if timestamp >= maximum_end:
                     prediction = self._finish_active_at(maximum_end, 0.0)
                     if prediction is not None:
-                        emitted.append(prediction)
+                        self._emit_prediction(prediction, emitted)
         return tuple(emitted)
 
     def close(self) -> tuple[SegmentPrediction, ...]:
@@ -606,7 +693,7 @@ class StreamingEventPairDecoder:
                 )
                 prediction = self._finish_active_at(tail_end, 0.0)
             if prediction is not None:
-                emitted.append(prediction)
+                self._emit_prediction(prediction, emitted)
         self._clear_state()
         self._closed = True
         return tuple(emitted)
@@ -636,6 +723,19 @@ class StreamingEventPairDecoder:
             self._last_strong_end_timestamp = peak.timestamp
         if self._active_start is None or peak.timestamp <= self._active_start.timestamp:
             return
+        if (
+            peak.probability < self.config.strong_end_event_threshold
+            and peak.presence > self.config.weak_end_presence_threshold
+        ):
+            return
+        if (
+            self.config.preserve_first_strong_end_candidate
+            and peak.probability >= self.config.strong_end_event_threshold
+            and self._first_strong_end_candidate is None
+            and peak.timestamp - self._active_start.timestamp
+            >= self.config.preserve_strong_end_minimum_duration_seconds
+        ):
+            self._first_strong_end_candidate = peak
         self._pending_end = peak
         self._pending_age = 0
         self._recovery_count = 0
@@ -645,7 +745,7 @@ class StreamingEventPairDecoder:
         peak: _CausalEventPeak | None,
         emitted: list[SegmentPrediction],
     ) -> None:
-        if peak is None or peak.presence < self.config.presence_on_threshold:
+        if peak is None:
             return
         if (
             peak.timestamp - self._last_strong_end_timestamp
@@ -653,7 +753,19 @@ class StreamingEventPairDecoder:
         ):
             return
         if self._active_start is None:
-            self._begin_active(peak)
+            if peak.presence >= self.config.presence_on_threshold:
+                self._begin_active(peak)
+            elif self.config.start_confirmation_window_samples > 0:
+                self._queue_pending_start(peak)
+            return
+        split_start_threshold = (
+            self.config.split_start_event_threshold
+            if self.config.split_start_event_threshold > 0.0
+            else self.config.start_event_threshold
+        )
+        if peak.probability < split_start_threshold:
+            return
+        if peak.presence < self.config.presence_on_threshold:
             return
         if peak.timestamp <= self._active_start.timestamp:
             return
@@ -671,20 +783,103 @@ class StreamingEventPairDecoder:
             )
         prediction = self._finish_active(candidate)
         if prediction is not None:
-            emitted.append(prediction)
+            self._emit_prediction(prediction, emitted)
         self._begin_active(peak)
 
+    def _emit_prediction(
+        self,
+        prediction: SegmentPrediction,
+        emitted: list[SegmentPrediction],
+    ) -> None:
+        if self._track_confirmed:
+            emitted.append(prediction)
+            return
+        if (
+            prediction.confidence
+            >= self.config.track_confirmation_score_threshold
+        ):
+            self._track_confirmed = True
+            emitted.extend(self._pending_track_predictions)
+            self._pending_track_predictions.clear()
+            emitted.append(prediction)
+            return
+        limit = self.config.track_confirmation_max_pending_segments
+        if len(self._pending_track_predictions) >= limit:
+            self._pending_track_predictions.popleft()
+        self._pending_track_predictions.append(prediction)
+
+    def _queue_pending_start(self, peak: _CausalEventPeak) -> None:
+        self._pending_start = peak
+        self._pending_start_age = 0
+        self._pending_start_presence_hits = int(
+            peak.presence >= self.config.start_confirmation_presence_threshold
+        )
+        self._pending_start_presence_sum = peak.presence
+        self._pending_start_presence_count = 1
+        if (
+            self._pending_start_presence_hits
+            >= self.config.start_confirmation_samples
+        ):
+            self._activate_pending_start()
+
+    def _advance_pending_start(self, presence: float) -> bool:
+        if self._pending_start is None:
+            return False
+        self._pending_start_age += 1
+        self._pending_start_presence_sum += presence
+        self._pending_start_presence_count += 1
+        if presence >= self.config.start_confirmation_presence_threshold:
+            self._pending_start_presence_hits += 1
+        if (
+            self._pending_start_presence_hits
+            >= self.config.start_confirmation_samples
+        ):
+            self._activate_pending_start()
+            return True
+        if (
+            self._pending_start_age
+            >= self.config.start_confirmation_window_samples
+        ):
+            self._clear_pending_start()
+        return False
+
+    def _activate_pending_start(self) -> None:
+        peak = self._pending_start
+        if peak is None:
+            return
+        presence_sum = self._pending_start_presence_sum
+        presence_count = self._pending_start_presence_count
+        self._clear_pending_start()
+        self._begin_active(peak)
+        self._active_presence_sum = presence_sum
+        self._active_presence_count = presence_count
+
+    def _clear_pending_start(self) -> None:
+        self._pending_start = None
+        self._pending_start_age = 0
+        self._pending_start_presence_hits = 0
+        self._pending_start_presence_sum = 0.0
+        self._pending_start_presence_count = 0
+
     def _begin_active(self, peak: _CausalEventPeak) -> None:
+        self._clear_pending_start()
         self._active_start = peak
         self._active_presence_sum = peak.presence
         self._active_presence_count = 1
         self._active_start_evidence = peak.probability
         self._pending_end = None
         self._last_end_candidate = None
+        self._first_strong_end_candidate = None
         self._pending_age = 0
         self._recovery_count = 0
 
     def _finish_active(self, candidate: _CausalEventPeak) -> SegmentPrediction | None:
+        if (
+            self.config.preserve_first_strong_end_candidate
+            and self._first_strong_end_candidate is not None
+            and self._first_strong_end_candidate.timestamp <= candidate.timestamp
+        ):
+            candidate = self._first_strong_end_candidate
         end_timestamp = candidate.timestamp
         if (
             candidate.probability < self.config.end_refinement_event_threshold
@@ -734,6 +929,7 @@ class StreamingEventPairDecoder:
         self._active_start_evidence = 0.0
         self._pending_end = None
         self._last_end_candidate = None
+        self._first_strong_end_candidate = None
         self._pending_age = 0
         self._recovery_count = 0
         return prediction
@@ -750,15 +946,18 @@ class StreamingEventPairDecoder:
         self._last_timestamp = None
         self._last_duration = 0.0
         self._recent_timestamps.clear()
+        self._clear_pending_start()
         self._active_start = None
         self._active_presence_sum = 0.0
         self._active_presence_count = 0
         self._active_start_evidence = 0.0
         self._pending_end = None
         self._last_end_candidate = None
+        self._first_strong_end_candidate = None
         self._pending_age = 0
         self._recovery_count = 0
         self._last_strong_end_timestamp = -math.inf
+        self._pending_track_predictions.clear()
 
 
 class StreamingAnchorDecoder:

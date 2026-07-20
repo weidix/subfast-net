@@ -55,7 +55,14 @@ class FeatureCache:
     def __init__(self, directory: Path) -> None:
         self.directory = directory.expanduser().resolve()
         self.meta = json.loads((self.directory / "meta.json").read_text(encoding="utf-8"))
-        if self.meta.get("format") != FEATURE_FORMAT or self.meta.get("version") != FEATURE_VERSION:
+        supported_format = (
+            self.meta.get("format") == FEATURE_FORMAT
+            and self.meta.get("version") == FEATURE_VERSION
+        ) or (
+            self.meta.get("format") == "subfast-net.full-frame-timing-features"
+            and self.meta.get("version") == 1
+        )
+        if not supported_format:
             raise ValueError(f"unsupported feature cache: {self.directory}")
         if not self.meta.get("completed"):
             raise ValueError(f"incomplete feature cache: {self.directory}")
@@ -414,19 +421,35 @@ def _validate_synthesis_audit(
     roi = audit["subtitle_roi"]
     frame_width = int(stream["width"])
     frame_height = int(stream["height"])
-    if (
+    full_frame_input = (
+        cache.meta.get("input_domain") == "full_frame_visual"
+        or cache.meta.get("spatial_contract", {}).get("spatial_mode")
+        == "decoded_full_frame"
+    )
+    invalid_render_bounds = (
         int(roi["x"]) < 0
-        or int(roi["y"]) < int(np.ceil(frame_height * 0.80))
+        or int(roi["y"]) < 0
         or int(roi["x"]) + int(roi["width"]) > frame_width
         or int(roi["y"]) + int(roi["height"]) > frame_height
         or not roi.get("all_nontransparent_pixels_confined_to_roi")
-    ):
-        raise ValueError(f"synthesis audit violates bottom-20% ROI: {record.video_id}")
+    )
+    if not full_frame_input:
+        invalid_render_bounds = invalid_render_bounds or (
+            int(roi["y"]) < int(np.ceil(frame_height * 0.80))
+        )
+    if invalid_render_bounds:
+        region = "frame" if full_frame_input else "bottom-20% ROI"
+        raise ValueError(
+            f"synthesis audit violates {region} bounds: {record.video_id}"
+        )
     contracts = audit["contracts"]
     if (
         not contracts.get("offline_generation_decodes_and_reencodes_pixels")
         or contracts.get("agent_visually_inspected_video_or_frames")
-        or contracts.get("training_feature_extraction_requires_pixel_decode")
+        or (
+            not full_frame_input
+            and contracts.get("training_feature_extraction_requires_pixel_decode")
+        )
     ):
         raise ValueError(f"unexpected synthesis audit contract: {record.video_id}")
     signal_validation = audit.get("signal_validation", {})

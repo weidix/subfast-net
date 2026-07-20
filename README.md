@@ -18,9 +18,10 @@ Those directories are local-only.
 
 ## CLI
 
-The repository exposes three independent command packages. `subfast-net`
+The repository exposes four independent command packages. `subfast-net`
 manages detector and ROI models, `h264-timing` manages compressed-domain
-timing detection, and `subfast-tools` manages dataset and review utilities.
+timing detection, `full-frame-timing` manages decoded full-frame timing
+detection, and `subfast-tools` manages dataset and review utilities.
 
 ```text
 subfast-net
@@ -37,6 +38,12 @@ subfast-tools
 |-- prepare-roi|extract-craft
 |-- labels-to-via|via-to-labels
 `-- review-labels|review-roi
+
+full-frame-timing
+|-- extract
+|-- prepare
+|-- train
+`-- infer
 ```
 
 Inspect a command before running it:
@@ -48,6 +55,7 @@ uv run subfast-net train presence --help
 uv run subfast-net train embedding --help
 uv run subfast-net train matcher --help
 uv run h264-timing --help
+uv run full-frame-timing --help
 uv run subfast-tools --help
 ```
 
@@ -60,6 +68,8 @@ Training contracts and export formats are documented in [Detector](docs/detector
 [ROI Presence](docs/roi-presence.md), [ROI Embedding](docs/roi-embedding.md),
 and [ROI Matcher](docs/roi-matcher.md).
 The H.264 workflow has its own [guide](src/h264_timing/README.md).
+The full-frame timing workflow has its own
+[guide](src/full_frame_timing/README.md).
 Dataset and review utilities are documented in [Tools](src/tools/command.md).
 
 ## Layout
@@ -74,6 +84,7 @@ subfast-net/
 |   |   `-- matcher/
 |   `-- export/
 |-- src/h264_timing/          # H.264 timing subproject (two model families)
+|-- src/full_frame_timing/    # decoded full-frame timing CLI and model workflow
 |-- src/tools/                # independent dataset and review tools package
 |-- tests/                    # focused unit and smoke tests
 |-- docs/                     # current guides and historical notes

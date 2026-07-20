@@ -65,7 +65,10 @@ class StreamingTrainSettings(BaseModel):
     temporal_guard_seconds: float = Field(default=10.0, ge=0.0)
     inference_chunk_frames: int = Field(default=128, gt=0)
     initial_checkpoint: Path | None = None
-    input_domain: Literal["combined", "visual_only"] = "combined"
+    input_domain: Literal[
+        "combined", "visual_only", "full_frame_visual"
+    ] = "combined"
+    calibration_profile: Literal["standard", "fast"] = "standard"
 
     @model_validator(mode="after")
     def validate_ranges(self) -> Self:
@@ -73,8 +76,11 @@ class StreamingTrainSettings(BaseModel):
             raise ValueError("stride_frames must not exceed window_frames")
         if self.maximum_duration_seconds <= self.minimum_duration_seconds:
             raise ValueError("maximum duration must be greater than minimum duration")
-        if self.input_domain == "visual_only" and self.use_byte_branch:
-            raise ValueError("visual-only streaming training cannot use byte tokens")
+        if (
+            self.input_domain in {"visual_only", "full_frame_visual"}
+            and self.use_byte_branch
+        ):
+            raise ValueError("decoded visual streaming training cannot use byte tokens")
         return self
 
 
@@ -404,12 +410,35 @@ def _decoded_metrics(
             "anchor_pair_start_events": float(config.anchor_pair_start_events),
             "causal_event_pairing": float(config.causal_event_pairing),
             "start_event_threshold": config.start_event_threshold,
+            "split_start_event_threshold": config.split_start_event_threshold,
             "end_event_threshold": config.end_event_threshold,
             "event_confirmation_samples": float(config.event_confirmation_samples),
             "event_recovery_threshold": config.event_recovery_threshold,
             "event_recovery_samples": float(config.event_recovery_samples),
             "strong_end_event_threshold": config.strong_end_event_threshold,
+            "weak_end_presence_threshold": config.weak_end_presence_threshold,
+            "preserve_first_strong_end_candidate": float(
+                config.preserve_first_strong_end_candidate
+            ),
+            "preserve_strong_end_minimum_duration_seconds": (
+                config.preserve_strong_end_minimum_duration_seconds
+            ),
+            "track_confirmation_score_threshold": (
+                config.track_confirmation_score_threshold
+            ),
+            "track_confirmation_max_pending_segments": float(
+                config.track_confirmation_max_pending_segments
+            ),
             "minimum_start_gap_seconds": config.minimum_start_gap_seconds,
+            "start_confirmation_presence_threshold": (
+                config.start_confirmation_presence_threshold
+            ),
+            "start_confirmation_samples": float(
+                config.start_confirmation_samples
+            ),
+            "start_confirmation_window_samples": float(
+                config.start_confirmation_window_samples
+            ),
             "end_refinement_frames": float(config.end_refinement_frames),
             "end_refinement_event_threshold": config.end_refinement_event_threshold,
             "recall_target": target_recall,
@@ -429,6 +458,13 @@ def _calibration_key(metrics: dict[str, float], *, target_recall: float) -> tupl
         recall + 1e-12 >= target_recall
         and strict_recall + 1e-12 >= target_recall
     )
+    conservative_decoder_tie_break = (
+        metrics["track_confirmation_score_threshold"],
+        metrics["start_event_threshold"],
+        metrics["split_start_event_threshold"],
+        metrics["preserve_strong_end_minimum_duration_seconds"],
+        -metrics["weak_end_presence_threshold"],
+    )
     if target_met:
         return (
             1,
@@ -439,6 +475,7 @@ def _calibration_key(metrics: dict[str, float], *, target_recall: float) -> tupl
             -metrics["start_error_p95_seconds"],
             -metrics["end_error_p95_seconds"],
             -metrics["false_intervals_per_minute"],
+            *conservative_decoder_tie_break,
             -metrics["anchor_score_threshold"],
         )
     return (
@@ -450,6 +487,7 @@ def _calibration_key(metrics: dict[str, float], *, target_recall: float) -> tupl
         metrics["matched_interval_mean_iou"],
         metrics["interval_precision_iou50"],
         -metrics["false_intervals_per_minute"],
+        *conservative_decoder_tie_break,
         -metrics["anchor_score_threshold"],
     )
 
@@ -464,20 +502,33 @@ def _calibrate_decoder(
         # Keep the grid deliberately small because decoding is stateful, but
         # include the causal start-event pairing that is useful when the
         # regressed start offset is noisy on a cold stream.
-        for anchor_threshold in (0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.85):
-            for end_event_threshold, minimum_anchor_gap in (
-                (0.0, 0.0),
-                (0.50, 0.50),
-                (0.70, 0.50),
-            ):
-                for nms_threshold in (0.70, 0.90, 0.98):
-                    for peak_radius in (0, 1, 2):
-                        pair_variants = (
-                            (False, 0.0, 0.0),
-                            (True, 0.30, 1.0),
-                            (True, 0.50, 1.5),
-                            (True, 0.70, 2.0),
-                        )
+        fast = settings.calibration_profile == "fast"
+        anchor_thresholds = (
+            (0.30, 0.50, 0.70)
+            if fast
+            else (0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.85)
+        )
+        end_variants = (
+            ((0.0, 0.0),)
+            if fast
+            else ((0.0, 0.0), (0.50, 0.50), (0.70, 0.50))
+        )
+        nms_thresholds = (0.90,) if fast else (0.70, 0.90, 0.98)
+        peak_radii = (0, 1) if fast else (0, 1, 2)
+        pair_variants = (
+            ((False, 0.0, 0.0), (True, 0.50, 1.5))
+            if fast
+            else (
+                (False, 0.0, 0.0),
+                (True, 0.30, 1.0),
+                (True, 0.50, 1.5),
+                (True, 0.70, 2.0),
+            )
+        )
+        for anchor_threshold in anchor_thresholds:
+            for end_event_threshold, minimum_anchor_gap in end_variants:
+                for nms_threshold in nms_thresholds:
+                    for peak_radius in peak_radii:
                         for pair_starts, start_threshold, refinement in pair_variants:
                             config = StreamingDecoderConfig(
                                 score_threshold=anchor_threshold,
@@ -517,13 +568,12 @@ def _calibrate_decoder(
         settings.minimum_duration_seconds,
         min(0.50, min(observed_durations, default=0.50)),
     )
-    for start_threshold in (0.80, 0.84, 0.86, 0.88):
+    fast = settings.calibration_profile == "fast"
+    start_thresholds = (0.80, 0.84, 0.86, 0.88)
+    event_variants = ((4, 2), (5, 3)) if fast else ((4, 2), (4, 3), (5, 3))
+    for start_threshold in start_thresholds:
         for end_threshold in (0.15, 0.20):
-            for event_confirmation, recovery_samples in (
-                (4, 2),
-                (4, 3),
-                (5, 3),
-            ):
+            for event_confirmation, recovery_samples in event_variants:
                 for score_threshold in (0.0, 0.25):
                     config = StreamingDecoderConfig(
                         score_threshold=score_threshold,
@@ -556,19 +606,179 @@ def _calibrate_decoder(
                     if best is None or key > best[0]:
                         best = (key, config, metrics)
 
+    # Weak subtitle starts can produce a valid local start-event peak before
+    # the presence head crosses its normal activation threshold. Preserve the
+    # original peak timestamp, confirm it with the following presence samples,
+    # and use a higher threshold for starts that would split an active segment.
+    # The variants are explicit to keep per-epoch calibration bounded.
+    pending_start_variants = (
+        (
+            (0.15, 0.70, 0.15, 1, 3),
+            (0.23, 0.70, 0.15, 1, 3),
+            (0.30, 0.70, 0.15, 1, 3),
+            (0.15, 0.85, 0.15, 1, 3),
+            (0.23, 0.85, 0.25, 1, 3),
+        )
+        if fast
+        else (
+            (0.15, 0.70, 0.15, 1, 3),
+            (0.20, 0.70, 0.15, 1, 3),
+            (0.23, 0.70, 0.15, 1, 3),
+            (0.30, 0.70, 0.15, 1, 3),
+            (0.50, 0.70, 0.15, 1, 3),
+            (0.15, 0.80, 0.15, 1, 3),
+            (0.23, 0.80, 0.15, 1, 3),
+            (0.30, 0.80, 0.25, 1, 3),
+            (0.15, 0.90, 0.15, 1, 3),
+            (0.23, 0.70, 0.25, 2, 3),
+        )
+    )
+    pending_scores = (0.0, 0.25, 0.30, 0.40) if fast else (
+        0.0,
+        0.15,
+        0.25,
+        0.30,
+        0.40,
+    )
+    for (
+        start_threshold,
+        split_start_threshold,
+        confirmation_presence_threshold,
+        start_confirmation_samples,
+        start_confirmation_window,
+    ) in pending_start_variants:
+        for end_threshold in (0.15, 0.20):
+            for event_confirmation in (2, 4):
+                for score_threshold in pending_scores:
+                    config = StreamingDecoderConfig(
+                        score_threshold=score_threshold,
+                        presence_on_threshold=0.50,
+                        presence_off_threshold=0.35,
+                        boundary_event_threshold=0.50,
+                        minimum_duration_seconds=paired_minimum_duration,
+                        maximum_duration_seconds=settings.maximum_duration_seconds,
+                        causal_event_pairing=True,
+                        start_event_threshold=start_threshold,
+                        split_start_event_threshold=split_start_threshold,
+                        end_event_threshold=end_threshold,
+                        event_confirmation_samples=event_confirmation,
+                        event_recovery_threshold=0.60,
+                        event_recovery_samples=3,
+                        strong_end_event_threshold=0.50,
+                        minimum_start_gap_seconds=0.0,
+                        start_confirmation_presence_threshold=(
+                            confirmation_presence_threshold
+                        ),
+                        start_confirmation_samples=start_confirmation_samples,
+                        start_confirmation_window_samples=(
+                            start_confirmation_window
+                        ),
+                        end_refinement_frames=1,
+                        end_refinement_event_threshold=0.50,
+                    )
+                    metrics = _decoded_metrics(
+                        _decode_records(predictions, config),
+                        config,
+                        target_recall=settings.target_recall,
+                        include_roles=False,
+                    )
+                    key = _calibration_key(
+                        metrics,
+                        target_recall=settings.target_recall,
+                    )
+                    if best is None or key > best[0]:
+                        best = (key, config, metrics)
+
+    if settings.input_domain == "full_frame_visual":
+        # Full-frame scene edges can create strong late end peaks. Keep the
+        # first mature strong candidate, while accepting a weak end only when
+        # presence has already fallen. This preserves faint subtitle endings
+        # without letting high-presence scene motion terminate a segment.
+        for start_threshold in (0.20, 0.30):
+            for split_start_threshold in (0.70, 0.75):
+                for weak_end_presence_threshold in (0.40, 0.50, 0.60):
+                    for preserve_minimum_duration in (3.0, 3.5):
+                        for score_threshold in (0.40, 0.45):
+                            for track_confirmation_threshold in (
+                                0.0,
+                                0.85,
+                                0.90,
+                            ):
+                                config = StreamingDecoderConfig(
+                                    score_threshold=score_threshold,
+                                    presence_on_threshold=0.50,
+                                    presence_off_threshold=0.35,
+                                    boundary_event_threshold=0.50,
+                                    minimum_duration_seconds=(
+                                        paired_minimum_duration
+                                    ),
+                                    maximum_duration_seconds=(
+                                        settings.maximum_duration_seconds
+                                    ),
+                                    causal_event_pairing=True,
+                                    start_event_threshold=start_threshold,
+                                    split_start_event_threshold=(
+                                        split_start_threshold
+                                    ),
+                                    end_event_threshold=0.15,
+                                    event_confirmation_samples=4,
+                                    event_recovery_threshold=0.50,
+                                    event_recovery_samples=4,
+                                    strong_end_event_threshold=0.50,
+                                    weak_end_presence_threshold=(
+                                        weak_end_presence_threshold
+                                    ),
+                                    preserve_first_strong_end_candidate=True,
+                                    preserve_strong_end_minimum_duration_seconds=(
+                                        preserve_minimum_duration
+                                    ),
+                                    track_confirmation_score_threshold=(
+                                        track_confirmation_threshold
+                                    ),
+                                    track_confirmation_max_pending_segments=(
+                                        16
+                                        if track_confirmation_threshold > 0.0
+                                        else 0
+                                    ),
+                                    minimum_start_gap_seconds=0.0,
+                                    start_confirmation_presence_threshold=0.15,
+                                    start_confirmation_samples=1,
+                                    start_confirmation_window_samples=3,
+                                    end_refinement_frames=0,
+                                    end_refinement_event_threshold=0.50,
+                                )
+                                metrics = _decoded_metrics(
+                                    _decode_records(predictions, config),
+                                    config,
+                                    target_recall=settings.target_recall,
+                                    include_roles=False,
+                                )
+                                key = _calibration_key(
+                                    metrics,
+                                    target_recall=settings.target_recall,
+                                )
+                                if best is None or key > best[0]:
+                                    best = (key, config, metrics)
+
     presence_thresholds = (
-        (0.25, 0.10),
-        (0.35, 0.15),
-        (0.35, 0.20),
-        (0.50, 0.20),
-        (0.50, 0.35),
-        (0.65, 0.35),
-        (0.65, 0.50),
+        ((0.35, 0.15), (0.50, 0.35), (0.65, 0.50))
+        if fast
+        else (
+            (0.25, 0.10),
+            (0.35, 0.15),
+            (0.35, 0.20),
+            (0.50, 0.20),
+            (0.50, 0.35),
+            (0.65, 0.35),
+            (0.65, 0.50),
+        )
     )
     for presence_on, presence_off in presence_thresholds:
-        for event_threshold in (0.25, 0.35, 0.50, 0.65, 0.80):
+        event_thresholds = (0.35, 0.50, 0.65) if fast else (0.25, 0.35, 0.50, 0.65, 0.80)
+        for event_threshold in event_thresholds:
             for confirmation_samples in (1, 2):
-                for score_threshold in (0.0, 0.10, 0.25):
+                score_thresholds = (0.0, 0.25) if fast else (0.0, 0.10, 0.25)
+                for score_threshold in score_thresholds:
                     config = StreamingDecoderConfig(
                         score_threshold=score_threshold,
                         presence_on_threshold=presence_on,
@@ -665,10 +875,15 @@ def _checkpoint(
         "causal_window_context_frames": settings.window_frames - settings.stride_frames,
         "calibration_split": "train",
     }
-    return {
-        "format": STREAM_CHECKPOINT_FORMAT,
-        "version": STREAM_CHECKPOINT_VERSION,
-        "feature_version": FEATURE_VERSION,
+    full_frame_input = settings.input_domain == "full_frame_visual"
+    checkpoint = {
+        "format": (
+            "subfast-net.full-frame-timing-stream-model"
+            if full_frame_input
+            else STREAM_CHECKPOINT_FORMAT
+        ),
+        "version": 1 if full_frame_input else STREAM_CHECKPOINT_VERSION,
+        "feature_version": 1 if full_frame_input else FEATURE_VERSION,
         "model": model.state_dict(),
         "model_config": model_config.to_dict(),
         "model_output_contract": (
@@ -682,10 +897,13 @@ def _checkpoint(
         "feature_settings": dict(first_cache.meta["feature_settings"]),
         "visual_feature_settings": dict(first_cache.visual_feature_settings or {}),
         "input_domain": settings.input_domain,
-        "pixel_decode_required": settings.input_domain == "visual_only",
+        "pixel_decode_required": settings.input_domain in {
+            "visual_only",
+            "full_frame_visual",
+        },
         "spatial_contract": dict(first_cache.meta["spatial_contract"]),
         "payload_tail_ratio": float(
-            first_cache.meta["feature_settings"]["payload_tail_ratio"]
+            first_cache.meta["feature_settings"].get("payload_tail_ratio", 1.0)
         ),
         "streaming_decoder_config": decoder_config.to_dict(),
         "inference_chunk_frames": settings.inference_chunk_frames,
@@ -703,6 +921,11 @@ def _checkpoint(
         "epoch": epoch,
         "metrics": metrics,
     }
+    if full_frame_input:
+        checkpoint["full_frame_feature_settings"] = dict(
+            first_cache.meta["full_frame_feature_settings"]
+        )
+    return checkpoint
 
 
 def _prepare_output_dir(path: Path) -> tuple[Path, Path]:
@@ -809,16 +1032,33 @@ def train_streaming(settings: StreamingTrainSettings) -> dict:
     )
     model = StreamingH264SubtitleModel(model_config).to(device)
     initial_epoch = 0
+    initial_checkpoint_feature_count = model_config.feature_count
+    initial_checkpoint_schema_expanded = False
     if settings.initial_checkpoint is not None:
         checkpoint_path = settings.initial_checkpoint.expanduser().resolve()
         initial_checkpoint = torch.load(
             checkpoint_path, map_location="cpu", weights_only=False
         )
+        expected_format = (
+            "subfast-net.full-frame-timing-stream-model"
+            if settings.input_domain == "full_frame_visual"
+            else STREAM_CHECKPOINT_FORMAT
+        )
+        expected_version = (
+            1
+            if settings.input_domain == "full_frame_visual"
+            else STREAM_CHECKPOINT_VERSION
+        )
+        expected_feature_version = (
+            int(first_cache.meta["version"])
+            if settings.input_domain == "full_frame_visual"
+            else FEATURE_VERSION
+        )
         if (
             not isinstance(initial_checkpoint, dict)
-            or initial_checkpoint.get("format") != STREAM_CHECKPOINT_FORMAT
-            or initial_checkpoint.get("version") != STREAM_CHECKPOINT_VERSION
-            or initial_checkpoint.get("feature_version") != FEATURE_VERSION
+            or initial_checkpoint.get("format") != expected_format
+            or initial_checkpoint.get("version") != expected_version
+            or initial_checkpoint.get("feature_version") != expected_feature_version
         ):
             raise ValueError(f"unsupported initial streaming checkpoint: {checkpoint_path}")
         initial_model_config = dict(initial_checkpoint.get("model_config", {}))
@@ -826,11 +1066,95 @@ def train_streaming(settings: StreamingTrainSettings) -> dict:
         # this flag.  A missing value is equivalent to the disabled head.
         if "use_segment_head" not in initial_model_config:
             initial_model_config["use_segment_head"] = False
-        if initial_model_config != model_config.to_dict():
-            raise ValueError("initial checkpoint model config differs from training settings")
-        if initial_checkpoint.get("feature_names") != first_cache.feature_names:
-            raise ValueError("initial checkpoint feature schema differs from the manifest")
-        model.load_state_dict(initial_checkpoint["model"], strict=True)
+        current_model_config = model_config.to_dict()
+        initial_feature_names = initial_checkpoint.get("feature_names")
+        current_feature_names = first_cache.feature_names
+        exact_schema = (
+            initial_model_config == current_model_config
+            and initial_feature_names == current_feature_names
+        )
+        if exact_schema:
+            model.load_state_dict(initial_checkpoint["model"], strict=True)
+        else:
+            initial_architecture = dict(initial_model_config)
+            current_architecture = dict(current_model_config)
+            initial_feature_count = int(
+                initial_architecture.pop("feature_count", -1)
+            )
+            current_feature_count = int(
+                current_architecture.pop("feature_count", -1)
+            )
+            initial_full_frame_settings = dict(
+                initial_checkpoint.get("full_frame_feature_settings", {})
+            )
+            current_full_frame_settings = dict(
+                first_cache.meta.get("full_frame_feature_settings", {})
+            )
+            initial_schema_version = int(
+                initial_full_frame_settings.pop("schema_version", 1)
+            )
+            current_schema_version = int(
+                current_full_frame_settings.pop("schema_version", 1)
+            )
+            if initial_schema_version < 5 <= current_schema_version:
+                current_full_frame_settings.pop("fine_column_bins", None)
+            schema_expansion = (
+                settings.input_domain == "full_frame_visual"
+                and initial_architecture == current_architecture
+                and initial_feature_count > 0
+                and initial_feature_count < current_feature_count
+                and initial_schema_version < current_schema_version
+                and initial_full_frame_settings == current_full_frame_settings
+                and isinstance(initial_feature_names, list)
+                and len(initial_feature_names) == initial_feature_count
+                and len(set(initial_feature_names)) == initial_feature_count
+                and len(set(current_feature_names)) == current_feature_count
+                and set(initial_feature_names).issubset(current_feature_names)
+            )
+            if not schema_expansion:
+                if initial_architecture != current_architecture:
+                    raise ValueError(
+                        "initial checkpoint model config differs from training settings"
+                    )
+                raise ValueError(
+                    "initial checkpoint feature schema differs from the manifest"
+                )
+
+            initial_state = initial_checkpoint["model"]
+            expanded_state = model.state_dict()
+            input_weight_name = "numeric_encoder.0.weight"
+            initial_input_weight = initial_state[input_weight_name]
+            expanded_input_weight = expanded_state[input_weight_name]
+            if initial_input_weight.shape != (
+                model_config.width,
+                initial_feature_count,
+            ) or expanded_input_weight.shape != (
+                model_config.width,
+                current_feature_count,
+            ):
+                raise ValueError(
+                    "initial checkpoint numeric input projection has an unexpected shape"
+                )
+            expanded_input_weight.zero_()
+            current_feature_indices = {
+                name: index for index, name in enumerate(current_feature_names)
+            }
+            for initial_index, name in enumerate(initial_feature_names):
+                expanded_input_weight[:, current_feature_indices[name]].copy_(
+                    initial_input_weight[:, initial_index]
+                )
+            for name, value in expanded_state.items():
+                if name == input_weight_name:
+                    continue
+                initial_value = initial_state.get(name)
+                if initial_value is None or initial_value.shape != value.shape:
+                    raise ValueError(
+                        f"initial checkpoint parameter differs from training model: {name}"
+                    )
+                value.copy_(initial_value)
+            model.load_state_dict(expanded_state, strict=True)
+            initial_checkpoint_feature_count = initial_feature_count
+            initial_checkpoint_schema_expanded = True
         initial_epoch = int(initial_checkpoint.get("epoch", 0))
         if initial_epoch < 0:
             raise ValueError("initial checkpoint epoch must be non-negative")
@@ -978,7 +1302,10 @@ def train_streaming(settings: StreamingTrainSettings) -> dict:
             else "causal_streaming_presence_events"
         ),
         "inference_chunk_frames": settings.inference_chunk_frames,
-        "visual_pixel_decode": first_cache.visual_feature_settings is not None,
+        "visual_pixel_decode": (
+            first_cache.visual_feature_settings is not None
+            or settings.input_domain == "full_frame_visual"
+        ),
         "validation_contract": (
             "held_out_by_declared_source_group_and_container_fingerprint"
             if settings.validation_mode == "held_out"
@@ -986,6 +1313,8 @@ def train_streaming(settings: StreamingTrainSettings) -> dict:
         ),
         "streaming_decoder_calibration_split": "train",
         "initial_checkpoint_epoch": initial_epoch,
+        "initial_checkpoint_feature_count": initial_checkpoint_feature_count,
+        "initial_checkpoint_schema_expanded": initial_checkpoint_schema_expanded,
     }
     (output_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
