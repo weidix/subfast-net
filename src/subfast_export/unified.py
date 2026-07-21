@@ -4,6 +4,7 @@ import argparse
 import json
 import tempfile
 import warnings
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -11,19 +12,37 @@ import torch
 from torch.fx import Node
 
 from subfast_detector.model import SubtitleDetector
+from subfast_frame_presence.model import FramePresenceModel
 from subfast_roi_matcher.model import RoiPairInference, RoiPairMatcher, fuse_pair_matcher_for_inference
 from subfast_roi_presence.model import RoiPresenceModel
+
+from .checkpoint import checkpoint_model_type
 
 
 FORMAT_NAME = "subfast-net.unified-model"
 FORMAT_VERSION = 1
 EXTENDED_FORMAT_VERSION = 2
+FRAME_PRESENCE_FORMAT_VERSION = 3
 WEIGHTS_FILE = "weights.bin"
 COREML_OUTPUT_SUFFIXES = {".mlmodel", ".mlpackage"}
 FORMAT_V2_OPERATORS = {"aten.maximum.default", "aten.slice.Tensor"}
+FORMAT_V3_OPERATORS = {
+    "aten.adaptive_avg_pool2d.default",
+    "aten.detach_.default",
+    "aten.flatten.using_ints",
+    "aten.lift_fresh_copy.default",
+    "aten.max_pool2d.default",
+    "aten.minimum.default",
+    "aten.pad.default",
+    "aten.rsub.Scalar",
+    "aten.unsqueeze.default",
+    "aten.view.default",
+    "aten.where.self",
+}
 SUPPORTED_OPERATORS = {
     "aten.abs.default",
     "aten.add.Tensor",
+    "aten.adaptive_avg_pool2d.default",
     "aten.amax.default",
     "aten.avg_pool2d.default",
     "aten.batch_norm.default",
@@ -32,12 +51,19 @@ SUPPORTED_OPERATORS = {
     "aten.clamp_min.default",
     "aten.conv2d.default",
     "aten.div.Tensor",
+    "aten.detach_.default",
+    "aten.flatten.using_ints",
     "aten.gt.Scalar",
     "aten.linear.default",
+    "aten.lift_fresh_copy.default",
     "aten.masked_fill.Scalar",
     "aten.maximum.default",
+    "aten.max_pool2d.default",
     "aten.mean.dim",
     "aten.mul.Tensor",
+    "aten.minimum.default",
+    "aten.pad.default",
+    "aten.rsub.Scalar",
     "aten.sigmoid.default",
     "aten.silu.default",
     "aten.silu_.default",
@@ -46,7 +72,10 @@ SUPPORTED_OPERATORS = {
     "aten.squeeze.dim",
     "aten.sub.Tensor",
     "aten.to.dtype",
+    "aten.unsqueeze.default",
     "aten.upsample_bilinear2d.vec",
+    "aten.view.default",
+    "aten.where.self",
 }
 
 
@@ -348,11 +377,49 @@ def load_checkpoint_export_model(
     batch_size: int,
 ) -> tuple[torch.nn.Module, tuple[torch.Tensor, ...]]:
     checkpoint_path = Path(checkpoint_path)
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    if not isinstance(checkpoint, dict) or "model" not in checkpoint:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict):
         raise RuntimeError(f"invalid training checkpoint: {checkpoint_path}")
 
-    model_type = checkpoint.get("model_type")
+    model_type = checkpoint_model_type(checkpoint)
+    if model_type == "frame_presence":
+        model_config = checkpoint.get("model")
+        preprocessing = checkpoint.get("preprocessing")
+        state_dict = checkpoint.get("model_state")
+        if not isinstance(model_config, Mapping):
+            raise RuntimeError(
+                f"frame_presence checkpoint does not define model config: {checkpoint_path}"
+            )
+        if not isinstance(preprocessing, Mapping):
+            raise RuntimeError(
+                f"frame_presence checkpoint does not define preprocessing: {checkpoint_path}"
+            )
+        if not isinstance(state_dict, Mapping):
+            raise RuntimeError(
+                f"frame_presence checkpoint does not contain model_state: {checkpoint_path}"
+            )
+        model = FramePresenceModel(
+            width=int(model_config.get("width", 16)),
+            kernel_size=int(model_config.get("kernel_size", 5)),
+        ).eval()
+        architecture_version = int(checkpoint.get("architecture_version", 1))
+        if architecture_version != model.architecture_version:
+            raise RuntimeError(
+                "unsupported frame_presence "
+                f"architecture_version={architecture_version}; "
+                f"runtime=v{model.architecture_version}"
+            )
+        model.load_state_dict(state_dict)
+        input_width = int(preprocessing.get("input_width", 256))
+        input_height = int(preprocessing.get("input_height", 144))
+        focus_width = int(preprocessing.get("focus_width", 256))
+        focus_height = int(preprocessing.get("focus_height", 32))
+        return model, (
+            torch.randn(batch_size, 3, input_height, input_width),
+            torch.randn(batch_size, 3, focus_height, focus_width),
+            torch.zeros(batch_size, dtype=torch.float32),
+        )
+
     if model_type == "roi_presence":
         width, height = checkpoint_resize_roi(checkpoint, checkpoint_path)
         settings = checkpoint.get("settings") or {}
@@ -401,6 +468,7 @@ def export_pt2_to_unified_model(pt2_path: Path, output_dir: Path) -> Path:
     exported_program = torch.export.load(pt2_path)
     input_kinds, user_input_names, user_output_names = graph_signature_maps(exported_program)
     state_dict = exported_program.state_dict
+    constants = exported_program.constants
     graph_nodes = list(exported_program.graph.nodes)
     conv_batch_norm_pairs = foldable_conv_batch_norm_pairs(graph_nodes)
     folded_names = folded_placeholder_names(conv_batch_norm_pairs, input_kinds)
@@ -416,7 +484,8 @@ def export_pt2_to_unified_model(pt2_path: Path, output_dir: Path) -> Path:
             if node.op == "placeholder":
                 meta = tensor_meta_from_node(node)
                 kind, target = input_kinds.get(node.name, ("placeholder", None))
-                if node.name in folded_names or (kind in {"parameter", "buffer"} and not node.users):
+                stored_kinds = {"parameter", "buffer", "constant_tensor"}
+                if node.name in folded_names or (kind in stored_kinds and not node.users):
                     continue
                 tensor_record: dict[str, Any] = {
                     "name": node.name,
@@ -425,10 +494,19 @@ def export_pt2_to_unified_model(pt2_path: Path, output_dir: Path) -> Path:
                 }
                 if meta is not None:
                     tensor_record.update(meta)
-                if kind in {"parameter", "buffer"}:
-                    if target is None or target not in state_dict:
-                        raise RuntimeError(f"missing state tensor for placeholder {node.name}: target={target}")
-                    state_tensor = state_dict[target]
+                if kind in stored_kinds:
+                    if target is None:
+                        raise RuntimeError(
+                            f"stored placeholder has no target: {node.name} kind={kind}"
+                        )
+                    state_tensor = state_dict.get(target)
+                    if state_tensor is None:
+                        state_tensor = constants.get(target)
+                    if not isinstance(state_tensor, torch.Tensor):
+                        raise RuntimeError(
+                            f"missing state tensor for placeholder {node.name}: "
+                            f"kind={kind} target={target}"
+                        )
                     tensor_record.update(tensor_meta_from_tensor(state_tensor))
                     offset, byte_length = write_weight_tensor(weights_file, state_tensor)
                     tensor_record["data"] = {
@@ -513,11 +591,13 @@ def export_pt2_to_unified_model(pt2_path: Path, output_dir: Path) -> Path:
             }
         )
 
-    format_version = (
-        EXTENDED_FORMAT_VERSION
-        if any(node["op"] in FORMAT_V2_OPERATORS for node in nodes)
-        else FORMAT_VERSION
-    )
+    operators = {node["op"] for node in nodes}
+    if operators & FORMAT_V3_OPERATORS:
+        format_version = FRAME_PRESENCE_FORMAT_VERSION
+    elif operators & FORMAT_V2_OPERATORS:
+        format_version = EXTENDED_FORMAT_VERSION
+    else:
+        format_version = FORMAT_VERSION
     manifest = {
         "format": FORMAT_NAME,
         "format_version": format_version,
@@ -566,18 +646,22 @@ def coreml_output_path(path: Path) -> Path:
     return path / "model.mlpackage"
 
 
-def first_user_input_shape(exported_program: torch.export.ExportedProgram) -> tuple[str, tuple[int, ...]]:
+def user_input_shapes(
+    exported_program: torch.export.ExportedProgram,
+) -> list[tuple[str, tuple[int, ...]]]:
     _input_kinds, user_input_names, _user_output_names = graph_signature_maps(exported_program)
-    if len(user_input_names) != 1:
-        raise RuntimeError(f"CoreML export requires exactly one user input, got {len(user_input_names)}")
-    input_name = user_input_names[0]
-    for node in exported_program.graph.nodes:
-        if node.name == input_name:
-            meta = tensor_meta_from_node(node)
-            if meta is None:
-                raise RuntimeError(f"user input has no tensor metadata: {input_name}")
-            return input_name, tuple(meta["shape"])
-    raise RuntimeError(f"user input tensor not found in graph: {input_name}")
+    node_metadata = {
+        node.name: tensor_meta_from_node(node) for node in exported_program.graph.nodes
+    }
+    result: list[tuple[str, tuple[int, ...]]] = []
+    for input_name in user_input_names:
+        meta = node_metadata.get(input_name)
+        if meta is None:
+            raise RuntimeError(f"user input has no tensor metadata: {input_name}")
+        result.append((input_name, tuple(meta["shape"])))
+    if not result:
+        raise RuntimeError("CoreML export requires at least one user input")
+    return result
 
 
 class CoreMLSubtitleDetector(torch.nn.Module):
@@ -602,16 +686,19 @@ def export_model_to_coreml_model(
         raise RuntimeError(f"batch_size must be positive, got {batch_size}")
 
     ct = load_coremltools()
+    converted_outputs = None
     if model_path.suffix == ".pt2":
         if batch_size != 1:
             raise RuntimeError("--batch-size can only be used when exporting CoreML from a training checkpoint")
         exported_program = torch.export.load(model_path)
-        converted_input, input_shape = first_user_input_shape(exported_program)
+        exported_inputs = user_input_shapes(exported_program)
         model_for_conversion = exported_program.run_decompositions({})
     else:
-        checkpoint = torch.load(model_path, map_location="cpu")
+        checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
         model, example_inputs = load_checkpoint_export_model(model_path, batch_size)
-        model_type = checkpoint.get("model_type") if isinstance(checkpoint, dict) else None
+        model_type = (
+            checkpoint_model_type(checkpoint) if isinstance(checkpoint, Mapping) else None
+        )
         if model_type is None:
             image_size = int(example_inputs[0].shape[-1])
             model = CoreMLSubtitleDetector(model, image_size).eval()
@@ -623,6 +710,16 @@ def export_model_to_coreml_model(
                 ct.TensorType(name="left", shape=tuple(example_inputs[0].shape)),
                 ct.TensorType(name="right", shape=tuple(example_inputs[1].shape)),
             ]
+        elif model_type == "frame_presence":
+            converted_inputs = [
+                ct.TensorType(name="images", shape=tuple(example_inputs[0].shape)),
+                ct.TensorType(name="focus", shape=tuple(example_inputs[1].shape)),
+                ct.TensorType(name="focus_mode", shape=tuple(example_inputs[2].shape)),
+            ]
+            converted_outputs = [
+                ct.TensorType(name="presence_logits"),
+                ct.TensorType(name="region_logits"),
+            ]
         else:
             raise RuntimeError(f"unsupported checkpoint model_type for CoreML export: {model_type}")
         with torch.no_grad(), warnings.catch_warnings():
@@ -632,12 +729,14 @@ def export_model_to_coreml_model(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     conversion_options: dict[str, Any] = {
         "inputs": (
-            [ct.TensorType(name=converted_input, shape=input_shape)]
+            [ct.TensorType(name=name, shape=shape) for name, shape in exported_inputs]
             if model_path.suffix == ".pt2"
             else converted_inputs
         ),
         "source": "pytorch",
     }
+    if converted_outputs is not None:
+        conversion_options["outputs"] = converted_outputs
     if model_path.suffix != ".pt2" and model_type in {"roi_presence", "roi_pair_matcher"}:
         conversion_options["compute_precision"] = ct.precision.FLOAT32
     coreml_model = ct.convert(model_for_conversion, **conversion_options)
@@ -648,6 +747,31 @@ def export_model_to_coreml_model(
 def replace_manifest_source(manifest_path: Path, source: dict[str, Any]) -> None:
     manifest = json.loads(manifest_path.read_text())
     manifest["source"] = source
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+
+def annotate_checkpoint_contract(manifest_path: Path, checkpoint_path: Path) -> None:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, Mapping):
+        return
+    model_type = checkpoint_model_type(checkpoint)
+    if model_type != "frame_presence":
+        return
+    manifest = json.loads(manifest_path.read_text())
+    semantic_outputs = ("presence_logits", "region_logits")
+    if len(manifest["outputs"]) != len(semantic_outputs):
+        raise RuntimeError(
+            "frame_presence unified export must have presence and region outputs"
+        )
+    manifest["model_type"] = model_type
+    for output, semantic_name in zip(
+        manifest["outputs"], semantic_outputs, strict=True
+    ):
+        output["semantic_name"] = semantic_name
+    manifest["deployment_contract"] = {
+        "preprocessing": checkpoint.get("preprocessing", {}),
+        "outputs": checkpoint.get("outputs", {}),
+    }
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
 
@@ -704,6 +828,7 @@ def export_model_to_unified_model(
     if head_output:
         source["head_output"] = True
     replace_manifest_source(manifest_path, source)
+    annotate_checkpoint_contract(manifest_path, model_path)
     return manifest_path
 
 
