@@ -1,7 +1,7 @@
 [project]
 name = "subfast-net"
 version = "0.1.0"
-description = "Subtitle detection models, H.264 timing, and dataset tools"
+description = "Subtitle detection models and dataset tools"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -30,10 +30,6 @@ subfast-roi-embedding-validate = "subfast_roi_embedding.train:main_validate"
 subfast-roi-matcher = "subfast_roi_matcher.train:main"
 subfast-roi-matcher-validate = "subfast_roi_matcher.train:main_validate"
 subfast-export = "subfast_export.cli:main"
-h264-timing = "h264_timing.cli:main"
-h264-stream-timing = "h264_stream_timing.cli:main"
-h264-compressed-stream-timing = "h264_compressed_stream_timing.cli:main"
-full-frame-timing = "full_frame_timing.cli:main"
 subfast-tools = "tools.cli:main"
 
 [build-system]
@@ -43,10 +39,6 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 package-dir = {"" = "src"}
 packages = [
-    "full_frame_timing",
-    "h264_compressed_stream_timing",
-    "h264_stream_timing",
-    "h264_timing",
     "subfast_detector",
     "subfast_export",
     "subfast_roi_data",
@@ -54,15 +46,9 @@ packages = [
     "subfast_roi_matcher",
     "subfast_roi_presence",
     "subfast_shared",
-    "subtitle_timing_core",
-    "subtitle_timing_stream",
     "tools",
 ]
 include-package-data = true
 
 [tool.setuptools.package-data]
-"h264_timing" = ["*.csv", "*.jsonl", "*.srt", "README.md"]
-"h264_stream_timing" = ["README.md"]
-"h264_compressed_stream_timing" = ["README.md"]
-"full_frame_timing" = ["README.md"]
 "tools" = ["*.html", "*.md"]

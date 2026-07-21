@@ -22,7 +22,6 @@ Groups:
 
 Run ``subfast-net <group> <command> --help`` for command-specific options.
 
-H.264 timing uses the independent ``h264-timing`` command.
 Dataset and review utilities use the independent ``subfast-tools`` command.
 
 Each command has one canonical grouped spelling; use ``--help`` to discover
