@@ -12,7 +12,6 @@ import torch
 from torch.fx import Node
 
 from subfast_detector.model import SubtitleDetector
-from subfast_frame_presence.model import FramePresenceModel
 from subfast_roi_matcher.model import RoiPairInference, RoiPairMatcher, fuse_pair_matcher_for_inference
 from subfast_roi_presence.model import RoiPresenceModel
 
@@ -22,7 +21,7 @@ from .checkpoint import checkpoint_model_type
 FORMAT_NAME = "subfast-net.unified-model"
 FORMAT_VERSION = 1
 EXTENDED_FORMAT_VERSION = 2
-FRAME_PRESENCE_FORMAT_VERSION = 3
+EXTENDED_FORMAT_VERSION_3 = 3
 WEIGHTS_FILE = "weights.bin"
 COREML_OUTPUT_SUFFIXES = {".mlmodel", ".mlpackage"}
 FORMAT_V2_OPERATORS = {"aten.maximum.default", "aten.slice.Tensor"}
@@ -382,44 +381,6 @@ def load_checkpoint_export_model(
         raise RuntimeError(f"invalid training checkpoint: {checkpoint_path}")
 
     model_type = checkpoint_model_type(checkpoint)
-    if model_type == "frame_presence":
-        model_config = checkpoint.get("model")
-        preprocessing = checkpoint.get("preprocessing")
-        state_dict = checkpoint.get("model_state")
-        if not isinstance(model_config, Mapping):
-            raise RuntimeError(
-                f"frame_presence checkpoint does not define model config: {checkpoint_path}"
-            )
-        if not isinstance(preprocessing, Mapping):
-            raise RuntimeError(
-                f"frame_presence checkpoint does not define preprocessing: {checkpoint_path}"
-            )
-        if not isinstance(state_dict, Mapping):
-            raise RuntimeError(
-                f"frame_presence checkpoint does not contain model_state: {checkpoint_path}"
-            )
-        model = FramePresenceModel(
-            width=int(model_config.get("width", 16)),
-            kernel_size=int(model_config.get("kernel_size", 5)),
-        ).eval()
-        architecture_version = int(checkpoint.get("architecture_version", 1))
-        if architecture_version != model.architecture_version:
-            raise RuntimeError(
-                "unsupported frame_presence "
-                f"architecture_version={architecture_version}; "
-                f"runtime=v{model.architecture_version}"
-            )
-        model.load_state_dict(state_dict)
-        input_width = int(preprocessing.get("input_width", 256))
-        input_height = int(preprocessing.get("input_height", 144))
-        focus_width = int(preprocessing.get("focus_width", 256))
-        focus_height = int(preprocessing.get("focus_height", 32))
-        return model, (
-            torch.randn(batch_size, 3, input_height, input_width),
-            torch.randn(batch_size, 3, focus_height, focus_width),
-            torch.zeros(batch_size, dtype=torch.float32),
-        )
-
     if model_type == "roi_presence":
         width, height = checkpoint_resize_roi(checkpoint, checkpoint_path)
         settings = checkpoint.get("settings") or {}
@@ -593,7 +554,7 @@ def export_pt2_to_unified_model(pt2_path: Path, output_dir: Path) -> Path:
 
     operators = {node["op"] for node in nodes}
     if operators & FORMAT_V3_OPERATORS:
-        format_version = FRAME_PRESENCE_FORMAT_VERSION
+        format_version = EXTENDED_FORMAT_VERSION_3
     elif operators & FORMAT_V2_OPERATORS:
         format_version = EXTENDED_FORMAT_VERSION
     else:
@@ -686,7 +647,6 @@ def export_model_to_coreml_model(
         raise RuntimeError(f"batch_size must be positive, got {batch_size}")
 
     ct = load_coremltools()
-    converted_outputs = None
     if model_path.suffix == ".pt2":
         if batch_size != 1:
             raise RuntimeError("--batch-size can only be used when exporting CoreML from a training checkpoint")
@@ -710,16 +670,6 @@ def export_model_to_coreml_model(
                 ct.TensorType(name="left", shape=tuple(example_inputs[0].shape)),
                 ct.TensorType(name="right", shape=tuple(example_inputs[1].shape)),
             ]
-        elif model_type == "frame_presence":
-            converted_inputs = [
-                ct.TensorType(name="images", shape=tuple(example_inputs[0].shape)),
-                ct.TensorType(name="focus", shape=tuple(example_inputs[1].shape)),
-                ct.TensorType(name="focus_mode", shape=tuple(example_inputs[2].shape)),
-            ]
-            converted_outputs = [
-                ct.TensorType(name="presence_logits"),
-                ct.TensorType(name="region_logits"),
-            ]
         else:
             raise RuntimeError(f"unsupported checkpoint model_type for CoreML export: {model_type}")
         with torch.no_grad(), warnings.catch_warnings():
@@ -735,8 +685,6 @@ def export_model_to_coreml_model(
         ),
         "source": "pytorch",
     }
-    if converted_outputs is not None:
-        conversion_options["outputs"] = converted_outputs
     if model_path.suffix != ".pt2" and model_type in {"roi_presence", "roi_pair_matcher"}:
         conversion_options["compute_precision"] = ct.precision.FLOAT32
     coreml_model = ct.convert(model_for_conversion, **conversion_options)
@@ -747,31 +695,6 @@ def export_model_to_coreml_model(
 def replace_manifest_source(manifest_path: Path, source: dict[str, Any]) -> None:
     manifest = json.loads(manifest_path.read_text())
     manifest["source"] = source
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-
-
-def annotate_checkpoint_contract(manifest_path: Path, checkpoint_path: Path) -> None:
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if not isinstance(checkpoint, Mapping):
-        return
-    model_type = checkpoint_model_type(checkpoint)
-    if model_type != "frame_presence":
-        return
-    manifest = json.loads(manifest_path.read_text())
-    semantic_outputs = ("presence_logits", "region_logits")
-    if len(manifest["outputs"]) != len(semantic_outputs):
-        raise RuntimeError(
-            "frame_presence unified export must have presence and region outputs"
-        )
-    manifest["model_type"] = model_type
-    for output, semantic_name in zip(
-        manifest["outputs"], semantic_outputs, strict=True
-    ):
-        output["semantic_name"] = semantic_name
-    manifest["deployment_contract"] = {
-        "preprocessing": checkpoint.get("preprocessing", {}),
-        "outputs": checkpoint.get("outputs", {}),
-    }
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
 
@@ -828,7 +751,6 @@ def export_model_to_unified_model(
     if head_output:
         source["head_output"] = True
     replace_manifest_source(manifest_path, source)
-    annotate_checkpoint_contract(manifest_path, model_path)
     return manifest_path
 
 
