@@ -17,7 +17,7 @@ class FramePresenceTrainSettings(BaseModel):
         ]
     )
     val_root: Path = Path("data/validation_samples")
-    output_dir: Path = Path("outputs/frame_presence_run")
+    output_dir: Path = Path("outputs/frame_presence_v3")
     resume: Path | None = None
     image_size: tuple[int, int] = (512, 288)
     batch_size: int = Field(default=24, gt=0)
@@ -28,7 +28,6 @@ class FramePresenceTrainSettings(BaseModel):
     max_train_samples: int | None = Field(default=None, gt=0)
     max_val_samples: int | None = Field(default=None, gt=0)
     width: int = Field(default=24, gt=0)
-    evidence_kernel_size: int = Field(default=5, gt=1)
     region_loss_weight: float = Field(default=1.0, ge=0.0)
     region_dice_weight: float = Field(default=0.5, ge=0.0)
     margin_loss_weight: float = Field(default=0.5, ge=0.0)
@@ -43,8 +42,6 @@ class FramePresenceTrainSettings(BaseModel):
         width, height = self.image_size
         if width <= 0 or height <= 0:
             raise ValueError("image_size dimensions must be positive")
-        if width % 2 or height % 2:
-            raise ValueError("image_size dimensions must be divisible by the model stride (2)")
-        if self.evidence_kernel_size % 2 == 0:
-            raise ValueError("evidence_kernel_size must be odd")
+        if width % 16 or height % 16:
+            raise ValueError("image_size dimensions must be divisible by the encoder stride (16)")
         return self

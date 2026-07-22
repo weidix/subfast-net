@@ -371,7 +371,6 @@ def _checkpoint_payload(
         "settings": settings.model_dump(mode="json"),
         "model_settings": {
             "width": settings.width,
-            "evidence_kernel_size": settings.evidence_kernel_size,
         },
         "preprocessing": {
             "input": "complete_rgb_frame",
@@ -428,7 +427,7 @@ def _load_resume(
         raise RuntimeError("resume checkpoint architecture does not match")
     previous = dict(checkpoint.get("settings") or {})
     current = settings.model_dump(mode="json")
-    for name in ("train_roots", "val_root", "image_size", "width", "evidence_kernel_size", "seed"):
+    for name in ("train_roots", "val_root", "image_size", "width", "seed"):
         if previous.get(name) != current.get(name):
             raise RuntimeError(
                 f"resume setting mismatch for {name}: checkpoint={previous.get(name)!r} current={current.get(name)!r}"
@@ -471,10 +470,7 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
     if val_dataset.summary.positive == 0 or val_dataset.summary.empty == 0:
         raise RuntimeError("validation data must include both subtitle-presence classes")
     _write_reproducibility_files(output_dir, settings, train_dataset, val_dataset)
-    model = FramePresenceModel(
-        width=settings.width,
-        evidence_kernel_size=settings.evidence_kernel_size,
-    ).to(device)
+    model = FramePresenceModel(width=settings.width).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=settings.learning_rate,
@@ -499,8 +495,7 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
     print(
         f"config: image_size={settings.image_size[0]}x{settings.image_size[1]} "
         f"batch_size={settings.batch_size} epochs={settings.epochs} lr={settings.learning_rate:g} "
-        f"weight_decay={settings.weight_decay:g} width={settings.width} "
-        f"evidence_kernel_size={settings.evidence_kernel_size}",
+        f"weight_decay={settings.weight_decay:g} width={settings.width}",
         flush=True,
     )
     print(format_dataset_summary("train", train_dataset), flush=True)
@@ -628,7 +623,6 @@ def parse_args(argv: list[str] | None = None) -> FramePresenceTrainSettings:
     parser.add_argument("--max-train-samples", type=int)
     parser.add_argument("--max-val-samples", type=int)
     parser.add_argument("--width", type=int, default=defaults.width)
-    parser.add_argument("--evidence-kernel-size", type=int, default=defaults.evidence_kernel_size)
     parser.add_argument("--log-interval", type=int, default=defaults.log_interval)
     parser.add_argument("--seed", type=int, default=defaults.seed)
     parser.add_argument("--device", default=defaults.device)
@@ -648,8 +642,6 @@ def parse_args(argv: list[str] | None = None) -> FramePresenceTrainSettings:
         parser.error("--weight-decay must be non-negative")
     if args.num_workers < 0:
         parser.error("--num-workers must be non-negative")
-    if args.evidence_kernel_size <= 1 or args.evidence_kernel_size % 2 == 0:
-        parser.error("--evidence-kernel-size must be an odd integer greater than 1")
     for name, value in (("--max-train-samples", args.max_train_samples), ("--max-val-samples", args.max_val_samples)):
         if value is not None and value <= 0:
             parser.error(f"{name} must be positive")
@@ -667,7 +659,6 @@ def parse_args(argv: list[str] | None = None) -> FramePresenceTrainSettings:
         max_train_samples=args.max_train_samples,
         max_val_samples=args.max_val_samples,
         width=args.width,
-        evidence_kernel_size=args.evidence_kernel_size,
         log_interval=args.log_interval,
         seed=args.seed,
         device=args.device,

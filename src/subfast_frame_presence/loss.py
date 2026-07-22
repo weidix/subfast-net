@@ -36,9 +36,11 @@ def _presence_margin_loss(
     positive = presence > 0.5
     terms: list[torch.Tensor] = []
     if bool(positive.any()):
-        terms.append(F.relu(positive_margin - logits[positive]).mean())
+        violations = F.softplus(positive_margin - logits[positive])
+        terms.append(violations.topk(max(1, (violations.numel() + 3) // 4)).values.mean())
     if bool((~positive).any()):
-        terms.append(F.relu(logits[~positive] - negative_margin).mean())
+        violations = F.softplus(logits[~positive] - negative_margin)
+        terms.append(violations.topk(max(1, (violations.numel() + 3) // 4)).values.mean())
     return torch.stack(terms).mean() if terms else logits.sum() * 0.0
 
 
