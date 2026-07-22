@@ -32,6 +32,7 @@ its options.
 _ROUTES: dict[tuple[str, str], tuple[str, str]] = {
     # Training families.
     ("train", "detector"): ("subfast_detector.train", "main"),
+    ("train", "frame-presence"): ("subfast_frame_presence.train", "main"),
     ("train", "presence"): ("subfast_roi_presence.train", "main"),
     ("train", "matcher"): ("subfast_roi_matcher.train", "main"),
     ("train", "embedding"): ("subfast_roi_embedding.train", "main"),
@@ -46,7 +47,7 @@ _ROUTES: dict[tuple[str, str], tuple[str, str]] = {
 }
 
 _GROUP_COMMANDS: dict[str, tuple[str, ...]] = {
-    "train": ("detector", "presence", "embedding", "matcher"),
+    "train": ("detector", "frame-presence", "presence", "embedding", "matcher"),
     "validate": ("embedding", "matcher"),
     "benchmark": ("presence",),
     "export": ("unified", "coreml", "safetensors"),
