@@ -19,10 +19,20 @@ from tqdm import tqdm
 from subfast_shared.runtime import choose_device
 
 from .config import FramePresenceTrainSettings
-from .dataset import FramePresenceDataset, collate_frame_presence_batch, is_roi_root
-from .loss import FramePresenceLoss, frame_presence_loss
+from .dataset import (
+    RESIZE_ALIGNMENT,
+    RESIZE_ALIGNMENT_MODE,
+    RESIZE_INTERPOLATION,
+    FramePresenceDataset,
+    FramePresenceMacroBatch,
+    aligned_resize_size,
+    collate_frame_presence_batch,
+    is_roi_root,
+)
+from .loss import FramePresenceLoss, FramePresenceLossInput, frame_presence_macro_loss
 from .metrics import acceptance, checkpoint_rank, presence_metrics
 from .model import FramePresenceModel, fuse_frame_presence_for_inference
+from .sampler import MixedMacroBatchSampler
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -64,7 +74,7 @@ def format_dataset_summary(name: str, dataset: FramePresenceDataset) -> str:
     sample_types = ", ".join(f"{kind}={count}" for kind, count in sorted(summary.sample_types.items()))
     return (
         f"{name}: samples={summary.total} positive={summary.positive} empty={summary.empty} "
-        f"dropped={summary.dropped} positive_ratio={summary.positive_ratio:.3f} "
+        f"manual_drop_image_exclusions={summary.dropped} positive_ratio={summary.positive_ratio:.3f} "
         f"empty_ratio={summary.empty_ratio:.3f} types=[{sample_types}] roots=[{roots}]"
     )
 
@@ -72,7 +82,9 @@ def format_dataset_summary(name: str, dataset: FramePresenceDataset) -> str:
 def make_dataset(settings: FramePresenceTrainSettings, *, train: bool) -> FramePresenceDataset:
     return FramePresenceDataset(
         settings.train_roots if train else settings.val_roots,
-        image_size=settings.image_size,
+        resize_scale=settings.resize_scale,
+        min_subtitle_short_edge=settings.min_subtitle_short_edge,
+        protect_small_subtitles=train,
         random_crop_views=settings.random_crop_views if train else 0,
         random_crop_scale=(settings.random_crop_min_scale, settings.random_crop_max_scale),
         seed=settings.seed,
@@ -94,28 +106,11 @@ def _domain_metrics(metrics: dict[str, float], sample_type: str) -> dict[str, fl
 
 
 def _validation_acceptance(metrics: dict[str, float], *, complete_validation: bool) -> dict[str, bool]:
-    checks = acceptance(metrics, complete_validation=complete_validation)
-    for sample_type in ("full_frame", "roi"):
-        domain = _domain_metrics(metrics, sample_type)
-        if not domain:
-            checks[f"{sample_type}_present"] = False
-            continue
-        for name, passed in acceptance(domain, complete_validation=complete_validation).items():
-            if name != "validation_complete":
-                checks[f"{sample_type}_{name}"] = passed
-    return checks
+    return acceptance(metrics, complete_validation=complete_validation)
 
 
 def _validation_rank(metrics: dict[str, float]) -> tuple[float, ...]:
-    domain_f1 = [
-        _domain_metrics(metrics, sample_type).get("presence_f1", 0.0)
-        for sample_type in ("full_frame", "roi")
-    ]
-    domain_recall = [
-        _domain_metrics(metrics, sample_type).get("presence_recall", 0.0)
-        for sample_type in ("full_frame", "roi")
-    ]
-    return (round(min(domain_f1), 8), round(min(domain_recall), 8), *checkpoint_rank(metrics))
+    return checkpoint_rank(metrics)
 
 
 def _json_write(path: Path, payload: object) -> None:
@@ -174,7 +169,6 @@ def _write_reproducibility_files(
     settings: FramePresenceTrainSettings,
     train_dataset: FramePresenceDataset,
     val_dataset: FramePresenceDataset,
-    initialization: dict[str, object] | None,
 ) -> None:
     code_files = sorted((_PROJECT_ROOT / "src" / "subfast_frame_presence").glob("*.py"))
     tracked_files = code_files + [
@@ -195,19 +189,47 @@ def _write_reproducibility_files(
         },
     }
     run_config = {
+        "model_name": settings.model_name,
+        "architecture_version": settings.architecture_version,
         "settings": settings.model_dump(mode="json"),
         "input_contract": {
             "input": "one RGB full frame, ROI, or arbitrary image region per model item",
             "source_scope": _input_scope(settings),
-            "shape": [3, settings.image_size[1], settings.image_size[0]],
-            "pixel_values": "raw RGB values represented as float32",
-            "inference_preprocessing": "stretch resize only",
+            "shape": [3, "aligned_height", "aligned_width"],
+            "pixel_values": "RGB float32 scaled to [0,1]",
+            "resize": {
+                "mode": "source_scale_then_stretch_align",
+                "resize_scale": settings.resize_scale,
+                "align_to": RESIZE_ALIGNMENT,
+                "alignment_mode": RESIZE_ALIGNMENT_MODE,
+                "interpolation": RESIZE_INTERPOLATION,
+                "reference_source_size": list(settings.reference_source_size),
+                "reference_output_size": list(
+                    aligned_resize_size(settings.reference_source_size, settings.resize_scale)
+                ),
+            },
             "training_augmentation": {
                 "random_crop_views": settings.random_crop_views,
                 "random_crop_scale": [settings.random_crop_min_scale, settings.random_crop_max_scale],
-                "positive_crop_rule": "fully retain at least one subtitle box",
+                "positive_crop_rule": "fully retain every refined subtitle box",
             },
-            "prohibited": ["ROI mask", "padding", "normalization"],
+            "small_subtitle_protection": {
+                "min_subtitle_short_edge": settings.min_subtitle_short_edge,
+                "maximum_resize_scale": 1.0,
+                "positive_rule": "minimum scale satisfying every refined box when possible",
+                "negative_rule": "sample actual positive resize-scale distribution",
+                "validation_uses_protection": False,
+                "warnings": "small_subtitle_warnings.jsonl",
+            },
+            "prohibited": ["ROI mask", "padding"],
+        },
+        "training_contract": {
+            "batching": "mixed logical macro batch split into exact-HxW execution micro batches",
+            "optimizer_steps_per_macro_batch": 1,
+            "loss_reduction": "global across the complete logical macro batch",
+            "normalization": settings.normalization,
+            "gradient_clip_norm": settings.gradient_clip_norm,
+            "initialization": "fresh random Kaiming initialization",
         },
         "evaluation_contract": {
             "decision_threshold": 0.5,
@@ -226,7 +248,7 @@ def _write_reproducibility_files(
             "train_manifest": "data_manifest_train.jsonl",
             "validation_manifest": "data_manifest_validation.jsonl",
         },
-        "initialization": initialization,
+        "initialization": {"type": "fresh_random", "seed": settings.seed},
     }
     _json_write(output_dir / "source_snapshot.json", snapshot)
     if source_patch:
@@ -264,11 +286,14 @@ def _make_train_loader(
     dataset.set_epoch(epoch)
     return DataLoader(
         dataset,
-        batch_size=settings.batch_size,
-        shuffle=True,
+        batch_sampler=MixedMacroBatchSampler(
+            dataset,
+            batch_size=settings.batch_size,
+            seed=settings.seed,
+            epoch=epoch,
+        ),
         num_workers=settings.num_workers,
         pin_memory=False,
-        generator=torch.Generator().manual_seed(settings.seed + epoch),
         collate_fn=collate_frame_presence_batch,
     )
 
@@ -302,24 +327,31 @@ def train_epoch(
     progress = tqdm(loader, desc=f"frame presence epoch {epoch}/{settings.epochs}", leave=False)
     for batch_index, batch in enumerate(progress, start=1):
         batch_start = time.perf_counter()
-        images = batch.images.to(device)
-        subtitle_masks = batch.subtitle_masks.to(device)
-        supervision_masks = batch.supervision_masks.to(device)
-        presence = batch.presence.to(device)
         optimizer.zero_grad(set_to_none=True)
-        presence_logits, region_logits = model.forward_with_presence_map(images)
-        loss = frame_presence_loss(
-            presence_logits,
-            region_logits,
-            presence,
-            subtitle_masks,
-            supervision_masks,
+        loss_inputs: list[FramePresenceLossInput] = []
+        for micro in batch.micro_batches:
+            images = micro.images.to(device)
+            presence_logits, region_logits = model.forward_with_presence_map(images)
+            loss_inputs.append(
+                FramePresenceLossInput(
+                    presence_logits=presence_logits,
+                    region_logits=region_logits,
+                    presence=micro.presence.to(device),
+                    subtitle_masks=micro.subtitle_masks.to(device),
+                    supervision_masks=micro.supervision_masks.to(device),
+                )
+            )
+        loss = frame_presence_macro_loss(
+            loss_inputs,
             **_loss_kwargs(settings),
         )
         loss.total.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+        gradient_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=settings.gradient_clip_norm,
+        )
         optimizer.step()
-        batch_size = images.shape[0]
+        batch_size = batch.size
         values = _loss_values(loss)
         for name, value in values.items():
             totals[name] += value * batch_size
@@ -337,6 +369,8 @@ def train_epoch(
                     "epoch_batches": len(loader),
                     "samples": sample_count,
                     "samples_per_second": batch_size / max(time.perf_counter() - batch_start, 1e-9),
+                    "execution_micro_batches": len(batch.micro_batches),
+                    "gradient_norm": float(gradient_norm.detach().cpu()),
                     **values,
                 },
             )
@@ -362,52 +396,55 @@ def validate(
     sample_types_all: list[str] = []
     rows: list[dict[str, object]] = []
     for batch in loader:
-        images = batch.images.to(device)
-        subtitle_masks = batch.subtitle_masks.to(device)
-        supervision_masks = batch.supervision_masks.to(device)
-        presence = batch.presence.to(device)
-        presence_logits, region_logits = model.forward_with_presence_map(images)
-        loss = frame_presence_loss(
-            presence_logits,
-            region_logits,
-            presence,
-            subtitle_masks,
-            supervision_masks,
-            **_loss_kwargs(settings),
-        )
-        batch_size = images.shape[0]
+        loss_inputs: list[FramePresenceLossInput] = []
+        batch_size = batch.size
+        for micro in batch.micro_batches:
+            images = micro.images.to(device)
+            presence = micro.presence.to(device)
+            presence_logits, region_logits = model.forward_with_presence_map(images)
+            loss_inputs.append(
+                FramePresenceLossInput(
+                    presence_logits=presence_logits,
+                    region_logits=region_logits,
+                    presence=presence,
+                    subtitle_masks=micro.subtitle_masks.to(device),
+                    supervision_masks=micro.supervision_masks.to(device),
+                )
+            )
+            scores = torch.sigmoid(presence_logits).detach().cpu()
+            logits_cpu = presence_logits.detach().cpu()
+            targets = presence.detach().cpu()
+            for sample_id, root, image_path, sample_type, score, logit, target in zip(
+                micro.sample_ids,
+                micro.roots,
+                micro.image_paths,
+                micro.sample_types,
+                scores.tolist(),
+                logits_cpu.tolist(),
+                targets.tolist(),
+                strict=True,
+            ):
+                rows.append(
+                    {
+                        "sample_key": f"{root}::{sample_id}",
+                        "sample_id": sample_id,
+                        "root": root,
+                        "image_path": image_path,
+                        "sample_type": sample_type,
+                        "target": int(target > 0.5),
+                        "presence_logit": logit,
+                        "presence_score": score,
+                        "prediction": int(score >= 0.5),
+                        "decision_threshold": 0.5,
+                    }
+                )
+            logits_all.append(logits_cpu)
+            presence_all.append(targets)
+            sample_types_all.extend(micro.sample_types)
+        loss = frame_presence_macro_loss(loss_inputs, **_loss_kwargs(settings))
         values = _loss_values(loss)
         for name, value in values.items():
             totals[name] += value * batch_size
-        scores = torch.sigmoid(presence_logits).detach().cpu()
-        logits_cpu = presence_logits.detach().cpu()
-        targets = presence.detach().cpu()
-        for sample_id, root, image_path, sample_type, score, logit, target in zip(
-            batch.sample_ids,
-            batch.roots,
-            batch.image_paths,
-            batch.sample_types,
-            scores.tolist(),
-            logits_cpu.tolist(),
-            targets.tolist(),
-            strict=True,
-        ):
-            rows.append(
-                {
-                    "sample_key": f"{root}::{sample_id}",
-                    "sample_id": sample_id,
-                    "root": root,
-                    "image_path": image_path,
-                    "sample_type": sample_type,
-                    "target": int(target > 0.5),
-                    "presence_logit": logit,
-                    "presence_score": score,
-                    "prediction": int(score >= 0.5),
-                }
-            )
-        logits_all.append(logits_cpu)
-        presence_all.append(targets)
-        sample_types_all.extend(batch.sample_types)
         sample_count += batch_size
     _jsonl_write(scores_path, rows)
     metrics = {
@@ -434,45 +471,6 @@ def resolve_resume_checkpoint(path: Path) -> Path:
     raise FileNotFoundError(f"resume checkpoint not found: {path}")
 
 
-def resolve_initial_checkpoint(path: Path) -> Path:
-    if path.is_file():
-        return path
-    for name in ("best.pt", "last.pt"):
-        candidate = path / name
-        if candidate.is_file():
-            return candidate
-    raise FileNotFoundError(f"initial checkpoint not found: {path}")
-
-
-def _load_initial_weights(
-    path: Path,
-    settings: FramePresenceTrainSettings,
-    model: FramePresenceModel,
-) -> dict[str, object]:
-    checkpoint_path = resolve_initial_checkpoint(path).expanduser().resolve()
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if not isinstance(checkpoint, dict) or checkpoint.get("model_type") != "frame_presence":
-        raise RuntimeError(f"invalid frame presence initialization checkpoint: {checkpoint_path}")
-    if bool(checkpoint.get("inference_fused")):
-        raise RuntimeError("initialization requires a training checkpoint, not a fused inference checkpoint")
-    if int(checkpoint.get("architecture_version", -1)) != model.architecture_version:
-        raise RuntimeError("initialization checkpoint architecture does not match")
-    model_settings = dict(checkpoint.get("model_settings") or {})
-    if int(model_settings.get("width", -1)) != settings.width:
-        raise RuntimeError("initialization checkpoint width does not match")
-    preprocessing = dict(checkpoint.get("preprocessing") or {})
-    if tuple(preprocessing.get("resize") or ()) != settings.image_size:
-        raise RuntimeError("initialization checkpoint image size does not match")
-    model.load_state_dict(checkpoint["model"])
-    return {
-        "checkpoint": str(checkpoint_path),
-        "sha256": _sha256(checkpoint_path),
-        "source_epoch": int(checkpoint.get("epoch", 0)),
-        "architecture_version": int(checkpoint["architecture_version"]),
-        "optimizer": "reset",
-    }
-
-
 def _checkpoint_payload(
     settings: FramePresenceTrainSettings,
     model: FramePresenceModel,
@@ -483,8 +481,11 @@ def _checkpoint_payload(
     best_epoch: int,
     best_metrics: dict[str, float],
     metrics: dict[str, float],
+    warning_count: int,
+    unique_warning_samples: int,
 ) -> dict[str, Any]:
     return {
+        "model_name": settings.model_name,
         "model_type": "frame_presence",
         "architecture_version": model.architecture_version,
         "model": model.state_dict(),
@@ -492,12 +493,47 @@ def _checkpoint_payload(
         "settings": settings.model_dump(mode="json"),
         "model_settings": {
             "width": settings.width,
+            "normalization": settings.normalization,
         },
         "preprocessing": {
             "input": f"complete_rgb_{_input_scope(settings)}",
-            "resize": list(settings.image_size),
-            "resize_mode": "stretch",
-            "other_preprocessing": "none",
+            "input_value_range": [0.0, 1.0],
+            "source_value_range": [0.0, 255.0],
+            "value_scale": 1.0 / 255.0,
+            "resize": {
+                "mode": "source_scale_then_stretch_align",
+                "resize_scale": settings.resize_scale,
+                "align_to": RESIZE_ALIGNMENT,
+                "alignment_mode": RESIZE_ALIGNMENT_MODE,
+                "interpolation": RESIZE_INTERPOLATION,
+                "reference_source_size": list(settings.reference_source_size),
+                "reference_output_size": list(
+                    aligned_resize_size(settings.reference_source_size, settings.resize_scale)
+                ),
+            },
+            "padding": "none",
+            "training_small_subtitle_protection": {
+                "min_subtitle_short_edge": settings.min_subtitle_short_edge,
+                "max_resize_scale": 1.0,
+                "negative_scale_sampling": "positive_actual_resize_scale_distribution",
+            },
+            "validation_small_subtitle_protection": "disabled",
+        },
+        "training_contract": {
+            "scheme": "A" if settings.normalization == "none" else "B",
+            "normalization": settings.normalization,
+            "macro_batch_size": settings.batch_size,
+            "micro_batch_grouping": "exact_height_width",
+            "padding": "none",
+            "optimizer_step": "once_per_macro_batch",
+            "loss_reduction": "global_per_macro_batch",
+            "gradient_clip_norm": settings.gradient_clip_norm,
+            "initialization": "fresh_random",
+        },
+        "small_subtitle_warnings": {
+            "file": "small_subtitle_warnings.jsonl",
+            "count": warning_count,
+            "unique_samples": unique_warning_samples,
         },
         "score_contract": {
             "decision_threshold": 0.5,
@@ -526,11 +562,14 @@ def _inference_payload(
         key: checkpoint[key]
         for key in (
             "model_type",
+            "model_name",
             "architecture_version",
             "settings",
             "model_settings",
             "preprocessing",
             "score_contract",
+            "training_contract",
+            "small_subtitle_warnings",
             "epoch",
             "metrics",
         )
@@ -538,12 +577,10 @@ def _inference_payload(
     payload.update(
         {
             "model": optimized.state_dict(),
-            "inference_fused": True,
-            "operator_fusion": "Conv2d-BatchNorm2d parameter folding",
+            "inference_fused": False,
+            "operator_fusion": "none (V5 contains no BatchNorm)",
         }
     )
-    if checkpoint.get("initialization") is not None:
-        payload["initialization"] = checkpoint["initialization"]
     return payload
 
 
@@ -563,9 +600,8 @@ def load_frame_presence_inference_checkpoint(
         )
     model_settings = dict(checkpoint.get("model_settings") or {})
     width = int(model_settings.get("width", FramePresenceTrainSettings().width))
-    model = FramePresenceModel(width=width).eval()
-    if bool(checkpoint.get("inference_fused")):
-        model = fuse_frame_presence_for_inference(model)
+    normalization = str(model_settings.get("normalization", "none"))
+    model = FramePresenceModel(width=width, normalization=normalization).eval()
     model.load_state_dict(checkpoint["model"])
     return model.to(device).eval(), checkpoint
 
@@ -621,11 +657,16 @@ def _load_resume(
     for name in (
         "train_roots",
         "val_roots",
-        "image_size",
+        "resize_scale",
+        "min_subtitle_short_edge",
+        "resize_alignment",
+        "resize_alignment_mode",
+        "resize_interpolation",
         "random_crop_views",
         "random_crop_min_scale",
         "random_crop_max_scale",
         "width",
+        "normalization",
         "seed",
     ):
         if previous.get(name) != current.get(name):
@@ -654,6 +695,8 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
     device = choose_device(settings.device)
     output_dir = settings.output_dir.expanduser().resolve()
     metrics_path = output_dir / "metrics.jsonl"
+    warnings_path = output_dir / "small_subtitle_warnings.jsonl"
+    warning_summary_path = output_dir / "small_subtitle_summary.json"
     if metrics_path.exists() and settings.resume is None:
         raise FileExistsError(f"output already contains a training run: {output_dir}")
     train_roots = {root.expanduser().resolve() for root in settings.train_roots}
@@ -671,7 +714,7 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
         raise RuntimeError("training data must include both subtitle-presence classes")
     if val_dataset.summary.positive == 0 or val_dataset.summary.empty == 0:
         raise RuntimeError("validation data must include both subtitle-presence classes")
-    model = FramePresenceModel(width=settings.width).to(device)
+    model = FramePresenceModel(width=settings.width, normalization=settings.normalization).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=settings.learning_rate,
@@ -682,7 +725,6 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
     best_epoch = 0
     best_metrics: dict[str, float] = {}
     best_rank: tuple[float, ...] | None = None
-    initialization: dict[str, object] | None = None
     if settings.resume is not None:
         checkpoint_path = resolve_resume_checkpoint(settings.resume)
         start_epoch, global_step, best_epoch, best_metrics, best_rank = _load_resume(
@@ -693,57 +735,38 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
             device,
         )
         print(f"resume={checkpoint_path} start_epoch={start_epoch} step={global_step}", flush=True)
-    elif settings.init_checkpoint is not None:
-        initialization = _load_initial_weights(settings.init_checkpoint, settings, model)
-        print(
-            f"init_checkpoint={initialization['checkpoint']} source_epoch={initialization['source_epoch']} "
-            "optimizer=reset",
-            flush=True,
-        )
-    _write_reproducibility_files(output_dir, settings, train_dataset, val_dataset, initialization)
-    print(f"frame_presence device={device} output_dir={output_dir}", flush=True)
+    train_dataset.set_epoch(start_epoch)
+    warning_rows: list[dict[str, object]] = []
+    if settings.resume is not None and warnings_path.is_file():
+        warning_rows = [json.loads(line) for line in warnings_path.read_text(encoding="utf-8").splitlines() if line]
+    warning_rows.extend(warning.to_dict() for warning in train_dataset.small_subtitle_warnings)
+    _jsonl_write(warnings_path, warning_rows)
+    _write_reproducibility_files(output_dir, settings, train_dataset, val_dataset)
+    print(f"{settings.model_name} device={device} output_dir={output_dir}", flush=True)
     print(
-        f"config: image_size={settings.image_size[0]}x{settings.image_size[1]} "
+        f"config: resize_scale={settings.resize_scale:g} align_to={RESIZE_ALIGNMENT} "
+        f"alignment={RESIZE_ALIGNMENT_MODE} interpolation={RESIZE_INTERPOLATION} "
+        f"min_subtitle_short_edge={settings.min_subtitle_short_edge:g}px "
         f"batch_size={settings.batch_size} epochs={settings.epochs} lr={settings.learning_rate:g} "
-        f"weight_decay={settings.weight_decay:g} width={settings.width}",
+        f"weight_decay={settings.weight_decay:g} width={settings.width} "
+        f"normalization={settings.normalization}",
         flush=True,
     )
     print(format_dataset_summary("train", train_dataset), flush=True)
     print(format_dataset_summary("val", val_dataset), flush=True)
     val_loader = _make_val_loader(val_dataset, settings)
     last_metrics: dict[str, float] = {}
-    initial_metrics: dict[str, float] | None = None
     completed_epoch = start_epoch - 1
     with metrics_path.open("a" if settings.resume is not None else "w", encoding="utf-8"):
         pass
-    if initialization is not None:
-        initial_dir = output_dir / "epoch_outputs" / "epoch_0000"
-        initial_dir.mkdir(parents=True, exist_ok=True)
-        initial_metrics = validate(
-            model,
-            val_loader,
-            device=device,
-            settings=settings,
-            scores_path=initial_dir / "validation_scores.jsonl",
-        )
-        initial_record: dict[str, object] = {
-            "record_type": "initial_validation",
-            "epoch": 0,
-            **initial_metrics,
-        }
-        _json_write(initial_dir / "metrics.json", initial_record)
-        _append_jsonl(metrics_path, initial_record)
-        print(
-            f"initial accuracy={initial_metrics['presence_accuracy']:.6f} "
-            f"f1={initial_metrics['presence_f1']:.6f} "
-            f"recall={initial_metrics['presence_recall']:.6f} "
-            f"fp={int(initial_metrics['presence_fp'])} fn={int(initial_metrics['presence_fn'])}",
-            flush=True,
-        )
     for epoch in range(start_epoch, settings.epochs + 1):
+        train_loader = _make_train_loader(train_dataset, settings, epoch)
+        if epoch != start_epoch:
+            warning_rows.extend(warning.to_dict() for warning in train_dataset.small_subtitle_warnings)
+            _jsonl_write(warnings_path, warning_rows)
         train_metrics, global_step = train_epoch(
             model,
-            _make_train_loader(train_dataset, settings, epoch),
+            train_loader,
             optimizer,
             device=device,
             settings=settings,
@@ -790,9 +813,11 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
             best_epoch=best_epoch,
             best_metrics=best_metrics,
             metrics=epoch_metrics,
+            warning_count=len(warning_rows),
+            unique_warning_samples=len(
+                {(str(row["image_path"]), str(row["sample_id"])) for row in warning_rows}
+            ),
         )
-        if initialization is not None:
-            payload["initialization"] = initialization
         torch.save(payload, epoch_dir / "checkpoint.pt")
         torch.save(payload, output_dir / "last.pt")
         if is_best:
@@ -834,7 +859,7 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
     benchmark = _benchmark_checkpoint_in_fresh_process(
         output_dir / "best_inference.pt",
         device=device,
-        image_size=settings.image_size,
+        image_size=aligned_resize_size(settings.reference_source_size, settings.resize_scale),
     )
     _json_write(output_dir / "benchmark.json", benchmark)
     _append_jsonl(metrics_path, benchmark)
@@ -845,18 +870,32 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
         torch.save(checkpoint, checkpoint_path)
     print(
         f"inference median_ms={float(benchmark['median_ms']):.6f} "
-        f"p90_round_ms={float(benchmark['p90_round_ms']):.6f} "
-        f"speedup_vs_v3={benchmark['speedup_vs_v3']} target_met={benchmark['target_met']}",
+        f"p90_round_ms={float(benchmark['p90_round_ms']):.6f}",
         flush=True,
     )
     final_acceptance = _validation_acceptance(
         best_metrics,
         complete_validation=settings.max_val_samples is None,
     )
-    if device.type == "mps":
-        final_acceptance["inference_speed"] = bool(benchmark["target_met"])
+    warning_summary: dict[str, object] = {
+        "model_name": settings.model_name,
+        "architecture_version": settings.architecture_version,
+        "warning_events": len(warning_rows),
+        "unique_warning_samples": len(
+            {(str(row["image_path"]), str(row["sample_id"])) for row in warning_rows}
+        ),
+        "unsatisfied_events_at_scale_1": sum(not bool(row["protection_satisfied"]) for row in warning_rows),
+        "warnings_file": str(warnings_path),
+    }
+    _json_write(warning_summary_path, warning_summary)
+    for checkpoint_name in ("best.pt", "best_inference.pt", "last.pt"):
+        checkpoint_path = output_dir / checkpoint_name
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        checkpoint["small_subtitle_warnings"] = warning_summary
+        torch.save(checkpoint, checkpoint_path)
     summary: dict[str, object] = {
         "record_type": "frame_presence_training_summary",
+        "model_name": settings.model_name,
         "model_type": "frame_presence",
         "architecture_version": model.architecture_version,
         "device": str(device),
@@ -864,16 +903,25 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
         "input_scope": _input_scope(settings),
         "full_frame_input": True,
         "roi_input": any(is_roi_root(root) for root in settings.train_roots),
-        "input_preprocessing": "stretch resize; training also uses labeled random crops",
+        "input_preprocessing": {
+            "resize_scale": settings.resize_scale,
+            "align_to": RESIZE_ALIGNMENT,
+            "alignment_mode": RESIZE_ALIGNMENT_MODE,
+            "interpolation": RESIZE_INTERPOLATION,
+            "input_value_range": [0.0, 1.0],
+            "padding": "none",
+        },
+        "training_scheme": "A" if settings.normalization == "none" else "B",
+        "normalization": settings.normalization,
         "completed_epoch": completed_epoch,
         "epoch_limit": settings.epochs,
         "best_epoch": best_epoch,
         "train_samples": len(train_dataset),
         "validation_samples": len(val_dataset),
         "validation": best_metrics,
-        "initial_validation": initial_metrics,
         "last_validation": last_metrics,
-        "initialization": initialization,
+        "initialization": {"type": "fresh_random", "seed": settings.seed},
+        "small_subtitle_warnings": warning_summary,
         "inference_benchmark": benchmark,
         "acceptance": final_acceptance,
         "accepted": all(final_acceptance.values()),
@@ -884,6 +932,7 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
         "benchmark": str(output_dir / "benchmark.json"),
         "source_snapshot": str(output_dir / "source_snapshot.json"),
         "run_config": str(output_dir / "run_config.json"),
+        "small_subtitle_warning_summary": str(warning_summary_path),
     }
     _json_write(output_dir / "summary.json", summary)
     return summary
@@ -896,13 +945,22 @@ def parse_args(argv: list[str] | None = None) -> FramePresenceTrainSettings:
     parser.add_argument("--val-root", dest="val_roots", metavar="VAL_ROOT", type=Path, action="append")
     parser.add_argument("--output-dir", type=Path, default=defaults.output_dir)
     parser.add_argument("--resume", type=Path)
-    parser.add_argument("--init-checkpoint", type=Path)
     parser.add_argument(
         "--early-stop",
         action=argparse.BooleanOptionalAction,
         default=defaults.early_stop,
     )
-    parser.add_argument("--image-size", type=parse_frame_size, default=defaults.image_size)
+    parser.add_argument("--resize-scale", type=float, default=defaults.resize_scale)
+    parser.add_argument(
+        "--min-subtitle-short-edge",
+        type=float,
+        default=defaults.min_subtitle_short_edge,
+    )
+    parser.add_argument(
+        "--reference-source-size",
+        type=parse_frame_size,
+        default=defaults.reference_source_size,
+    )
     parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
     parser.add_argument("--epochs", type=int, default=defaults.epochs)
     parser.add_argument("--lr", type=float, default=defaults.learning_rate)
@@ -914,6 +972,12 @@ def parse_args(argv: list[str] | None = None) -> FramePresenceTrainSettings:
     parser.add_argument("--random-crop-min-scale", type=float, default=defaults.random_crop_min_scale)
     parser.add_argument("--random-crop-max-scale", type=float, default=defaults.random_crop_max_scale)
     parser.add_argument("--width", type=int, default=defaults.width)
+    parser.add_argument(
+        "--normalization",
+        choices=("none", "group_norm"),
+        default=defaults.normalization,
+    )
+    parser.add_argument("--gradient-clip-norm", type=float, default=defaults.gradient_clip_norm)
     parser.add_argument("--log-interval", type=int, default=defaults.log_interval)
     parser.add_argument("--seed", type=int, default=defaults.seed)
     parser.add_argument("--device", default=defaults.device)
@@ -931,14 +995,18 @@ def parse_args(argv: list[str] | None = None) -> FramePresenceTrainSettings:
         parser.error("--lr must be positive")
     if args.weight_decay < 0.0:
         parser.error("--weight-decay must be non-negative")
+    if not 0.0 < args.resize_scale <= 1.0:
+        parser.error("--resize-scale must satisfy 0 < scale <= 1")
+    if args.min_subtitle_short_edge <= 0.0:
+        parser.error("--min-subtitle-short-edge must be positive")
+    if args.gradient_clip_norm <= 0.0:
+        parser.error("--gradient-clip-norm must be positive")
     if args.num_workers < 0:
         parser.error("--num-workers must be non-negative")
     if not 0 <= args.random_crop_views <= 8:
         parser.error("--random-crop-views must be between 0 and 8")
     if not 0.0 < args.random_crop_min_scale <= args.random_crop_max_scale <= 1.0:
         parser.error("random crop scales must satisfy 0 < min <= max <= 1")
-    if args.resume is not None and args.init_checkpoint is not None:
-        parser.error("--resume and --init-checkpoint are mutually exclusive")
     for name, value in (("--max-train-samples", args.max_train_samples), ("--max-val-samples", args.max_val_samples)):
         if value is not None and value <= 0:
             parser.error(f"{name} must be positive")
@@ -947,9 +1015,10 @@ def parse_args(argv: list[str] | None = None) -> FramePresenceTrainSettings:
         val_roots=args.val_roots or defaults.val_roots,
         output_dir=args.output_dir,
         resume=args.resume,
-        init_checkpoint=args.init_checkpoint,
         early_stop=args.early_stop,
-        image_size=args.image_size,
+        resize_scale=args.resize_scale,
+        min_subtitle_short_edge=args.min_subtitle_short_edge,
+        reference_source_size=args.reference_source_size,
         batch_size=args.batch_size,
         epochs=args.epochs,
         learning_rate=args.lr,
@@ -961,6 +1030,8 @@ def parse_args(argv: list[str] | None = None) -> FramePresenceTrainSettings:
         random_crop_min_scale=args.random_crop_min_scale,
         random_crop_max_scale=args.random_crop_max_scale,
         width=args.width,
+        normalization=args.normalization,
+        gradient_clip_norm=args.gradient_clip_norm,
         log_interval=args.log_interval,
         seed=args.seed,
         device=args.device,
@@ -988,12 +1059,21 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
     device = choose_device(args.device)
     model, checkpoint = load_frame_presence_inference_checkpoint(args.checkpoint, device)
     preprocessing = dict(checkpoint.get("preprocessing") or {})
-    image_size = tuple(args.image_size or preprocessing.get("resize") or FramePresenceTrainSettings().image_size)
+    resize = preprocessing.get("resize")
+    if args.image_size is not None:
+        image_size = tuple(args.image_size)
+    elif isinstance(resize, dict):
+        image_size = tuple(resize.get("reference_output_size") or ())
+    else:
+        image_size = tuple(resize or ()) if isinstance(resize, (list, tuple)) else ()
+    if len(image_size) != 2:
+        defaults = FramePresenceTrainSettings()
+        image_size = aligned_resize_size(defaults.reference_source_size, defaults.resize_scale)
     width, height = int(image_size[0]), int(image_size[1])
     images = torch.rand(
         (1, 3, height, width),
         generator=torch.Generator().manual_seed(2026),
-    ) * 255.0
+    )
     median_ms, p90_ms = measure_frame_presence_latency(
         model,
         images,
@@ -1004,10 +1084,11 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
     )
     metrics: dict[str, object] = {
         "record_type": "frame_presence_inference_benchmark",
+        "model_name": checkpoint.get("model_name", model.model_name),
         "checkpoint": str(args.checkpoint),
         "architecture_version": model.architecture_version,
         "model_parameters": sum(parameter.numel() for parameter in model.parameters()),
-        "scope": "conv_bn_folded_eager_forward_only",
+        "scope": "v5_no_normalization_eager_forward_only",
         "device": str(device),
         "torch_version": str(torch.__version__),
         "dtype": "float32",
@@ -1019,10 +1100,6 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
         "rounds": args.rounds,
         "median_ms": median_ms,
         "p90_round_ms": p90_ms,
-        "v3_mps_median_ms": _V3_MPS_MEDIAN_MS if device.type == "mps" else None,
-        "speedup_vs_v3": _V3_MPS_MEDIAN_MS / median_ms if device.type == "mps" else None,
-        "target_median_ms": _MPS_TARGET_MEDIAN_MS if device.type == "mps" else None,
-        "target_met": median_ms <= _MPS_TARGET_MEDIAN_MS if device.type == "mps" else None,
     }
     print(json.dumps(metrics, ensure_ascii=False, indent=2, sort_keys=True))
     return metrics

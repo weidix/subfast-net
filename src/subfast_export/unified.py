@@ -376,6 +376,8 @@ def checkpoint_frame_size(checkpoint: dict[str, Any], checkpoint_path: Path) -> 
     preprocessing = checkpoint.get("preprocessing") or {}
     settings = checkpoint.get("settings") or {}
     image_size = preprocessing.get("resize") if isinstance(preprocessing, dict) else None
+    if isinstance(image_size, dict):
+        image_size = image_size.get("reference_output_size")
     if image_size is None and isinstance(settings, dict):
         image_size = settings.get("image_size")
     if not isinstance(image_size, (list, tuple)) or len(image_size) != 2:
@@ -414,7 +416,8 @@ def load_checkpoint_export_model(
         model_settings = checkpoint.get("model_settings") or {}
         settings = checkpoint.get("settings") or {}
         model_width = int(model_settings.get("width", settings.get("width", 24)))
-        model = FramePresenceModel(width=model_width).eval()
+        normalization = str(model_settings.get("normalization", settings.get("normalization", "none")))
+        model = FramePresenceModel(width=model_width, normalization=normalization).eval()
         version = int(checkpoint.get("architecture_version", -1))
         if version != model.architecture_version:
             raise RuntimeError(

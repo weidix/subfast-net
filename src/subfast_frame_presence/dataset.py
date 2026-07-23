@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 import random
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +14,12 @@ from torch.utils.data import Dataset
 
 from subfast_detector.dataset import apply_label_masks, load_label_masks, read_boxes
 from subfast_shared.geometry import Box
+
+
+RESIZE_ALIGNMENT = 16
+RESIZE_ALIGNMENT_MODE = "nearest_multiple_half_up"
+RESIZE_INTERPOLATION = "bilinear"
+SMALL_SUBTITLE_WARNING_EDGE = 8.0
 
 
 @dataclass(frozen=True)
@@ -48,7 +56,24 @@ class FramePresenceSummary:
 
 
 @dataclass(frozen=True)
-class FramePresenceBatch:
+class SmallSubtitleWarning:
+    epoch: int
+    sample_id: str
+    image_path: str
+    sample_type: str
+    original_size: tuple[int, int]
+    standard_output_size: tuple[int, int]
+    standard_min_short_edge: float
+    protection_scale: float
+    protected_output_size: tuple[int, int]
+    protection_satisfied: bool
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class FramePresenceMicroBatch:
     images: torch.Tensor
     subtitle_masks: torch.Tensor
     supervision_masks: torch.Tensor
@@ -57,6 +82,17 @@ class FramePresenceBatch:
     roots: list[str]
     image_paths: list[str]
     sample_types: list[str]
+    resize_scales: list[float]
+    output_size: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class FramePresenceMacroBatch:
+    micro_batches: tuple[FramePresenceMicroBatch, ...]
+
+    @property
+    def size(self) -> int:
+        return sum(micro.images.shape[0] for micro in self.micro_batches)
 
 
 @dataclass(frozen=True)
@@ -64,6 +100,96 @@ class _DatasetItem:
     sample: FramePresenceSample
     sample_type: str
     crop_view: int = 0
+
+
+@dataclass(frozen=True)
+class _PreparedItem:
+    crop: tuple[int, int, int, int]
+    source_size: tuple[int, int]
+    boxes: tuple[Box, ...]
+    ignored_boxes: tuple[Box, ...]
+    sample_id: str
+    resize_scale: float
+    standard_output_size: tuple[int, int]
+    output_size: tuple[int, int]
+    standard_min_short_edge: float | None
+
+
+def align_dimension(value: float, alignment: int = RESIZE_ALIGNMENT) -> int:
+    if value <= 0.0:
+        raise ValueError("scaled image dimension must be positive")
+    return max(alignment, int(math.floor(value / alignment + 0.5)) * alignment)
+
+
+def aligned_resize_size(
+    source_size: tuple[int, int],
+    resize_scale: float,
+    alignment: int = RESIZE_ALIGNMENT,
+) -> tuple[int, int]:
+    if not 0.0 < resize_scale <= 1.0:
+        raise ValueError("resize_scale must satisfy 0 < scale <= 1")
+    width, height = source_size
+    return align_dimension(width * resize_scale, alignment), align_dimension(height * resize_scale, alignment)
+
+
+def _minimum_mapped_short_edge(
+    boxes: tuple[Box, ...],
+    *,
+    source_size: tuple[int, int],
+    output_size: tuple[int, int],
+) -> float | None:
+    if not boxes:
+        return None
+    source_width, source_height = source_size
+    output_width, output_height = output_size
+    return min(
+        min(box.width * output_width / source_width, box.height * output_height / source_height)
+        for box in boxes
+    )
+
+
+def subtitle_protection_geometry(
+    boxes: tuple[Box, ...],
+    *,
+    source_size: tuple[int, int],
+    resize_scale: float,
+    min_short_edge: float,
+) -> tuple[float, tuple[int, int], tuple[int, int], float | None, bool]:
+    standard_size = aligned_resize_size(source_size, resize_scale)
+    standard_short_edge = _minimum_mapped_short_edge(
+        boxes,
+        source_size=source_size,
+        output_size=standard_size,
+    )
+    if standard_short_edge is None or standard_short_edge >= min_short_edge:
+        return resize_scale, standard_size, standard_size, standard_short_edge, True
+
+    source_width, source_height = source_size
+    required_width = max(min_short_edge * source_width / box.width for box in boxes)
+    required_height = max(min_short_edge * source_height / box.height for box in boxes)
+    aligned_width = math.ceil(required_width / RESIZE_ALIGNMENT) * RESIZE_ALIGNMENT
+    aligned_height = math.ceil(required_height / RESIZE_ALIGNMENT) * RESIZE_ALIGNMENT
+    protected_scale = min(
+        1.0,
+        max(
+            resize_scale,
+            (aligned_width - RESIZE_ALIGNMENT / 2) / source_width + 1e-12,
+            (aligned_height - RESIZE_ALIGNMENT / 2) / source_height + 1e-12,
+        ),
+    )
+    protected_size = aligned_resize_size(source_size, protected_scale)
+    protected_short_edge = _minimum_mapped_short_edge(
+        boxes,
+        source_size=source_size,
+        output_size=protected_size,
+    )
+    return (
+        protected_scale,
+        standard_size,
+        protected_size,
+        standard_short_edge,
+        bool(protected_short_edge is not None and protected_short_edge + 1e-6 >= min_short_edge),
+    )
 
 
 def _rasterize_boxes(
@@ -100,13 +226,13 @@ def discover_frame_presence_samples(roots: list[Path]) -> tuple[list[FramePresen
             with Image.open(image_path) as image:
                 source_size = image.size
             boxes = read_boxes(label_path, *source_size)
-            boxes, ignored_boxes, drop = apply_label_masks(
+            boxes, ignored_boxes, drop_image = apply_label_masks(
                 sample_id,
                 boxes,
                 masks,
                 *source_size,
             )
-            if drop:
+            if drop_image:
                 dropped += 1
                 continue
             samples.append(
@@ -140,7 +266,7 @@ def _crop_boxes(boxes: tuple[Box, ...], crop: tuple[int, int, int, int]) -> tupl
         y1 = max(box.y1, top)
         x2 = min(box.x2, right)
         y2 = min(box.y2, bottom)
-        if x2 - x1 >= 1.0 and y2 - y1 >= 1.0:
+        if x2 > x1 and y2 > y1:
             cropped.append(Box(x1 - left, y1 - top, x2 - left, y2 - top))
     return tuple(cropped)
 
@@ -158,7 +284,12 @@ def _random_crop_box(
     crop_height = max(1, min(source_height, round(source_height * scale)))
 
     if sample.boxes:
-        target = rng.choice(sample.boxes)
+        target = Box(
+            min(box.x1 for box in sample.boxes),
+            min(box.y1 for box in sample.boxes),
+            max(box.x2 for box in sample.boxes),
+            max(box.y2 for box in sample.boxes),
+        )
         target_width = int(np.ceil(target.x2)) - int(np.floor(target.x1))
         target_height = int(np.ceil(target.y2)) - int(np.floor(target.y1))
         crop_width = min(source_width, max(crop_width, target_width))
@@ -176,19 +307,23 @@ def _random_crop_box(
 
 
 class FramePresenceDataset(Dataset):
-    """Mixed full-frame, ROI, and reproducible random-crop presence samples."""
+    """V5 variable-shape frame presence samples without padding."""
 
     def __init__(
         self,
         roots: list[Path],
         *,
-        image_size: tuple[int, int],
+        resize_scale: float = 0.25,
+        min_subtitle_short_edge: float = 8.0,
+        protect_small_subtitles: bool = False,
         random_crop_views: int = 0,
         random_crop_scale: tuple[float, float] = (0.3, 0.9),
         seed: int = 0,
         max_samples: int | None = None,
     ) -> None:
-        self.image_size = image_size
+        self.resize_scale = resize_scale
+        self.min_subtitle_short_edge = min_subtitle_short_edge
+        self.protect_small_subtitles = protect_small_subtitles
         self.random_crop_scale = random_crop_scale
         self.seed = seed
         self.epoch = 0
@@ -211,82 +346,178 @@ class FramePresenceDataset(Dataset):
         self.items = items if max_samples is None else items[:max_samples]
         self.samples = [item.sample for item in self.items]
         self.summary = self._summarize()
+        self._prepared: list[_PreparedItem] = []
+        self.small_subtitle_warnings: list[SmallSubtitleWarning] = []
+        self.positive_resize_scales: tuple[float, ...] = ()
+        self.set_epoch(0, emit_warnings=False)
 
-    def set_epoch(self, epoch: int) -> None:
+    def set_epoch(self, epoch: int, *, emit_warnings: bool = True) -> None:
+        if self._prepared and self.epoch == epoch:
+            return
         self.epoch = epoch
+        bases: list[tuple[_DatasetItem, tuple[int, int, int, int], tuple[Box, ...], tuple[Box, ...], tuple[int, int], str]] = []
+        positive_scales: list[float] = []
+        positive_geometries: dict[int, tuple[float, tuple[int, int], tuple[int, int], float | None, bool]] = {}
+        for index, item in enumerate(self.items):
+            sample = item.sample
+            crop = (0, 0, sample.source_size[0], sample.source_size[1])
+            boxes = sample.boxes
+            ignored_boxes = sample.ignored_boxes
+            source_size = sample.source_size
+            sample_id = sample.sample_id
+            if item.sample_type == "random_crop":
+                rng = random.Random(f"{self.seed}:{epoch}:{index}:{item.crop_view}")
+                crop = _random_crop_box(
+                    sample,
+                    rng=rng,
+                    min_scale=self.random_crop_scale[0],
+                    max_scale=self.random_crop_scale[1],
+                )
+                boxes = _crop_boxes(sample.boxes, crop)
+                ignored_boxes = _crop_boxes(sample.ignored_boxes, crop)
+                source_size = (crop[2] - crop[0], crop[3] - crop[1])
+                sample_id = f"{sample.sample_id}#crop{item.crop_view}"
+            bases.append((item, crop, boxes, ignored_boxes, source_size, sample_id))
+            if boxes:
+                geometry = subtitle_protection_geometry(
+                    boxes,
+                    source_size=source_size,
+                    resize_scale=self.resize_scale,
+                    min_short_edge=self.min_subtitle_short_edge,
+                )
+                positive_geometries[index] = geometry
+                positive_scales.append(geometry[0] if self.protect_small_subtitles else self.resize_scale)
+        self.positive_resize_scales = tuple(positive_scales)
+
+        prepared: list[_PreparedItem] = []
+        warnings: list[SmallSubtitleWarning] = []
+        for index, (item, crop, boxes, ignored_boxes, source_size, sample_id) in enumerate(bases):
+            if boxes:
+                protected_scale, standard_size, protected_size, standard_short_edge, satisfied = positive_geometries[index]
+                actual_scale = protected_scale if self.protect_small_subtitles else self.resize_scale
+                output_size = protected_size if self.protect_small_subtitles else standard_size
+                if self.protect_small_subtitles and standard_short_edge is not None and standard_short_edge < SMALL_SUBTITLE_WARNING_EDGE:
+                    warning = SmallSubtitleWarning(
+                        epoch=epoch,
+                        sample_id=sample_id,
+                        image_path=str(item.sample.image_path),
+                        sample_type=item.sample_type,
+                        original_size=source_size,
+                        standard_output_size=standard_size,
+                        standard_min_short_edge=standard_short_edge,
+                        protection_scale=actual_scale,
+                        protected_output_size=output_size,
+                        protection_satisfied=satisfied,
+                    )
+                    warnings.append(warning)
+                    if emit_warnings:
+                        print(
+                            "WARNING small subtitle: "
+                            f"sample_id={warning.sample_id} image_path={warning.image_path} "
+                            f"original_size={source_size[0]}x{source_size[1]} "
+                            f"standard_output_size={standard_size[0]}x{standard_size[1]} "
+                            f"min_short_edge={standard_short_edge:.4f}px "
+                            f"protection_scale={actual_scale:.8f} "
+                            f"protected_output_size={output_size[0]}x{output_size[1]} "
+                            f"satisfied={satisfied}",
+                            flush=True,
+                        )
+            else:
+                standard_size = aligned_resize_size(source_size, self.resize_scale)
+                standard_short_edge = None
+                if self.protect_small_subtitles and positive_scales:
+                    rng = random.Random(f"{self.seed}:negative-scale:{epoch}:{index}")
+                    actual_scale = rng.choice(positive_scales)
+                else:
+                    actual_scale = self.resize_scale
+                output_size = aligned_resize_size(source_size, actual_scale)
+            prepared.append(
+                _PreparedItem(
+                    crop=crop,
+                    source_size=source_size,
+                    boxes=boxes,
+                    ignored_boxes=ignored_boxes,
+                    sample_id=sample_id,
+                    resize_scale=actual_scale,
+                    standard_output_size=standard_size,
+                    output_size=output_size,
+                    standard_min_short_edge=standard_short_edge,
+                )
+            )
+        self._prepared = prepared
+        self.small_subtitle_warnings = warnings
 
     def __len__(self) -> int:
         return len(self.samples)
 
+    def sample_type_for_index(self, index: int) -> str:
+        return self.items[index].sample_type
+
+    def presence_for_index(self, index: int) -> bool:
+        return bool(self._prepared[index].boxes)
+
+    def output_size_for_index(self, index: int) -> tuple[int, int]:
+        return self._prepared[index].output_size
+
     def __getitem__(self, index: int) -> dict[str, object]:
         item = self.items[index]
         sample = item.sample
-        crop = (0, 0, sample.source_size[0], sample.source_size[1])
-        boxes = sample.boxes
-        ignored_boxes = sample.ignored_boxes
-        source_size = sample.source_size
-        sample_id = sample.sample_id
-        if item.sample_type == "random_crop":
-            rng = random.Random(f"{self.seed}:{self.epoch}:{index}:{item.crop_view}")
-            crop = _random_crop_box(
-                sample,
-                rng=rng,
-                min_scale=self.random_crop_scale[0],
-                max_scale=self.random_crop_scale[1],
-            )
-            boxes = _crop_boxes(sample.boxes, crop)
-            ignored_boxes = _crop_boxes(sample.ignored_boxes, crop)
-            source_size = (crop[2] - crop[0], crop[3] - crop[1])
-            sample_id = f"{sample.sample_id}#crop{item.crop_view}"
+        prepared = self._prepared[index]
         with Image.open(sample.image_path) as image:
             if image.mode != "RGB":
                 raise ValueError(f"frame image must already be RGB: {sample.image_path}")
             if item.sample_type == "random_crop":
-                image = image.crop(crop)
-            if image.size != self.image_size:
-                image = image.resize(self.image_size, Image.Resampling.BILINEAR)
-            array = np.asarray(image, dtype=np.float32)
+                image = image.crop(prepared.crop)
+            if image.size != prepared.output_size:
+                image = image.resize(prepared.output_size, Image.Resampling.BILINEAR)
+            array = np.asarray(image, dtype=np.float32) / 255.0
         subtitle_mask = _rasterize_boxes(
-            boxes,
-            source_size=source_size,
-            output_size=self.image_size,
+            prepared.boxes,
+            source_size=prepared.source_size,
+            output_size=prepared.output_size,
         )
         ignored_mask = _rasterize_boxes(
-            ignored_boxes,
-            source_size=source_size,
-            output_size=self.image_size,
+            prepared.ignored_boxes,
+            source_size=prepared.source_size,
+            output_size=prepared.output_size,
         )
         return {
             "image": torch.from_numpy(array).permute(2, 0, 1),
             "subtitle_mask": subtitle_mask,
             "supervision_mask": 1.0 - ignored_mask,
-            "presence": torch.tensor(float(bool(boxes)), dtype=torch.float32),
-            "sample_id": sample_id,
+            "presence": torch.tensor(float(bool(prepared.boxes)), dtype=torch.float32),
+            "sample_id": prepared.sample_id,
             "root": str(sample.root),
             "image_path": str(sample.image_path),
             "sample_type": item.sample_type,
+            "resize_scale": prepared.resize_scale,
+            "output_size": prepared.output_size,
         }
 
     def manifest(self) -> list[dict[str, object]]:
         records: list[dict[str, object]] = []
-        for item in self.items:
+        for item, prepared in zip(self.items, self._prepared, strict=True):
             sample = item.sample
             stat = sample.image_path.stat()
             records.append(
                 {
                     "root": str(sample.root),
-                    "sample_id": sample.sample_id,
+                    "sample_id": prepared.sample_id,
                     "image_path": str(sample.image_path),
                     "label_path": str(sample.label_path),
-                    "source_size": list(sample.source_size),
+                    "source_size": list(prepared.source_size),
+                    "standard_output_size": list(prepared.standard_output_size),
+                    "output_size": list(prepared.output_size),
+                    "resize_scale": prepared.resize_scale,
+                    "standard_min_subtitle_short_edge": prepared.standard_min_short_edge,
                     "image_bytes": stat.st_size,
                     "image_mtime_ns": stat.st_mtime_ns,
-                    "has_subtitle": sample.has_subtitle,
+                    "has_subtitle": bool(prepared.boxes),
                     "sample_type": item.sample_type,
                     "crop_view": item.crop_view if item.sample_type == "random_crop" else None,
-                    "boxes": [[box.x1, box.y1, box.x2, box.y2] for box in sample.boxes],
+                    "boxes": [[box.x1, box.y1, box.x2, box.y2] for box in prepared.boxes],
                     "ignored_boxes": [
-                        [box.x1, box.y1, box.x2, box.y2] for box in sample.ignored_boxes
+                        [box.x1, box.y1, box.x2, box.y2] for box in prepared.ignored_boxes
                     ],
                 }
             )
@@ -312,25 +543,44 @@ class FramePresenceDataset(Dataset):
         )
 
 
-def collate_frame_presence_batch(items: list[dict[str, object]]) -> FramePresenceBatch:
-    return FramePresenceBatch(
-        images=torch.stack([item["image"] for item in items]),  # type: ignore[arg-type]
-        subtitle_masks=torch.stack([item["subtitle_mask"] for item in items]),  # type: ignore[arg-type]
-        supervision_masks=torch.stack([item["supervision_mask"] for item in items]),  # type: ignore[arg-type]
-        presence=torch.stack([item["presence"] for item in items]),  # type: ignore[arg-type]
-        sample_ids=[str(item["sample_id"]) for item in items],
-        roots=[str(item["root"]) for item in items],
-        image_paths=[str(item["image_path"]) for item in items],
-        sample_types=[str(item["sample_type"]) for item in items],
-    )
+def collate_frame_presence_batch(items: list[dict[str, object]]) -> FramePresenceMacroBatch:
+    grouped: OrderedDict[tuple[int, int], list[dict[str, object]]] = OrderedDict()
+    for item in items:
+        output_size = tuple(item["output_size"])  # type: ignore[arg-type]
+        grouped.setdefault(output_size, []).append(item)
+    micro_batches: list[FramePresenceMicroBatch] = []
+    for output_size, group in grouped.items():
+        micro_batches.append(
+            FramePresenceMicroBatch(
+                images=torch.stack([item["image"] for item in group]),  # type: ignore[arg-type]
+                subtitle_masks=torch.stack([item["subtitle_mask"] for item in group]),  # type: ignore[arg-type]
+                supervision_masks=torch.stack([item["supervision_mask"] for item in group]),  # type: ignore[arg-type]
+                presence=torch.stack([item["presence"] for item in group]),  # type: ignore[arg-type]
+                sample_ids=[str(item["sample_id"]) for item in group],
+                roots=[str(item["root"]) for item in group],
+                image_paths=[str(item["image_path"]) for item in group],
+                sample_types=[str(item["sample_type"]) for item in group],
+                resize_scales=[float(item["resize_scale"]) for item in group],
+                output_size=output_size,
+            )
+        )
+    return FramePresenceMacroBatch(tuple(micro_batches))
 
 
 __all__ = [
-    "FramePresenceBatch",
     "FramePresenceDataset",
+    "FramePresenceMacroBatch",
+    "FramePresenceMicroBatch",
     "FramePresenceSample",
     "FramePresenceSummary",
+    "RESIZE_ALIGNMENT",
+    "RESIZE_ALIGNMENT_MODE",
+    "RESIZE_INTERPOLATION",
+    "SmallSubtitleWarning",
+    "align_dimension",
+    "aligned_resize_size",
     "collate_frame_presence_batch",
     "discover_frame_presence_samples",
     "is_roi_root",
+    "subtitle_protection_geometry",
 ]

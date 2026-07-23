@@ -5,7 +5,6 @@ import copy
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.nn.utils.fusion import fuse_conv_bn_eval
 
 
 class ConvNormAct(nn.Sequential):
@@ -17,7 +16,15 @@ class ConvNormAct(nn.Sequential):
         kernel_size: int,
         stride: int,
         dilation: int = 1,
+        normalization: str = "none",
     ) -> None:
+        if normalization == "none":
+            norm: nn.Module = nn.Identity()
+        elif normalization == "group_norm":
+            groups = next(group for group in range(min(8, output_channels), 0, -1) if output_channels % group == 0)
+            norm = nn.GroupNorm(groups, output_channels)
+        else:
+            raise ValueError(f"unsupported normalization: {normalization}")
         super().__init__(
             nn.Conv2d(
                 input_channels,
@@ -26,9 +33,9 @@ class ConvNormAct(nn.Sequential):
                 stride=stride,
                 padding=dilation * (kernel_size // 2),
                 dilation=dilation,
-                bias=False,
+                bias=normalization == "none",
             ),
-            nn.BatchNorm2d(output_channels),
+            norm,
             nn.ReLU(inplace=True),
         )
 
@@ -36,30 +43,51 @@ class ConvNormAct(nn.Sequential):
 class FramePresenceModel(nn.Module):
     """Context-fused full-frame subtitle-presence model with dense supervision."""
 
-    architecture_version = 4
+    model_name = "Frame Presence V5"
+    architecture_version = 5
     feature_stride = 8
 
-    def __init__(self, *, width: int = 24) -> None:
+    def __init__(self, *, width: int = 24, normalization: str = "none") -> None:
         super().__init__()
         if width <= 0:
             raise ValueError("width must be positive")
+        if normalization not in {"none", "group_norm"}:
+            raise ValueError("normalization must be 'none' or 'group_norm'")
+        self.normalization = normalization
         stem_width = max(8, width * 2 // 3)
         region_width = width + width // 3
         context_width = width * 2
-        self.stem = ConvNormAct(3, stem_width, kernel_size=5, stride=2)
-        self.detail = ConvNormAct(stem_width, width, kernel_size=3, stride=2)
-        self.region_encoder = ConvNormAct(width, region_width, kernel_size=3, stride=2)
-        self.context_encoder = ConvNormAct(region_width, context_width, kernel_size=3, stride=2)
+        self.stem = ConvNormAct(3, stem_width, kernel_size=5, stride=2, normalization=normalization)
+        self.detail = ConvNormAct(stem_width, width, kernel_size=3, stride=2, normalization=normalization)
+        self.region_encoder = ConvNormAct(
+            width, region_width, kernel_size=3, stride=2, normalization=normalization
+        )
+        self.context_encoder = ConvNormAct(
+            region_width, context_width, kernel_size=3, stride=2, normalization=normalization
+        )
         self.context_refine = ConvNormAct(
             context_width,
             context_width,
             kernel_size=3,
             stride=1,
             dilation=3,
+            normalization=normalization,
         )
-        self.context_projection = nn.Conv2d(context_width, region_width, 1, bias=False)
+        self.context_projection = nn.Conv2d(context_width, region_width, 1)
         self.region_head = nn.Conv2d(region_width, 1, 1)
         self.global_head = nn.Linear(context_width, 1)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Linear):
+                nn.init.kaiming_uniform_(module.weight, a=5**0.5)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def encode_map(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         region = self.region_encoder(self.detail(self.stem(images)))
@@ -92,23 +120,9 @@ class FramePresenceModel(nn.Module):
 
 
 def fuse_frame_presence_for_inference(model: FramePresenceModel) -> FramePresenceModel:
-    """Return an eval-only copy with every Conv-BatchNorm pair folded."""
+    """Return an eval-only deployment copy; V5 has no foldable BatchNorm."""
     device = next(model.parameters()).device
-    optimized = copy.deepcopy(model).to("cpu").eval()
-    for block in (
-        optimized.stem,
-        optimized.detail,
-        optimized.region_encoder,
-        optimized.context_encoder,
-        optimized.context_refine,
-    ):
-        convolution = block[0]
-        normalization = block[1]
-        if not isinstance(convolution, nn.Conv2d) or not isinstance(normalization, nn.BatchNorm2d):
-            raise TypeError("frame presence feature blocks must contain Conv2d-BatchNorm2d")
-        block[0] = fuse_conv_bn_eval(convolution, normalization)
-        block[1] = nn.Identity()
-    return optimized.to(device)
+    return copy.deepcopy(model).to("cpu").eval().to(device)
 
 
 __all__ = ["FramePresenceModel", "fuse_frame_presence_for_inference"]

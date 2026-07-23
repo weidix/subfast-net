@@ -15,6 +15,15 @@ class FramePresenceLoss:
     region_dice: torch.Tensor
 
 
+@dataclass(frozen=True)
+class FramePresenceLossInput:
+    presence_logits: torch.Tensor
+    region_logits: torch.Tensor
+    presence: torch.Tensor
+    subtitle_masks: torch.Tensor
+    supervision_masks: torch.Tensor
+
+
 def _balanced_binary_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     losses = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
     positive = targets > 0.5
@@ -44,43 +53,54 @@ def _presence_margin_loss(
     return torch.stack(terms).mean() if terms else logits.sum() * 0.0
 
 
-def _region_bce(
-    region_logits: torch.Tensor,
-    region_targets: torch.Tensor,
-    supervision_mask: torch.Tensor,
-) -> torch.Tensor:
-    losses = F.binary_cross_entropy_with_logits(region_logits, region_targets, reduction="none")
-    positive_mask = (region_targets > 0.5).to(losses.dtype) * supervision_mask
-    negative_mask = (region_targets <= 0.5).to(losses.dtype) * supervision_mask
-    terms: list[torch.Tensor] = []
-    if bool(positive_mask.any()):
-        terms.append((losses * positive_mask).sum() / positive_mask.sum().clamp_min(1.0))
-    if bool(negative_mask.any()):
-        terms.append((losses * negative_mask).sum() / negative_mask.sum().clamp_min(1.0))
-    return torch.stack(terms).mean() if terms else region_logits.sum() * 0.0
+def _region_terms(
+    inputs: list[FramePresenceLossInput],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    reference = inputs[0].region_logits
+    positive_bce_sum = reference.sum() * 0.0
+    negative_bce_sum = reference.sum() * 0.0
+    positive_pixel_count = reference.new_zeros(())
+    negative_pixel_count = reference.new_zeros(())
+    dice_losses: list[torch.Tensor] = []
+    for item in inputs:
+        region_targets = F.interpolate(
+            item.subtitle_masks,
+            size=item.region_logits.shape[-2:],
+            mode="area",
+        ).clamp(0.0, 1.0)
+        supervision_mask = F.interpolate(
+            item.supervision_masks,
+            size=item.region_logits.shape[-2:],
+            mode="area",
+        ).gt(0.5).to(item.region_logits.dtype)
+        losses = F.binary_cross_entropy_with_logits(item.region_logits, region_targets, reduction="none")
+        positive_mask = (region_targets > 0.5).to(losses.dtype) * supervision_mask
+        negative_mask = (region_targets <= 0.5).to(losses.dtype) * supervision_mask
+        positive_bce_sum = positive_bce_sum + (losses * positive_mask).sum()
+        negative_bce_sum = negative_bce_sum + (losses * negative_mask).sum()
+        positive_pixel_count = positive_pixel_count + positive_mask.sum()
+        negative_pixel_count = negative_pixel_count + negative_mask.sum()
+
+        positive_samples = region_targets.flatten(start_dim=1).amax(dim=1) > 0.5
+        if bool(positive_samples.any()):
+            probability = torch.sigmoid(item.region_logits[positive_samples]) * supervision_mask[positive_samples]
+            target = region_targets[positive_samples] * supervision_mask[positive_samples]
+            intersection = (probability * target).sum(dim=(1, 2, 3))
+            denominator = probability.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
+            dice_losses.append(1.0 - (2.0 * intersection + 1.0) / (denominator + 1.0))
+
+    bce_terms: list[torch.Tensor] = []
+    if bool(positive_pixel_count > 0):
+        bce_terms.append(positive_bce_sum / positive_pixel_count)
+    if bool(negative_pixel_count > 0):
+        bce_terms.append(negative_bce_sum / negative_pixel_count)
+    region_bce = torch.stack(bce_terms).mean() if bce_terms else reference.sum() * 0.0
+    region_dice = torch.cat(dice_losses).mean() if dice_losses else reference.sum() * 0.0
+    return region_bce, region_dice
 
 
-def _region_dice(
-    region_logits: torch.Tensor,
-    region_targets: torch.Tensor,
-    supervision_mask: torch.Tensor,
-) -> torch.Tensor:
-    positive = region_targets.flatten(start_dim=1).amax(dim=1) > 0.5
-    if not bool(positive.any()):
-        return region_logits.sum() * 0.0
-    probability = torch.sigmoid(region_logits[positive]) * supervision_mask[positive]
-    target = region_targets[positive] * supervision_mask[positive]
-    intersection = (probability * target).sum(dim=(1, 2, 3))
-    denominator = probability.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
-    return (1.0 - (2.0 * intersection + 1.0) / (denominator + 1.0)).mean()
-
-
-def frame_presence_loss(
-    presence_logits: torch.Tensor,
-    region_logits: torch.Tensor,
-    presence: torch.Tensor,
-    subtitle_masks: torch.Tensor,
-    supervision_masks: torch.Tensor,
+def frame_presence_macro_loss(
+    inputs: list[FramePresenceLossInput],
     *,
     region_loss_weight: float,
     region_dice_weight: float,
@@ -88,16 +108,10 @@ def frame_presence_loss(
     positive_logit_margin: float,
     negative_logit_margin: float,
 ) -> FramePresenceLoss:
-    region_targets = F.interpolate(
-        subtitle_masks,
-        size=region_logits.shape[-2:],
-        mode="area",
-    ).clamp(0.0, 1.0)
-    supervision_mask = F.interpolate(
-        supervision_masks,
-        size=region_logits.shape[-2:],
-        mode="area",
-    ).gt(0.5).to(region_logits.dtype)
+    if not inputs:
+        raise ValueError("a logical macro batch must contain at least one execution micro batch")
+    presence_logits = torch.cat([item.presence_logits for item in inputs])
+    presence = torch.cat([item.presence for item in inputs])
     presence_bce = _balanced_binary_loss(presence_logits, presence)
     presence_margin = _presence_margin_loss(
         presence_logits,
@@ -105,8 +119,7 @@ def frame_presence_loss(
         positive_margin=positive_logit_margin,
         negative_margin=negative_logit_margin,
     )
-    region_bce = _region_bce(region_logits, region_targets, supervision_mask)
-    region_dice = _region_dice(region_logits, region_targets, supervision_mask)
+    region_bce, region_dice = _region_terms(inputs)
     total = (
         presence_bce
         + margin_loss_weight * presence_margin
@@ -121,4 +134,31 @@ def frame_presence_loss(
     )
 
 
-__all__ = ["FramePresenceLoss", "frame_presence_loss"]
+def frame_presence_loss(
+    presence_logits: torch.Tensor,
+    region_logits: torch.Tensor,
+    presence: torch.Tensor,
+    subtitle_masks: torch.Tensor,
+    supervision_masks: torch.Tensor,
+    **kwargs: float,
+) -> FramePresenceLoss:
+    return frame_presence_macro_loss(
+        [
+            FramePresenceLossInput(
+                presence_logits=presence_logits,
+                region_logits=region_logits,
+                presence=presence,
+                subtitle_masks=subtitle_masks,
+                supervision_masks=supervision_masks,
+            )
+        ],
+        **kwargs,
+    )
+
+
+__all__ = [
+    "FramePresenceLoss",
+    "FramePresenceLossInput",
+    "frame_presence_loss",
+    "frame_presence_macro_loss",
+]

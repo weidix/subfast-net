@@ -178,14 +178,35 @@ def _frame_presence_config(
     preprocessing = checkpoint.get("preprocessing") or {}
     if not isinstance(preprocessing, Mapping):
         raise RuntimeError("frame_presence preprocessing must be a mapping")
-    image_size = preprocessing.get("resize", settings.get("image_size"))
-    if not isinstance(image_size, (list, tuple)) or len(image_size) != 2:
-        raise RuntimeError(f"frame_presence image_size must be [width, height], got {image_size!r}")
-    width = _positive_int(image_size[0], "image_size width")
-    height = _positive_int(image_size[1], "image_size height")
-    resize_mode = str(preprocessing.get("resize_mode", "stretch"))
-    if resize_mode != "stretch":
-        raise RuntimeError(f"unsupported frame_presence resize_mode: {resize_mode}")
+    resize = preprocessing.get("resize", settings.get("image_size"))
+    architecture_version = _positive_int(
+        checkpoint.get("architecture_version"), "architecture_version"
+    )
+    if isinstance(resize, Mapping):
+        reference_size = resize.get("reference_output_size")
+        if not isinstance(reference_size, (list, tuple)) or len(reference_size) != 2:
+            raise RuntimeError(
+                f"Frame Presence V5 resize contract requires reference_output_size, got {reference_size!r}"
+            )
+        width = _positive_int(reference_size[0], "reference output width")
+        height = _positive_int(reference_size[1], "reference output height")
+        input_shape: list[Any] = ["batch", 3, "aligned_height", "aligned_width"]
+        resize_contract = _json_value(resize)
+    elif isinstance(resize, (list, tuple)) and len(resize) == 2:
+        width = _positive_int(resize[0], "image_size width")
+        height = _positive_int(resize[1], "image_size height")
+        input_shape = ["batch", 3, height, width]
+        resize_mode = str(preprocessing.get("resize_mode", "stretch"))
+        if resize_mode != "stretch":
+            raise RuntimeError(f"unsupported frame_presence resize_mode: {resize_mode}")
+        resize_contract = {
+            "mode": "stretch",
+            "target_size": {"width": width, "height": height},
+            "interpolation": "bilinear",
+            "align_corners": False,
+        }
+    else:
+        raise RuntimeError(f"frame_presence resize contract is invalid: {resize!r}")
 
     model_settings = checkpoint.get("model_settings") or {}
     if not isinstance(model_settings, Mapping):
@@ -194,31 +215,33 @@ def _frame_presence_config(
     if not isinstance(score_contract, Mapping):
         raise RuntimeError("frame_presence score_contract must be a mapping")
     threshold = _number(score_contract.get("decision_threshold", 0.5), "decision_threshold")
+    model_kwargs: dict[str, Any] = {
+        "width": _positive_int(
+            model_settings.get(
+                "width",
+                settings.get("width", _infer_width(state_dict, "detail.0.weight", 24)),
+            ),
+            "width",
+        )
+    }
+    if "normalization" in model_settings:
+        model_kwargs["normalization"] = str(model_settings["normalization"])
 
     return {
         "model": {
             "type": "frame_presence",
+            "name": str(checkpoint.get("model_name", "Frame Presence V5")),
             "class_name": "FramePresenceModel",
             "module": "subfast_frame_presence.model",
-            "architecture_version": _positive_int(
-                checkpoint.get("architecture_version"), "architecture_version"
-            ),
-            "kwargs": {
-                "width": _positive_int(
-                    model_settings.get(
-                        "width",
-                        settings.get("width", _infer_width(state_dict, "detail.0.weight", 24)),
-                    ),
-                    "width",
-                )
-            },
+            "architecture_version": architecture_version,
+            "kwargs": model_kwargs,
             "inference_fused": bool(checkpoint.get("inference_fused", False)),
         },
         "input": {
             "tensors": [
                 {
                     "name": "images",
-                    "shape": ["batch", 3, height, width],
+                    "shape": input_shape,
                     "layout": "NCHW",
                     "coordinate_space": "resized_image",
                 }
@@ -227,14 +250,12 @@ def _frame_presence_config(
         "preprocessing": {
             "color_space": "RGB",
             "source_value_range": [0.0, 255.0],
+            "model_value_range": [0.0, 1.0],
+            "value_scale": _number(preprocessing.get("value_scale", 1.0 / 255.0), "value_scale"),
             "tensor_layout": "NCHW",
             "normalization": None,
-            "resize": {
-                "mode": "stretch",
-                "target_size": {"width": width, "height": height},
-                "interpolation": "bilinear",
-                "align_corners": False,
-            },
+            "resize": resize_contract,
+            "padding": None,
         },
         "output": {
             "tensors": [
@@ -245,7 +266,7 @@ def _frame_presence_config(
                 },
                 {
                     "name": "region_logits",
-                    "shape": ["batch", 1, "height/8", "width/8"],
+                    "shape": ["batch", 1, "aligned_height/8", "aligned_width/8"],
                     "coordinate_space": "stride_8_resized_image",
                     "available_via": "FramePresenceModel.forward_with_presence_map",
                 },
@@ -256,6 +277,7 @@ def _frame_presence_config(
             "score_transform": str(score_contract.get("transform", "sigmoid")),
             "score_contract": _json_value(score_contract),
         },
+        "training_contract": _json_value(checkpoint.get("training_contract") or {}),
     }
 
 

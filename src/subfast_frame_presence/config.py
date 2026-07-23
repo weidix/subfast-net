@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
 
 class FramePresenceTrainSettings(BaseModel):
+    model_name: Literal["Frame Presence V5"] = "Frame Presence V5"
+    architecture_version: Literal[5] = 5
     train_roots: list[Path] = Field(
         default_factory=lambda: [
             Path("data/generated_samples1"),
@@ -28,11 +31,15 @@ class FramePresenceTrainSettings(BaseModel):
             Path("data/roi_validation_samples"),
         ]
     )
-    output_dir: Path = Path("outputs/frame_presence_v4_mixed")
+    output_dir: Path = Path("outputs/frame_presence_v5")
     resume: Path | None = None
-    init_checkpoint: Path | None = None
     early_stop: bool = True
-    image_size: tuple[int, int] = (512, 288)
+    resize_scale: float = Field(default=0.25, gt=0.0, le=1.0)
+    resize_alignment: Literal[16] = 16
+    resize_alignment_mode: Literal["nearest_multiple_half_up"] = "nearest_multiple_half_up"
+    resize_interpolation: Literal["bilinear"] = "bilinear"
+    min_subtitle_short_edge: float = Field(default=8.0, gt=0.0)
+    reference_source_size: tuple[int, int] = (1920, 1080)
     batch_size: int = Field(default=24, gt=0)
     epochs: int = Field(default=10, gt=0, le=10)
     learning_rate: float = Field(default=1.5e-3, gt=0.0)
@@ -44,6 +51,8 @@ class FramePresenceTrainSettings(BaseModel):
     random_crop_min_scale: float = Field(default=0.3, gt=0.0, le=1.0)
     random_crop_max_scale: float = Field(default=0.9, gt=0.0, le=1.0)
     width: int = Field(default=24, gt=0)
+    normalization: Literal["none", "group_norm"] = "none"
+    gradient_clip_norm: float = Field(default=5.0, gt=0.0)
     region_loss_weight: float = Field(default=1.0, ge=0.0)
     region_dice_weight: float = Field(default=0.5, ge=0.0)
     margin_loss_weight: float = Field(default=0.5, ge=0.0)
@@ -55,13 +64,9 @@ class FramePresenceTrainSettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_geometry(self) -> "FramePresenceTrainSettings":
-        if self.resume is not None and self.init_checkpoint is not None:
-            raise ValueError("resume and init_checkpoint are mutually exclusive")
-        width, height = self.image_size
+        width, height = self.reference_source_size
         if width <= 0 or height <= 0:
-            raise ValueError("image_size dimensions must be positive")
-        if width % 16 or height % 16:
-            raise ValueError("image_size dimensions must be divisible by the encoder stride (16)")
+            raise ValueError("reference_source_size dimensions must be positive")
         if self.random_crop_min_scale > self.random_crop_max_scale:
             raise ValueError("random_crop_min_scale must not exceed random_crop_max_scale")
         return self
