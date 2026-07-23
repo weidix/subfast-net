@@ -39,6 +39,7 @@ _ROUTES: dict[tuple[str, str], tuple[str, str]] = {
     # Validation and benchmarks.
     ("validate", "matcher"): ("subfast_roi_matcher.train", "main_validate"),
     ("validate", "embedding"): ("subfast_roi_embedding.train", "main_validate"),
+    ("benchmark", "frame-presence"): ("subfast_frame_presence.train", "main_benchmark"),
     ("benchmark", "presence"): ("subfast_roi_presence.train", "main_benchmark"),
     # Export formats.
     ("export", "unified"): ("subfast_export.unified", "main"),
@@ -49,7 +50,7 @@ _ROUTES: dict[tuple[str, str], tuple[str, str]] = {
 _GROUP_COMMANDS: dict[str, tuple[str, ...]] = {
     "train": ("detector", "frame-presence", "presence", "embedding", "matcher"),
     "validate": ("embedding", "matcher"),
-    "benchmark": ("presence",),
+    "benchmark": ("frame-presence", "presence"),
     "export": ("unified", "coreml", "safetensors"),
 }
 

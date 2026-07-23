@@ -120,7 +120,7 @@ def _limit_samples(
 
 
 class FramePresenceDataset(Dataset):
-    """One complete RGB frame per sample; image resizing is the only input transform."""
+    """One complete RGB image per sample; image resizing is the only input transform."""
 
     def __init__(
         self,

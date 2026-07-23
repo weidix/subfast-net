@@ -33,6 +33,7 @@ families and exports. Each training project above has its own entry point.
 ```bash
 uv run subfast-detector --help
 uv run subfast-frame-presence --help
+uv run subfast-frame-presence-benchmark --help
 uv run subfast-roi-presence --help
 uv run subfast-roi-embedding --help
 uv run subfast-roi-matcher --help

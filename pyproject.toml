@@ -24,6 +24,7 @@ dependencies = [
 subfast-net = "subfast_detector.cli:main"
 subfast-detector = "subfast_detector.train:main"
 subfast-frame-presence = "subfast_frame_presence.train:main"
+subfast-frame-presence-benchmark = "subfast_frame_presence.train:main_benchmark"
 subfast-roi-presence = "subfast_roi_presence.train:main"
 subfast-roi-presence-benchmark = "subfast_roi_presence.train:main_benchmark"
 subfast-roi-embedding = "subfast_roi_embedding.train:main"

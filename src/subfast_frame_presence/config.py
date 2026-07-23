@@ -17,8 +17,10 @@ class FramePresenceTrainSettings(BaseModel):
         ]
     )
     val_root: Path = Path("data/validation_samples")
-    output_dir: Path = Path("outputs/frame_presence_v3")
+    output_dir: Path = Path("outputs/frame_presence_v4")
     resume: Path | None = None
+    init_checkpoint: Path | None = None
+    early_stop: bool = True
     image_size: tuple[int, int] = (512, 288)
     batch_size: int = Field(default=24, gt=0)
     epochs: int = Field(default=10, gt=0, le=10)
@@ -39,6 +41,8 @@ class FramePresenceTrainSettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_geometry(self) -> "FramePresenceTrainSettings":
+        if self.resume is not None and self.init_checkpoint is not None:
+            raise ValueError("resume and init_checkpoint are mutually exclusive")
         width, height = self.image_size
         if width <= 0 or height <= 0:
             raise ValueError("image_size dimensions must be positive")

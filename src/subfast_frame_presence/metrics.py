@@ -16,6 +16,7 @@ def presence_metrics(
     false_positive = int((predicted & ~targets).sum())
     false_negative = int((~predicted & targets).sum())
     true_negative = int((~predicted & ~targets).sum())
+    accuracy = (true_positive + true_negative) / targets.numel() if targets.numel() else 0.0
     precision = true_positive / (true_positive + false_positive) if true_positive + false_positive else 0.0
     recall = true_positive / (true_positive + false_negative) if true_positive + false_negative else 0.0
     f1 = 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0
@@ -25,6 +26,7 @@ def presence_metrics(
     max_negative = float(negative_scores.max()) if negative_scores.numel() else 0.0
     return {
         "presence_precision": precision,
+        "presence_accuracy": accuracy,
         "presence_recall": recall,
         "presence_f1": f1,
         "presence_tp": float(true_positive),

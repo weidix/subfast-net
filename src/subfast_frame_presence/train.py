@@ -22,11 +22,16 @@ from .config import FramePresenceTrainSettings
 from .dataset import FramePresenceDataset, collate_frame_presence_batch
 from .loss import FramePresenceLoss, frame_presence_loss
 from .metrics import acceptance, checkpoint_rank, presence_metrics
-from .model import FramePresenceModel
+from .model import FramePresenceModel, fuse_frame_presence_for_inference
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _LOSS_NAMES = ("loss", "presence_bce", "presence_margin", "region_bce", "region_dice")
+_BENCHMARK_WARMUP = 20
+_BENCHMARK_ITERATIONS = 100
+_BENCHMARK_ROUNDS = 7
+_V3_MPS_MEDIAN_MS = 0.84
+_MPS_TARGET_MEDIAN_MS = _V3_MPS_MEDIAN_MS / 2.0
 
 
 def parse_frame_size(value: str) -> tuple[int, int]:
@@ -71,6 +76,14 @@ def make_dataset(settings: FramePresenceTrainSettings, *, train: bool) -> FrameP
     )
 
 
+def _input_scope(settings: FramePresenceTrainSettings) -> str:
+    roots = [*settings.train_roots, settings.val_root]
+    roi_roots = sum(int((root / "annotations.jsonl").is_file()) for root in roots)
+    if roi_roots == len(roots):
+        return "roi"
+    return "full_frame" if roi_roots == 0 else "mixed"
+
+
 def _json_write(path: Path, payload: object) -> None:
     partial = path.with_name(f"{path.name}.partial")
     partial.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -110,19 +123,34 @@ def _git_revision() -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def _git_diff() -> str:
+    result = subprocess.run(
+        ["git", "diff", "--binary", "HEAD"],
+        cwd=_PROJECT_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.stdout if result.returncode == 0 else ""
+
+
 def _write_reproducibility_files(
     output_dir: Path,
     settings: FramePresenceTrainSettings,
     train_dataset: FramePresenceDataset,
     val_dataset: FramePresenceDataset,
+    initialization: dict[str, object] | None,
 ) -> None:
     code_files = sorted((_PROJECT_ROOT / "src" / "subfast_frame_presence").glob("*.py"))
     tracked_files = code_files + [
         _PROJECT_ROOT / "pyproject.toml",
         _PROJECT_ROOT / "uv.lock",
     ]
+    source_patch = _git_diff()
     snapshot = {
         "git_revision": _git_revision(),
+        "source_patch": "source.patch" if source_patch else None,
         "python": platform.python_version(),
         "torch": torch.__version__,
         "platform": platform.platform(),
@@ -135,7 +163,8 @@ def _write_reproducibility_files(
     run_config = {
         "settings": settings.model_dump(mode="json"),
         "input_contract": {
-            "input": "one complete RGB frame per model item",
+            "input": f"one complete RGB {_input_scope(settings)} image per model item",
+            "source_scope": _input_scope(settings),
             "shape": [3, settings.image_size[1], settings.image_size[0]],
             "pixel_values": "raw RGB values represented as float32",
             "preprocessing": "stretch resize only",
@@ -158,8 +187,11 @@ def _write_reproducibility_files(
             "train_manifest": "data_manifest_train.jsonl",
             "validation_manifest": "data_manifest_validation.jsonl",
         },
+        "initialization": initialization,
     }
     _json_write(output_dir / "source_snapshot.json", snapshot)
+    if source_patch:
+        (output_dir / "source.patch").write_text(source_patch, encoding="utf-8")
     _json_write(output_dir / "run_config.json", run_config)
     _jsonl_write(output_dir / "data_manifest_train.jsonl", train_dataset.manifest())
     _jsonl_write(output_dir / "data_manifest_validation.jsonl", val_dataset.manifest())
@@ -352,6 +384,45 @@ def resolve_resume_checkpoint(path: Path) -> Path:
     raise FileNotFoundError(f"resume checkpoint not found: {path}")
 
 
+def resolve_initial_checkpoint(path: Path) -> Path:
+    if path.is_file():
+        return path
+    for name in ("best.pt", "last.pt"):
+        candidate = path / name
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(f"initial checkpoint not found: {path}")
+
+
+def _load_initial_weights(
+    path: Path,
+    settings: FramePresenceTrainSettings,
+    model: FramePresenceModel,
+) -> dict[str, object]:
+    checkpoint_path = resolve_initial_checkpoint(path).expanduser().resolve()
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or checkpoint.get("model_type") != "frame_presence":
+        raise RuntimeError(f"invalid frame presence initialization checkpoint: {checkpoint_path}")
+    if bool(checkpoint.get("inference_fused")):
+        raise RuntimeError("initialization requires a training checkpoint, not a fused inference checkpoint")
+    if int(checkpoint.get("architecture_version", -1)) != model.architecture_version:
+        raise RuntimeError("initialization checkpoint architecture does not match")
+    model_settings = dict(checkpoint.get("model_settings") or {})
+    if int(model_settings.get("width", -1)) != settings.width:
+        raise RuntimeError("initialization checkpoint width does not match")
+    preprocessing = dict(checkpoint.get("preprocessing") or {})
+    if tuple(preprocessing.get("resize") or ()) != settings.image_size:
+        raise RuntimeError("initialization checkpoint image size does not match")
+    model.load_state_dict(checkpoint["model"])
+    return {
+        "checkpoint": str(checkpoint_path),
+        "sha256": _sha256(checkpoint_path),
+        "source_epoch": int(checkpoint.get("epoch", 0)),
+        "architecture_version": int(checkpoint["architecture_version"]),
+        "optimizer": "reset",
+    }
+
+
 def _checkpoint_payload(
     settings: FramePresenceTrainSettings,
     model: FramePresenceModel,
@@ -373,7 +444,7 @@ def _checkpoint_payload(
             "width": settings.width,
         },
         "preprocessing": {
-            "input": "complete_rgb_frame",
+            "input": f"complete_rgb_{_input_scope(settings)}",
             "resize": list(settings.image_size),
             "resize_mode": "stretch",
             "other_preprocessing": "none",
@@ -396,13 +467,16 @@ def _checkpoint_payload(
     }
 
 
-def _inference_payload(checkpoint: dict[str, Any]) -> dict[str, Any]:
-    return {
+def _inference_payload(
+    checkpoint: dict[str, Any],
+    model: FramePresenceModel,
+) -> dict[str, Any]:
+    optimized = fuse_frame_presence_for_inference(model).to("cpu")
+    payload = {
         key: checkpoint[key]
         for key in (
             "model_type",
             "architecture_version",
-            "model",
             "settings",
             "model_settings",
             "preprocessing",
@@ -411,6 +485,73 @@ def _inference_payload(checkpoint: dict[str, Any]) -> dict[str, Any]:
             "metrics",
         )
     }
+    payload.update(
+        {
+            "model": optimized.state_dict(),
+            "inference_fused": True,
+            "operator_fusion": "Conv2d-BatchNorm2d parameter folding",
+        }
+    )
+    if checkpoint.get("initialization") is not None:
+        payload["initialization"] = checkpoint["initialization"]
+    return payload
+
+
+def load_frame_presence_inference_checkpoint(
+    path: Path,
+    device: torch.device,
+) -> tuple[FramePresenceModel, dict[str, Any]]:
+    if path.is_dir():
+        path = path / "best_inference.pt"
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or checkpoint.get("model_type") != "frame_presence":
+        raise RuntimeError(f"invalid frame presence checkpoint: {path}")
+    if int(checkpoint.get("architecture_version", -1)) != FramePresenceModel.architecture_version:
+        raise RuntimeError(
+            f"frame presence architecture mismatch: checkpoint=v{checkpoint.get('architecture_version')} "
+            f"runtime=v{FramePresenceModel.architecture_version}"
+        )
+    model_settings = dict(checkpoint.get("model_settings") or {})
+    width = int(model_settings.get("width", FramePresenceTrainSettings().width))
+    model = FramePresenceModel(width=width).eval()
+    if bool(checkpoint.get("inference_fused")):
+        model = fuse_frame_presence_for_inference(model)
+    model.load_state_dict(checkpoint["model"])
+    return model.to(device).eval(), checkpoint
+
+
+def _synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+
+@torch.inference_mode()
+def measure_frame_presence_latency(
+    model: FramePresenceModel,
+    images: torch.Tensor,
+    device: torch.device,
+    *,
+    warmup: int = _BENCHMARK_WARMUP,
+    iterations: int = _BENCHMARK_ITERATIONS,
+    rounds: int = _BENCHMARK_ROUNDS,
+) -> tuple[float, float]:
+    """Measure steady-state batch-one eager forwards with one sync per timed window."""
+    image = images[:1].to(device=device, dtype=torch.float32)
+    for _ in range(warmup):
+        model(image)
+    _synchronize_device(device)
+    timings: list[float] = []
+    for _ in range(rounds):
+        start = time.perf_counter_ns()
+        for _ in range(iterations):
+            model(image)
+        _synchronize_device(device)
+        elapsed_ms = (time.perf_counter_ns() - start) / 1_000_000.0
+        timings.append(elapsed_ms / iterations)
+    timings.sort()
+    return timings[len(timings) // 2], timings[min(len(timings) - 1, int(len(timings) * 0.90))]
 
 
 def _load_resume(
@@ -469,7 +610,6 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
         raise RuntimeError("training data must include both subtitle-presence classes")
     if val_dataset.summary.positive == 0 or val_dataset.summary.empty == 0:
         raise RuntimeError("validation data must include both subtitle-presence classes")
-    _write_reproducibility_files(output_dir, settings, train_dataset, val_dataset)
     model = FramePresenceModel(width=settings.width).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -481,6 +621,7 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
     best_epoch = 0
     best_metrics: dict[str, float] = {}
     best_rank: tuple[float, ...] | None = None
+    initialization: dict[str, object] | None = None
     if settings.resume is not None:
         checkpoint_path = resolve_resume_checkpoint(settings.resume)
         start_epoch, global_step, best_epoch, best_metrics, best_rank = _load_resume(
@@ -491,6 +632,14 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
             device,
         )
         print(f"resume={checkpoint_path} start_epoch={start_epoch} step={global_step}", flush=True)
+    elif settings.init_checkpoint is not None:
+        initialization = _load_initial_weights(settings.init_checkpoint, settings, model)
+        print(
+            f"init_checkpoint={initialization['checkpoint']} source_epoch={initialization['source_epoch']} "
+            "optimizer=reset",
+            flush=True,
+        )
+    _write_reproducibility_files(output_dir, settings, train_dataset, val_dataset, initialization)
     print(f"frame_presence device={device} output_dir={output_dir}", flush=True)
     print(
         f"config: image_size={settings.image_size[0]}x{settings.image_size[1]} "
@@ -502,9 +651,34 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
     print(format_dataset_summary("val", val_dataset), flush=True)
     val_loader = _make_val_loader(val_dataset, settings)
     last_metrics: dict[str, float] = {}
+    initial_metrics: dict[str, float] | None = None
     completed_epoch = start_epoch - 1
     with metrics_path.open("a" if settings.resume is not None else "w", encoding="utf-8"):
         pass
+    if initialization is not None:
+        initial_dir = output_dir / "epoch_outputs" / "epoch_0000"
+        initial_dir.mkdir(parents=True, exist_ok=True)
+        initial_metrics = validate(
+            model,
+            val_loader,
+            device=device,
+            settings=settings,
+            scores_path=initial_dir / "validation_scores.jsonl",
+        )
+        initial_record: dict[str, object] = {
+            "record_type": "initial_validation",
+            "epoch": 0,
+            **initial_metrics,
+        }
+        _json_write(initial_dir / "metrics.json", initial_record)
+        _append_jsonl(metrics_path, initial_record)
+        print(
+            f"initial accuracy={initial_metrics['presence_accuracy']:.6f} "
+            f"f1={initial_metrics['presence_f1']:.6f} "
+            f"recall={initial_metrics['presence_recall']:.6f} "
+            f"fp={int(initial_metrics['presence_fp'])} fn={int(initial_metrics['presence_fn'])}",
+            flush=True,
+        )
     for epoch in range(start_epoch, settings.epochs + 1):
         train_metrics, global_step = train_epoch(
             model,
@@ -553,17 +727,20 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
             best_metrics=best_metrics,
             metrics=epoch_metrics,
         )
+        if initialization is not None:
+            payload["initialization"] = initialization
         torch.save(payload, epoch_dir / "checkpoint.pt")
         torch.save(payload, output_dir / "last.pt")
         if is_best:
             torch.save(payload, output_dir / "best.pt")
-            torch.save(_inference_payload(payload), output_dir / "best_inference.pt")
+            torch.save(_inference_payload(payload, model), output_dir / "best_inference.pt")
         _json_write(epoch_dir / "metrics.json", epoch_metrics)
         _append_jsonl(metrics_path, epoch_metrics)
         last_metrics = validation_metrics
         completed_epoch = epoch
         print(
             f"epoch={epoch}/{settings.epochs} loss={validation_metrics['val_loss']:.4f} "
+            f"accuracy={validation_metrics['presence_accuracy']:.6f} "
             f"f1={validation_metrics['presence_f1']:.6f} "
             f"recall={validation_metrics['presence_recall']:.6f} "
             f"fp={int(validation_metrics['presence_fp'])} fn={int(validation_metrics['presence_fn'])} "
@@ -571,21 +748,48 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
             f"accepted={bool(epoch_metrics['acceptance_pass'])}",
             flush=True,
         )
-        if bool(epoch_metrics["acceptance_pass"]):
+        if settings.early_stop and bool(epoch_metrics["acceptance_pass"]):
             break
     if not best_metrics:
         raise RuntimeError("training did not produce a validation checkpoint")
+    model.to("cpu")
+    del optimizer
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps":
+        torch.mps.empty_cache()
+    benchmark = _benchmark_checkpoint_in_fresh_process(
+        output_dir / "best_inference.pt",
+        device=device,
+        image_size=settings.image_size,
+    )
+    _json_write(output_dir / "benchmark.json", benchmark)
+    _append_jsonl(metrics_path, benchmark)
+    for checkpoint_name in ("best.pt", "best_inference.pt", "last.pt"):
+        checkpoint_path = output_dir / checkpoint_name
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        checkpoint["inference_benchmark"] = benchmark
+        torch.save(checkpoint, checkpoint_path)
+    print(
+        f"inference median_ms={float(benchmark['median_ms']):.6f} "
+        f"p90_round_ms={float(benchmark['p90_round_ms']):.6f} "
+        f"speedup_vs_v3={benchmark['speedup_vs_v3']} target_met={benchmark['target_met']}",
+        flush=True,
+    )
     final_acceptance = acceptance(
         best_metrics,
         complete_validation=settings.max_val_samples is None,
     )
+    if device.type == "mps":
+        final_acceptance["inference_speed"] = bool(benchmark["target_met"])
     summary: dict[str, object] = {
         "record_type": "frame_presence_training_summary",
         "model_type": "frame_presence",
         "architecture_version": model.architecture_version,
         "device": str(device),
         "model_parameters": sum(parameter.numel() for parameter in model.parameters()),
-        "full_frame_input": True,
+        "input_scope": _input_scope(settings),
+        "full_frame_input": _input_scope(settings) == "full_frame",
         "input_preprocessing": "stretch resize only",
         "completed_epoch": completed_epoch,
         "epoch_limit": settings.epochs,
@@ -593,13 +797,17 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
         "train_samples": len(train_dataset),
         "validation_samples": len(val_dataset),
         "validation": best_metrics,
+        "initial_validation": initial_metrics,
         "last_validation": last_metrics,
+        "initialization": initialization,
+        "inference_benchmark": benchmark,
         "acceptance": final_acceptance,
         "accepted": all(final_acceptance.values()),
         "best_checkpoint": str(output_dir / "best.pt"),
         "best_inference_checkpoint": str(output_dir / "best_inference.pt"),
         "last_checkpoint": str(output_dir / "last.pt"),
         "metrics": str(metrics_path),
+        "benchmark": str(output_dir / "benchmark.json"),
         "source_snapshot": str(output_dir / "source_snapshot.json"),
         "run_config": str(output_dir / "run_config.json"),
     }
@@ -609,11 +817,17 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
 
 def parse_args(argv: list[str] | None = None) -> FramePresenceTrainSettings:
     defaults = FramePresenceTrainSettings()
-    parser = argparse.ArgumentParser(description="Train full-frame subtitle presence from scratch.")
+    parser = argparse.ArgumentParser(description="Train subtitle presence on complete RGB images.")
     parser.add_argument("--train-root", type=Path, action="append")
     parser.add_argument("--val-root", type=Path, default=defaults.val_root)
     parser.add_argument("--output-dir", type=Path, default=defaults.output_dir)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--init-checkpoint", type=Path)
+    parser.add_argument(
+        "--early-stop",
+        action=argparse.BooleanOptionalAction,
+        default=defaults.early_stop,
+    )
     parser.add_argument("--image-size", type=parse_frame_size, default=defaults.image_size)
     parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
     parser.add_argument("--epochs", type=int, default=defaults.epochs)
@@ -642,6 +856,8 @@ def parse_args(argv: list[str] | None = None) -> FramePresenceTrainSettings:
         parser.error("--weight-decay must be non-negative")
     if args.num_workers < 0:
         parser.error("--num-workers must be non-negative")
+    if args.resume is not None and args.init_checkpoint is not None:
+        parser.error("--resume and --init-checkpoint are mutually exclusive")
     for name, value in (("--max-train-samples", args.max_train_samples), ("--max-val-samples", args.max_val_samples)):
         if value is not None and value <= 0:
             parser.error(f"{name} must be positive")
@@ -650,6 +866,8 @@ def parse_args(argv: list[str] | None = None) -> FramePresenceTrainSettings:
         val_root=args.val_root,
         output_dir=args.output_dir,
         resume=args.resume,
+        init_checkpoint=args.init_checkpoint,
+        early_stop=args.early_stop,
         image_size=args.image_size,
         batch_size=args.batch_size,
         epochs=args.epochs,
@@ -665,12 +883,119 @@ def parse_args(argv: list[str] | None = None) -> FramePresenceTrainSettings:
     )
 
 
+def parse_benchmark_args(argv: list[str] | None = None) -> argparse.Namespace:
+    defaults = FramePresenceTrainSettings()
+    parser = argparse.ArgumentParser(description="Benchmark full-frame Presence batch-1 latency.")
+    parser.add_argument("checkpoint", type=Path, nargs="?", default=defaults.output_dir / "best_inference.pt")
+    parser.add_argument("--image-size", type=parse_frame_size)
+    parser.add_argument("--warmup", type=int, default=_BENCHMARK_WARMUP)
+    parser.add_argument("--iterations", type=int, default=_BENCHMARK_ITERATIONS)
+    parser.add_argument("--rounds", type=int, default=_BENCHMARK_ROUNDS)
+    parser.add_argument("--device", default="auto")
+    args = parser.parse_args(argv)
+    if args.warmup < 0:
+        parser.error("--warmup must be non-negative")
+    if args.iterations <= 0 or args.rounds <= 0:
+        parser.error("--iterations and --rounds must be positive")
+    return args
+
+
+def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
+    device = choose_device(args.device)
+    model, checkpoint = load_frame_presence_inference_checkpoint(args.checkpoint, device)
+    preprocessing = dict(checkpoint.get("preprocessing") or {})
+    image_size = tuple(args.image_size or preprocessing.get("resize") or FramePresenceTrainSettings().image_size)
+    width, height = int(image_size[0]), int(image_size[1])
+    images = torch.rand(
+        (1, 3, height, width),
+        generator=torch.Generator().manual_seed(2026),
+    ) * 255.0
+    median_ms, p90_ms = measure_frame_presence_latency(
+        model,
+        images,
+        device,
+        warmup=args.warmup,
+        iterations=args.iterations,
+        rounds=args.rounds,
+    )
+    metrics: dict[str, object] = {
+        "record_type": "frame_presence_inference_benchmark",
+        "checkpoint": str(args.checkpoint),
+        "architecture_version": model.architecture_version,
+        "model_parameters": sum(parameter.numel() for parameter in model.parameters()),
+        "scope": "conv_bn_folded_eager_forward_only",
+        "device": str(device),
+        "torch_version": str(torch.__version__),
+        "dtype": "float32",
+        "batch_size": 1,
+        "input_height": height,
+        "input_width": width,
+        "warmup": args.warmup,
+        "iterations_per_round": args.iterations,
+        "rounds": args.rounds,
+        "median_ms": median_ms,
+        "p90_round_ms": p90_ms,
+        "v3_mps_median_ms": _V3_MPS_MEDIAN_MS if device.type == "mps" else None,
+        "speedup_vs_v3": _V3_MPS_MEDIAN_MS / median_ms if device.type == "mps" else None,
+        "target_median_ms": _MPS_TARGET_MEDIAN_MS if device.type == "mps" else None,
+        "target_met": median_ms <= _MPS_TARGET_MEDIAN_MS if device.type == "mps" else None,
+    }
+    print(json.dumps(metrics, ensure_ascii=False, indent=2, sort_keys=True))
+    return metrics
+
+
+def _benchmark_checkpoint_in_fresh_process(
+    checkpoint: Path,
+    *,
+    device: torch.device,
+    image_size: tuple[int, int],
+) -> dict[str, object]:
+    command = [
+        sys.executable,
+        "-c",
+        "from subfast_frame_presence.train import main_benchmark; main_benchmark()",
+        str(checkpoint),
+        "--device",
+        str(device),
+        "--image-size",
+        f"{image_size[0]}x{image_size[1]}",
+        "--warmup",
+        str(_BENCHMARK_WARMUP),
+        "--iterations",
+        str(_BENCHMARK_ITERATIONS),
+        "--rounds",
+        str(_BENCHMARK_ROUNDS),
+    ]
+    result = subprocess.run(
+        command,
+        cwd=_PROJECT_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit code {result.returncode}"
+        raise RuntimeError(f"fresh-process inference benchmark failed: {detail}")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("fresh-process inference benchmark returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("fresh-process inference benchmark returned a non-object result")
+    return payload
+
+
 def main(argv: list[str] | None = None) -> None:
     summary = run_training(parse_args(argv))
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     if not summary["accepted"]:
         print("frame presence acceptance requirements were not met", file=sys.stderr)
         raise SystemExit(1)
+
+
+def main_benchmark(argv: list[str] | None = None) -> None:
+    run_benchmark(parse_benchmark_args(argv))
 
 
 if __name__ == "__main__":
