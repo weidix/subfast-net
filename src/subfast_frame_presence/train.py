@@ -19,7 +19,7 @@ from tqdm import tqdm
 from subfast_shared.runtime import choose_device
 
 from .config import FramePresenceTrainSettings
-from .dataset import FramePresenceDataset, collate_frame_presence_batch
+from .dataset import FramePresenceDataset, collate_frame_presence_batch, is_roi_root
 from .loss import FramePresenceLoss, frame_presence_loss
 from .metrics import acceptance, checkpoint_rank, presence_metrics
 from .model import FramePresenceModel, fuse_frame_presence_for_inference
@@ -61,27 +61,61 @@ def seed_everything(seed: int) -> None:
 def format_dataset_summary(name: str, dataset: FramePresenceDataset) -> str:
     summary = dataset.summary
     roots = ", ".join(f"{root}={count}" for root, count in sorted(summary.roots.items()))
+    sample_types = ", ".join(f"{kind}={count}" for kind, count in sorted(summary.sample_types.items()))
     return (
         f"{name}: samples={summary.total} positive={summary.positive} empty={summary.empty} "
         f"dropped={summary.dropped} positive_ratio={summary.positive_ratio:.3f} "
-        f"empty_ratio={summary.empty_ratio:.3f} roots=[{roots}]"
+        f"empty_ratio={summary.empty_ratio:.3f} types=[{sample_types}] roots=[{roots}]"
     )
 
 
 def make_dataset(settings: FramePresenceTrainSettings, *, train: bool) -> FramePresenceDataset:
     return FramePresenceDataset(
-        settings.train_roots if train else [settings.val_root],
+        settings.train_roots if train else settings.val_roots,
         image_size=settings.image_size,
+        random_crop_views=settings.random_crop_views if train else 0,
+        random_crop_scale=(settings.random_crop_min_scale, settings.random_crop_max_scale),
+        seed=settings.seed,
         max_samples=settings.max_train_samples if train else settings.max_val_samples,
     )
 
 
 def _input_scope(settings: FramePresenceTrainSettings) -> str:
-    roots = [*settings.train_roots, settings.val_root]
-    roi_roots = sum(int((root / "annotations.jsonl").is_file()) for root in roots)
-    if roi_roots == len(roots):
-        return "roi"
-    return "full_frame" if roi_roots == 0 else "mixed"
+    return "mixed_full_frame_roi" if any(is_roi_root(root) for root in settings.train_roots) else "full_frame"
+
+
+def _domain_metrics(metrics: dict[str, float], sample_type: str) -> dict[str, float]:
+    prefix = f"{sample_type}_"
+    return {
+        name.removeprefix(prefix): value
+        for name, value in metrics.items()
+        if name.startswith(prefix)
+    }
+
+
+def _validation_acceptance(metrics: dict[str, float], *, complete_validation: bool) -> dict[str, bool]:
+    checks = acceptance(metrics, complete_validation=complete_validation)
+    for sample_type in ("full_frame", "roi"):
+        domain = _domain_metrics(metrics, sample_type)
+        if not domain:
+            checks[f"{sample_type}_present"] = False
+            continue
+        for name, passed in acceptance(domain, complete_validation=complete_validation).items():
+            if name != "validation_complete":
+                checks[f"{sample_type}_{name}"] = passed
+    return checks
+
+
+def _validation_rank(metrics: dict[str, float]) -> tuple[float, ...]:
+    domain_f1 = [
+        _domain_metrics(metrics, sample_type).get("presence_f1", 0.0)
+        for sample_type in ("full_frame", "roi")
+    ]
+    domain_recall = [
+        _domain_metrics(metrics, sample_type).get("presence_recall", 0.0)
+        for sample_type in ("full_frame", "roi")
+    ]
+    return (round(min(domain_f1), 8), round(min(domain_recall), 8), *checkpoint_rank(metrics))
 
 
 def _json_write(path: Path, payload: object) -> None:
@@ -163,12 +197,17 @@ def _write_reproducibility_files(
     run_config = {
         "settings": settings.model_dump(mode="json"),
         "input_contract": {
-            "input": f"one complete RGB {_input_scope(settings)} image per model item",
+            "input": "one RGB full frame, ROI, or arbitrary image region per model item",
             "source_scope": _input_scope(settings),
             "shape": [3, settings.image_size[1], settings.image_size[0]],
             "pixel_values": "raw RGB values represented as float32",
-            "preprocessing": "stretch resize only",
-            "prohibited": ["ROI crop", "ROI mask", "padding", "normalization", "augmentation"],
+            "inference_preprocessing": "stretch resize only",
+            "training_augmentation": {
+                "random_crop_views": settings.random_crop_views,
+                "random_crop_scale": [settings.random_crop_min_scale, settings.random_crop_max_scale],
+                "positive_crop_rule": "fully retain at least one subtitle box",
+            },
+            "prohibited": ["ROI mask", "padding", "normalization"],
         },
         "evaluation_contract": {
             "decision_threshold": 0.5,
@@ -222,6 +261,7 @@ def _make_train_loader(
     settings: FramePresenceTrainSettings,
     epoch: int,
 ) -> DataLoader:
+    dataset.set_epoch(epoch)
     return DataLoader(
         dataset,
         batch_size=settings.batch_size,
@@ -319,6 +359,7 @@ def validate(
     sample_count = 0
     logits_all: list[torch.Tensor] = []
     presence_all: list[torch.Tensor] = []
+    sample_types_all: list[str] = []
     rows: list[dict[str, object]] = []
     for batch in loader:
         images = batch.images.to(device)
@@ -341,10 +382,11 @@ def validate(
         scores = torch.sigmoid(presence_logits).detach().cpu()
         logits_cpu = presence_logits.detach().cpu()
         targets = presence.detach().cpu()
-        for sample_id, root, image_path, score, logit, target in zip(
+        for sample_id, root, image_path, sample_type, score, logit, target in zip(
             batch.sample_ids,
             batch.roots,
             batch.image_paths,
+            batch.sample_types,
             scores.tolist(),
             logits_cpu.tolist(),
             targets.tolist(),
@@ -356,6 +398,7 @@ def validate(
                     "sample_id": sample_id,
                     "root": root,
                     "image_path": image_path,
+                    "sample_type": sample_type,
                     "target": int(target > 0.5),
                     "presence_logit": logit,
                     "presence_score": score,
@@ -364,13 +407,20 @@ def validate(
             )
         logits_all.append(logits_cpu)
         presence_all.append(targets)
+        sample_types_all.extend(batch.sample_types)
         sample_count += batch_size
     _jsonl_write(scores_path, rows)
     metrics = {
         f"val_{name}": value / max(1, sample_count)
         for name, value in totals.items()
     }
-    metrics.update(presence_metrics(torch.cat(logits_all), torch.cat(presence_all)))
+    all_logits = torch.cat(logits_all)
+    all_presence = torch.cat(presence_all)
+    metrics.update(presence_metrics(all_logits, all_presence))
+    for sample_type in sorted(set(sample_types_all)):
+        indices = torch.tensor([kind == sample_type for kind in sample_types_all], dtype=torch.bool)
+        type_metrics = presence_metrics(all_logits[indices], all_presence[indices])
+        metrics.update({f"{sample_type}_{name}": value for name, value in type_metrics.items()})
     return metrics
 
 
@@ -568,7 +618,16 @@ def _load_resume(
         raise RuntimeError("resume checkpoint architecture does not match")
     previous = dict(checkpoint.get("settings") or {})
     current = settings.model_dump(mode="json")
-    for name in ("train_roots", "val_root", "image_size", "width", "seed"):
+    for name in (
+        "train_roots",
+        "val_roots",
+        "image_size",
+        "random_crop_views",
+        "random_crop_min_scale",
+        "random_crop_max_scale",
+        "width",
+        "seed",
+    ):
         if previous.get(name) != current.get(name):
             raise RuntimeError(
                 f"resume setting mismatch for {name}: checkpoint={previous.get(name)!r} current={current.get(name)!r}"
@@ -586,7 +645,7 @@ def _load_resume(
             f"resume checkpoint already completed epoch {completed_epoch}; --epochs must remain above it and no greater than 10"
         )
     metrics = {key: float(value) for key, value in dict(checkpoint.get("best_metrics") or {}).items()}
-    rank = checkpoint_rank(metrics) if metrics else None
+    rank = _validation_rank(metrics) if metrics else None
     return completed_epoch + 1, int(checkpoint.get("step", 0)), int(checkpoint.get("best_epoch", 0)), metrics, rank
 
 
@@ -597,15 +656,17 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
     metrics_path = output_dir / "metrics.jsonl"
     if metrics_path.exists() and settings.resume is None:
         raise FileExistsError(f"output already contains a training run: {output_dir}")
-    if any(root.expanduser().resolve() == settings.val_root.expanduser().resolve() for root in settings.train_roots):
-        raise ValueError("validation root must not overlap a training root")
+    train_roots = {root.expanduser().resolve() for root in settings.train_roots}
+    val_roots = {root.expanduser().resolve() for root in settings.val_roots}
+    if train_roots & val_roots:
+        raise ValueError("validation roots must not overlap training roots")
     output_dir.mkdir(parents=True, exist_ok=True)
     train_dataset = make_dataset(settings, train=True)
     val_dataset = make_dataset(settings, train=False)
     if not len(train_dataset):
-        raise RuntimeError("no full-frame training samples found")
+        raise RuntimeError("no training samples found")
     if not len(val_dataset):
-        raise RuntimeError("no full-frame validation samples found")
+        raise RuntimeError("no validation samples found")
     if train_dataset.summary.positive == 0 or train_dataset.summary.empty == 0:
         raise RuntimeError("training data must include both subtitle-presence classes")
     if val_dataset.summary.positive == 0 or val_dataset.summary.empty == 0:
@@ -699,7 +760,7 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
             settings=settings,
             scores_path=epoch_dir / "validation_scores.jsonl",
         )
-        rank = checkpoint_rank(validation_metrics)
+        rank = _validation_rank(validation_metrics)
         is_best = best_rank is None or rank > best_rank
         if is_best:
             best_rank = rank
@@ -715,7 +776,10 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
             "best_epoch": float(best_epoch),
         }
         epoch_metrics["acceptance_pass"] = float(
-            all(acceptance(validation_metrics, complete_validation=settings.max_val_samples is None).values())
+            all(_validation_acceptance(
+                validation_metrics,
+                complete_validation=settings.max_val_samples is None,
+            ).values())
         )
         payload = _checkpoint_payload(
             settings,
@@ -748,6 +812,15 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
             f"accepted={bool(epoch_metrics['acceptance_pass'])}",
             flush=True,
         )
+        print(
+            f"  full_frame_f1={validation_metrics['full_frame_presence_f1']:.6f} "
+            f"full_frame_fp={int(validation_metrics['full_frame_presence_fp'])} "
+            f"full_frame_fn={int(validation_metrics['full_frame_presence_fn'])} "
+            f"roi_f1={validation_metrics['roi_presence_f1']:.6f} "
+            f"roi_fp={int(validation_metrics['roi_presence_fp'])} "
+            f"roi_fn={int(validation_metrics['roi_presence_fn'])}",
+            flush=True,
+        )
         if settings.early_stop and bool(epoch_metrics["acceptance_pass"]):
             break
     if not best_metrics:
@@ -776,7 +849,7 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
         f"speedup_vs_v3={benchmark['speedup_vs_v3']} target_met={benchmark['target_met']}",
         flush=True,
     )
-    final_acceptance = acceptance(
+    final_acceptance = _validation_acceptance(
         best_metrics,
         complete_validation=settings.max_val_samples is None,
     )
@@ -789,8 +862,9 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
         "device": str(device),
         "model_parameters": sum(parameter.numel() for parameter in model.parameters()),
         "input_scope": _input_scope(settings),
-        "full_frame_input": _input_scope(settings) == "full_frame",
-        "input_preprocessing": "stretch resize only",
+        "full_frame_input": True,
+        "roi_input": any(is_roi_root(root) for root in settings.train_roots),
+        "input_preprocessing": "stretch resize; training also uses labeled random crops",
         "completed_epoch": completed_epoch,
         "epoch_limit": settings.epochs,
         "best_epoch": best_epoch,
@@ -817,9 +891,9 @@ def run_training(settings: FramePresenceTrainSettings) -> dict[str, object]:
 
 def parse_args(argv: list[str] | None = None) -> FramePresenceTrainSettings:
     defaults = FramePresenceTrainSettings()
-    parser = argparse.ArgumentParser(description="Train subtitle presence on complete RGB images.")
+    parser = argparse.ArgumentParser(description="Train subtitle presence on full frames, ROIs, and random crops.")
     parser.add_argument("--train-root", type=Path, action="append")
-    parser.add_argument("--val-root", type=Path, default=defaults.val_root)
+    parser.add_argument("--val-root", dest="val_roots", metavar="VAL_ROOT", type=Path, action="append")
     parser.add_argument("--output-dir", type=Path, default=defaults.output_dir)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--init-checkpoint", type=Path)
@@ -836,6 +910,9 @@ def parse_args(argv: list[str] | None = None) -> FramePresenceTrainSettings:
     parser.add_argument("--num-workers", type=int, default=defaults.num_workers)
     parser.add_argument("--max-train-samples", type=int)
     parser.add_argument("--max-val-samples", type=int)
+    parser.add_argument("--random-crop-views", type=int, default=defaults.random_crop_views)
+    parser.add_argument("--random-crop-min-scale", type=float, default=defaults.random_crop_min_scale)
+    parser.add_argument("--random-crop-max-scale", type=float, default=defaults.random_crop_max_scale)
     parser.add_argument("--width", type=int, default=defaults.width)
     parser.add_argument("--log-interval", type=int, default=defaults.log_interval)
     parser.add_argument("--seed", type=int, default=defaults.seed)
@@ -856,6 +933,10 @@ def parse_args(argv: list[str] | None = None) -> FramePresenceTrainSettings:
         parser.error("--weight-decay must be non-negative")
     if args.num_workers < 0:
         parser.error("--num-workers must be non-negative")
+    if not 0 <= args.random_crop_views <= 8:
+        parser.error("--random-crop-views must be between 0 and 8")
+    if not 0.0 < args.random_crop_min_scale <= args.random_crop_max_scale <= 1.0:
+        parser.error("random crop scales must satisfy 0 < min <= max <= 1")
     if args.resume is not None and args.init_checkpoint is not None:
         parser.error("--resume and --init-checkpoint are mutually exclusive")
     for name, value in (("--max-train-samples", args.max_train_samples), ("--max-val-samples", args.max_val_samples)):
@@ -863,7 +944,7 @@ def parse_args(argv: list[str] | None = None) -> FramePresenceTrainSettings:
             parser.error(f"{name} must be positive")
     return FramePresenceTrainSettings(
         train_roots=args.train_root or defaults.train_roots,
-        val_root=args.val_root,
+        val_roots=args.val_roots or defaults.val_roots,
         output_dir=args.output_dir,
         resume=args.resume,
         init_checkpoint=args.init_checkpoint,
@@ -876,6 +957,9 @@ def parse_args(argv: list[str] | None = None) -> FramePresenceTrainSettings:
         num_workers=args.num_workers,
         max_train_samples=args.max_train_samples,
         max_val_samples=args.max_val_samples,
+        random_crop_views=args.random_crop_views,
+        random_crop_min_scale=args.random_crop_min_scale,
+        random_crop_max_scale=args.random_crop_max_scale,
         width=args.width,
         log_interval=args.log_interval,
         seed=args.seed,

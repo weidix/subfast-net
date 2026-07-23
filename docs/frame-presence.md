@@ -1,15 +1,17 @@
 # Frame Presence
 
-`subfast-frame-presence` trains one PyTorch model to decide whether a complete video frame contains subtitles. It does not perform OCR or text decoding.
+`subfast-frame-presence` trains one PyTorch model to decide whether a full frame, subtitle ROI, or arbitrary cropped image region contains subtitles. It does not perform OCR or text decoding.
 
 ## Input Contract
 
-- Each model item is one complete RGB frame.
-- The only image transform is direct stretch resizing to `--image-size` (default `512x288`).
-- There is no ROI crop, ROI mask, padding, color conversion, normalization, augmentation, cache-preparation command, or inference-time filtering.
+- Every model item is one RGB image and is stretch-resized to `--image-size` (default `512x288`).
+- Training mixes the original full frames, the configured ROI datasets, and reproducible random crops generated from the full frames.
+- Positive random crops fully retain at least one labeled subtitle box. Empty frames are cropped freely, so both subtitle occupancy and background coverage vary across epochs.
+- Random crop coordinates are derived from the run seed, epoch, item index, and crop-view index. Resuming a run therefore reproduces the same samples.
+- Inference accepts full frames, ROIs, and other image regions through the same input tensor. There is no ROI mask, padding, normalization, or inference-time filtering.
 - The model accepts only `images` with shape `N x 3 x H x W`. Batching never combines frames into one model input.
 
-The dense subtitle mask is training supervision derived from the existing full-frame labels. It is not an input and is not used during inference. The scalar presence score is produced by the model's learned full-frame evidence head, with a fixed sigmoid threshold of `0.5`.
+The dense subtitle mask is training supervision derived from each source label and transformed into the crop coordinate space when needed. It is not an input and is not used during inference. The scalar presence score is produced by the model's learned evidence head, with a fixed sigmoid threshold of `0.5`.
 
 ## Compact Model
 
@@ -17,11 +19,11 @@ Architecture v4 uses standard PyTorch only. Four compact downsampling blocks pro
 
 ## Train
 
-The canonical run uses all six configured generated roots and the held-out `data/validation_samples` root. It is limited to ten epochs by the CLI and settings model.
+The default `train_roots` contains all six generated-frame roots and all six ROI roots. The default `val_roots` contains `data/validation_samples` and `data/roi_validation_samples`. ROI folders are identified by `summary.json` containing `roi_size`; no separate ROI root setting is required. Each source full frame contributes one full-frame item and one random-crop item; each ROI contributes one ROI item. Validation reports aggregate, full-frame, and ROI metrics separately, and early stopping requires both validation domains to pass.
 
 ```bash
 uv run subfast-frame-presence \
-  --output-dir outputs/frame_presence_v4 \
+  --output-dir outputs/frame_presence_v4_mixed \
   --epochs 10 \
   --device auto
 ```
@@ -29,10 +31,12 @@ uv run subfast-frame-presence \
 The aggregate CLI uses the same spelling:
 
 ```bash
-uv run subfast-net train frame-presence --output-dir outputs/frame_presence_v4 --epochs 10
+uv run subfast-net train frame-presence \
+  --output-dir outputs/frame_presence_v4_mixed \
+  --epochs 10
 ```
 
-`--train-root` may be repeated to replace the configured train roots. `--max-val-samples` is only for diagnostics; a limited validation set is explicitly marked incomplete and cannot satisfy the acceptance result.
+`--train-root` and `--val-root` may both be repeated with any mix of full-frame and ROI folders. Supplying either option replaces its configured list. `--random-crop-views` controls the number of crop items per full-frame image, while `--random-crop-min-scale` and `--random-crop-max-scale` control crop width and height relative to that frame. ROI images are not randomly cropped. `--max-val-samples` remains diagnostics-only; a limited validation set cannot satisfy acceptance.
 
 For a single weight-initialized experiment, `--init-checkpoint` loads only model weights and resets the optimizer. It is distinct from `--resume` and permits a new dataset. Use `--no-early-stop` when the requested epoch count must run in full. The output records the base checkpoint path and SHA-256 plus validation metrics before the first update.
 
@@ -43,7 +47,7 @@ For a single weight-initialized experiment, `--init-checkpoint` loads only model
 Each run preserves the complete process rather than only final weights:
 
 ```text
-outputs/frame_presence_v4/
+outputs/frame_presence_v4_mixed/
 ├── run_config.json
 ├── source_snapshot.json
 ├── source.patch
@@ -73,7 +77,7 @@ uv run subfast-net benchmark frame-presence outputs/frame_presence_v4/best_infer
 
 ## Verified Run
 
-The v3 baseline and canonical v4 run completed on 2026-07-22. V4 stopped at epoch 2 with every quality and efficiency requirement satisfied:
+The v3 baseline and original full-frame-only v4 run completed on 2026-07-22. These are historical baseline results; the mixed training workflow must be evaluated against both held-out domains before claiming equivalent quality:
 
 | Model | Parameters | Leaf modules | Full-frame MPS FP32 latency | Recall | F1 | FP / FN | Gap |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |

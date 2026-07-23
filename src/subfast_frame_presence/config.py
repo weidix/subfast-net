@@ -14,10 +14,21 @@ class FramePresenceTrainSettings(BaseModel):
             Path("data/generated_samples4"),
             Path("data/generated_samples5"),
             Path("data/generated_samples6"),
+            Path("data/roi_samples1"),
+            Path("data/roi_samples2"),
+            Path("data/roi_samples3"),
+            Path("data/roi_samples4"),
+            Path("data/roi_samples5"),
+            Path("data/roi_samples6"),
         ]
     )
-    val_root: Path = Path("data/validation_samples")
-    output_dir: Path = Path("outputs/frame_presence_v4")
+    val_roots: list[Path] = Field(
+        default_factory=lambda: [
+            Path("data/validation_samples"),
+            Path("data/roi_validation_samples"),
+        ]
+    )
+    output_dir: Path = Path("outputs/frame_presence_v4_mixed")
     resume: Path | None = None
     init_checkpoint: Path | None = None
     early_stop: bool = True
@@ -29,6 +40,9 @@ class FramePresenceTrainSettings(BaseModel):
     num_workers: int = Field(default=0, ge=0)
     max_train_samples: int | None = Field(default=None, gt=0)
     max_val_samples: int | None = Field(default=None, gt=0)
+    random_crop_views: int = Field(default=1, ge=0, le=8)
+    random_crop_min_scale: float = Field(default=0.3, gt=0.0, le=1.0)
+    random_crop_max_scale: float = Field(default=0.9, gt=0.0, le=1.0)
     width: int = Field(default=24, gt=0)
     region_loss_weight: float = Field(default=1.0, ge=0.0)
     region_dice_weight: float = Field(default=0.5, ge=0.0)
@@ -48,4 +62,6 @@ class FramePresenceTrainSettings(BaseModel):
             raise ValueError("image_size dimensions must be positive")
         if width % 16 or height % 16:
             raise ValueError("image_size dimensions must be divisible by the encoder stride (16)")
+        if self.random_crop_min_scale > self.random_crop_max_scale:
+            raise ValueError("random_crop_min_scale must not exceed random_crop_max_scale")
         return self
