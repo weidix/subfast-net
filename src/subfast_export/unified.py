@@ -12,6 +12,7 @@ import torch
 from torch.fx import Node
 
 from subfast_detector.model import SubtitleDetector
+from subfast_frame_presence.model import FramePresenceModel, fuse_frame_presence_for_inference
 from subfast_roi_matcher.model import RoiPairInference, RoiPairMatcher, fuse_pair_matcher_for_inference
 from subfast_roi_presence.model import RoiPresenceModel
 
@@ -371,6 +372,33 @@ def checkpoint_resize_roi(checkpoint: dict[str, Any], checkpoint_path: Path) -> 
     return width, height
 
 
+def checkpoint_frame_size(checkpoint: dict[str, Any], checkpoint_path: Path) -> tuple[int, int]:
+    preprocessing = checkpoint.get("preprocessing") or {}
+    settings = checkpoint.get("settings") or {}
+    image_size = preprocessing.get("resize") if isinstance(preprocessing, dict) else None
+    if image_size is None and isinstance(settings, dict):
+        image_size = settings.get("image_size")
+    if not isinstance(image_size, (list, tuple)) or len(image_size) != 2:
+        raise RuntimeError(f"frame_presence checkpoint does not define a width/height image_size: {checkpoint_path}")
+    width, height = (int(value) for value in image_size)
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"invalid frame_presence image_size in checkpoint {checkpoint_path}: {image_size}")
+    return width, height
+
+
+class _ExportReLU(torch.nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return torch.clamp_min(value, 0.0)
+
+
+def _replace_relu_for_export(model: torch.nn.Module) -> None:
+    for name, child in model.named_children():
+        if isinstance(child, torch.nn.ReLU):
+            setattr(model, name, _ExportReLU())
+        else:
+            _replace_relu_for_export(child)
+
+
 def load_checkpoint_export_model(
     checkpoint_path: Path,
     batch_size: int,
@@ -381,6 +409,23 @@ def load_checkpoint_export_model(
         raise RuntimeError(f"invalid training checkpoint: {checkpoint_path}")
 
     model_type = checkpoint_model_type(checkpoint)
+    if model_type == "frame_presence":
+        width, height = checkpoint_frame_size(checkpoint, checkpoint_path)
+        model_settings = checkpoint.get("model_settings") or {}
+        settings = checkpoint.get("settings") or {}
+        model_width = int(model_settings.get("width", settings.get("width", 24)))
+        model = FramePresenceModel(width=model_width).eval()
+        version = int(checkpoint.get("architecture_version", -1))
+        if version != model.architecture_version:
+            raise RuntimeError(
+                f"unsupported frame_presence architecture_version={version}; runtime=v{model.architecture_version}"
+            )
+        if bool(checkpoint.get("inference_fused")):
+            model = fuse_frame_presence_for_inference(model)
+        model.load_state_dict(checkpoint["model"])
+        _replace_relu_for_export(model)
+        return model, (torch.randn(batch_size, 3, height, width),)
+
     if model_type == "roi_presence":
         width, height = checkpoint_resize_roi(checkpoint, checkpoint_path)
         settings = checkpoint.get("settings") or {}
@@ -663,7 +708,7 @@ def export_model_to_coreml_model(
             image_size = int(example_inputs[0].shape[-1])
             model = CoreMLSubtitleDetector(model, image_size).eval()
             converted_inputs = [ct.TensorType(name="x", shape=tuple(example_inputs[0].shape))]
-        elif model_type == "roi_presence":
+        elif model_type in {"frame_presence", "roi_presence"}:
             converted_inputs = [ct.TensorType(name="images", shape=tuple(example_inputs[0].shape))]
         elif model_type == "roi_pair_matcher":
             converted_inputs = [
@@ -685,7 +730,7 @@ def export_model_to_coreml_model(
         ),
         "source": "pytorch",
     }
-    if model_path.suffix != ".pt2" and model_type in {"roi_presence", "roi_pair_matcher"}:
+    if model_path.suffix != ".pt2" and model_type in {"frame_presence", "roi_presence", "roi_pair_matcher"}:
         conversion_options["compute_precision"] = ct.precision.FLOAT32
     coreml_model = ct.convert(model_for_conversion, **conversion_options)
     coreml_model.save(output_path)

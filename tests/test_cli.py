@@ -12,6 +12,7 @@ import torch
 from torch import nn
 
 from subfast_detector.model import SubtitleDetector
+from subfast_frame_presence.model import FramePresenceModel
 
 
 class CliTests(unittest.TestCase):
@@ -165,6 +166,41 @@ class CliTests(unittest.TestCase):
             self.assertEqual(config["postprocessing"]["region_threshold"], 0.6)
             with safe_open(weights_path, framework="pt", device="cpu") as archive:
                 self.assertEqual(archive.metadata()["model_type"], "subtitle_detector")
+
+    def test_export_safetensors_supports_frame_presence(self):
+        from subfast_detector.cli import main
+
+        model = FramePresenceModel(width=8).eval()
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint_path = Path(tmp) / "best.pt"
+            output_dir = Path(tmp) / "safetensors"
+            torch.save(
+                {
+                    "model_type": "frame_presence",
+                    "architecture_version": model.architecture_version,
+                    "model": model.state_dict(),
+                    "model_settings": {"width": 8},
+                    "settings": {"image_size": [64, 32]},
+                    "preprocessing": {
+                        "resize": [64, 32],
+                        "resize_mode": "stretch",
+                    },
+                    "score_contract": {
+                        "decision_threshold": 0.5,
+                        "transform": "sigmoid",
+                    },
+                },
+                checkpoint_path,
+            )
+
+            main(["export", "safetensors", str(checkpoint_path), str(output_dir)])
+
+            config = json.loads((output_dir / "config.json").read_text())
+            self.assertEqual(config["model_type"], "frame_presence")
+            self.assertEqual(config["model"]["kwargs"], {"width": 8})
+            self.assertEqual(config["input"]["tensors"][0]["shape"], ["batch", 3, 32, 64])
+            self.assertEqual(config["preprocessing"]["source_value_range"], [0.0, 255.0])
+            self.assertEqual(config["postprocessing"]["decision_threshold"], 0.5)
 
     def test_training_validation_and_benchmark_commands_dispatch(self):
         from subfast_detector.cli import main

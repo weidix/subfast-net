@@ -170,6 +170,95 @@ def _detector_config(
     }
 
 
+def _frame_presence_config(
+    checkpoint: Mapping[str, Any],
+    settings: Mapping[str, Any],
+    state_dict: Mapping[str, torch.Tensor],
+) -> dict[str, Any]:
+    preprocessing = checkpoint.get("preprocessing") or {}
+    if not isinstance(preprocessing, Mapping):
+        raise RuntimeError("frame_presence preprocessing must be a mapping")
+    image_size = preprocessing.get("resize", settings.get("image_size"))
+    if not isinstance(image_size, (list, tuple)) or len(image_size) != 2:
+        raise RuntimeError(f"frame_presence image_size must be [width, height], got {image_size!r}")
+    width = _positive_int(image_size[0], "image_size width")
+    height = _positive_int(image_size[1], "image_size height")
+    resize_mode = str(preprocessing.get("resize_mode", "stretch"))
+    if resize_mode != "stretch":
+        raise RuntimeError(f"unsupported frame_presence resize_mode: {resize_mode}")
+
+    model_settings = checkpoint.get("model_settings") or {}
+    if not isinstance(model_settings, Mapping):
+        raise RuntimeError("frame_presence model_settings must be a mapping")
+    score_contract = checkpoint.get("score_contract") or {}
+    if not isinstance(score_contract, Mapping):
+        raise RuntimeError("frame_presence score_contract must be a mapping")
+    threshold = _number(score_contract.get("decision_threshold", 0.5), "decision_threshold")
+
+    return {
+        "model": {
+            "type": "frame_presence",
+            "class_name": "FramePresenceModel",
+            "module": "subfast_frame_presence.model",
+            "architecture_version": _positive_int(
+                checkpoint.get("architecture_version"), "architecture_version"
+            ),
+            "kwargs": {
+                "width": _positive_int(
+                    model_settings.get(
+                        "width",
+                        settings.get("width", _infer_width(state_dict, "detail.0.weight", 24)),
+                    ),
+                    "width",
+                )
+            },
+            "inference_fused": bool(checkpoint.get("inference_fused", False)),
+        },
+        "input": {
+            "tensors": [
+                {
+                    "name": "images",
+                    "shape": ["batch", 3, height, width],
+                    "layout": "NCHW",
+                    "coordinate_space": "resized_image",
+                }
+            ]
+        },
+        "preprocessing": {
+            "color_space": "RGB",
+            "source_value_range": [0.0, 255.0],
+            "tensor_layout": "NCHW",
+            "normalization": None,
+            "resize": {
+                "mode": "stretch",
+                "target_size": {"width": width, "height": height},
+                "interpolation": "bilinear",
+                "align_corners": False,
+            },
+        },
+        "output": {
+            "tensors": [
+                {
+                    "name": "presence_logit",
+                    "shape": ["batch"],
+                    "score_transform": "sigmoid",
+                },
+                {
+                    "name": "region_logits",
+                    "shape": ["batch", 1, "height/8", "width/8"],
+                    "coordinate_space": "stride_8_resized_image",
+                    "available_via": "FramePresenceModel.forward_with_presence_map",
+                },
+            ]
+        },
+        "postprocessing": {
+            "decision_threshold": threshold,
+            "score_transform": str(score_contract.get("transform", "sigmoid")),
+            "score_contract": _json_value(score_contract),
+        },
+    }
+
+
 def _roi_preprocessing(resize_roi: tuple[int, int] | None, resize_mode: str) -> dict[str, Any]:
     resize: dict[str, Any]
     if resize_roi is None:
@@ -411,6 +500,8 @@ def _model_config(
     model_type = checkpoint_model_type(checkpoint)
     if model_type is None:
         return _detector_config(checkpoint, settings, state_dict)
+    if model_type == "frame_presence":
+        return _frame_presence_config(checkpoint, settings, state_dict)
     if model_type == "roi_presence":
         return _roi_presence_config(checkpoint, settings, state_dict)
     if model_type == "roi_presence_embedding":

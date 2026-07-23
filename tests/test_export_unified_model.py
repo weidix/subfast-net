@@ -9,7 +9,8 @@ import torch
 from torch import nn
 
 from subfast_detector.model import SubtitleDetector
-from subfast_export.unified import export_pt2_to_unified_model
+from subfast_export.unified import export_model_to_unified_model, export_pt2_to_unified_model
+from subfast_frame_presence.model import FramePresenceModel, fuse_frame_presence_for_inference
 
 
 class TinyExportModel(nn.Module):
@@ -42,6 +43,30 @@ class ConvBatchNormExportModel(nn.Module):
 
 
 class UnifiedModelExportTests(unittest.TestCase):
+    def test_export_frame_presence_inference_checkpoint(self):
+        model = fuse_frame_presence_for_inference(FramePresenceModel(width=8).eval())
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint_path = Path(tmp) / "best_inference.pt"
+            output_dir = Path(tmp) / "unified"
+            torch.save(
+                {
+                    "model_type": "frame_presence",
+                    "architecture_version": model.architecture_version,
+                    "model": model.state_dict(),
+                    "model_settings": {"width": 8},
+                    "preprocessing": {"resize": [64, 32], "resize_mode": "stretch"},
+                    "inference_fused": True,
+                },
+                checkpoint_path,
+            )
+
+            manifest_path = export_model_to_unified_model(checkpoint_path, output_dir)
+            manifest = json.loads(manifest_path.read_text())
+
+            self.assertEqual(manifest["inputs"][0]["shape"], [1, 3, 32, 64])
+            self.assertEqual(manifest["outputs"][0]["shape"], [1])
+            self.assertIn("aten.clamp_min.default", {node["op"] for node in manifest["nodes"]})
+
     def test_exported_program_writes_graph_metadata_and_weight_blob(self):
         model = TinyExportModel().eval()
         exported = torch.export.export(model, (torch.randn(1, 3, 8, 8),))
@@ -220,6 +245,61 @@ class UnifiedModelExportTests(unittest.TestCase):
                 self.assertEqual(calls["source"], "pytorch")
                 self.assertEqual(calls["inputs"][0].name, "x")
                 self.assertEqual(calls["inputs"][0].shape, (1, 3, 32, 32))
+        finally:
+            if previous_coremltools is None:
+                sys.modules.pop("coremltools", None)
+            else:
+                sys.modules["coremltools"] = previous_coremltools
+
+    def test_export_frame_presence_checkpoint_to_coreml(self):
+        from subfast_export.unified import export_model_to_coreml_model
+
+        calls = {}
+
+        class FakeTensorType:
+            def __init__(self, name, shape):
+                self.name = name
+                self.shape = shape
+
+        class FakeCoreMLModel:
+            def save(self, path):
+                Path(path).mkdir()
+
+        def fake_convert(model, *, inputs, source, compute_precision):
+            calls["inputs"] = inputs
+            calls["compute_precision"] = compute_precision
+            return FakeCoreMLModel()
+
+        precision = SimpleNamespace(FLOAT32="float32")
+        fake_coremltools = SimpleNamespace(
+            TensorType=FakeTensorType,
+            convert=fake_convert,
+            precision=precision,
+        )
+        previous_coremltools = sys.modules.get("coremltools")
+        sys.modules["coremltools"] = fake_coremltools
+
+        try:
+            model = FramePresenceModel(width=8).eval()
+            with tempfile.TemporaryDirectory() as tmp:
+                checkpoint_path = Path(tmp) / "best.pt"
+                output_path = Path(tmp) / "frame-presence.mlpackage"
+                torch.save(
+                    {
+                        "model_type": "frame_presence",
+                        "architecture_version": model.architecture_version,
+                        "model": model.state_dict(),
+                        "model_settings": {"width": 8},
+                        "preprocessing": {"resize": [64, 32]},
+                    },
+                    checkpoint_path,
+                )
+
+                export_model_to_coreml_model(checkpoint_path, output_path)
+
+                self.assertEqual(calls["inputs"][0].name, "images")
+                self.assertEqual(calls["inputs"][0].shape, (1, 3, 32, 64))
+                self.assertEqual(calls["compute_precision"], precision.FLOAT32)
         finally:
             if previous_coremltools is None:
                 sys.modules.pop("coremltools", None)
